@@ -7,6 +7,7 @@ Local-first Rust CLI for importing agent skill packages, preserving local edits 
 ```sh
 skillsync init [--library PATH]
 skillsync config path
+skillsync config edit   # opens config.toml in VISUAL, then EDITOR (TTY only)
 skillsync subscribe REPOSITORY [--skill NAME]
 # Without --skill, a TTY offers a line-oriented single-select picker.
 # With neither argument, the TTY asks for the repository first.
@@ -40,9 +41,9 @@ Package copies exclude operational files such as `.env`, logs, credential direct
 
 Updates compare the durable baseline, live package, and fetched upstream package. Upstream-only additions (including nested directories) are applied; local-only edits remain; clean non-overlapping text changes merge. Conflicts, including unsupported file/directory type transitions, retain live content and write local/incoming recovery copies without placing conflict markers in the live package. Failed network, branch, merge, or push operations retain local content and report a non-synced status.
 
-## Testing
+`config edit` is supported only from an interactive terminal. It creates a uniquely named no-follow temporary file inside the config directory, invokes `VISUAL` before `EDITOR` as an executable with that temporary path as its sole argument, then validates and publishes the result without replacing a config created concurrently. Existing configs are published only when their identity and bytes remain unchanged; symlink/reparse substitutions and editor-replaced temporary files fail closed. It inherits terminal streams and reports editor failures. Native Windows publication deliberately fails closed and is unavailable in this implementation; native Windows runtime is not exercised here. It never parses editor command strings or runs through a shell; `--json` and redirected stdin/stdout fail instead of launching an editor.
 
-Build the native binary, then run the TypeScript integration suite with Bun:
+## Testing the native binary, then run the TypeScript integration suite with Bun:
 
 ```sh
 cargo build

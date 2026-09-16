@@ -17,6 +17,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod config_editor;
+
 #[derive(Parser)]
 #[command(name = "skillsync", version)]
 struct Cli {
@@ -441,17 +443,19 @@ fn config_dir() -> PathBuf {
     }
 }
 fn default_library() -> PathBuf {
+    std::env::var_os(if cfg!(target_os = "windows") {
+        "USERPROFILE"
+    } else {
+        "HOME"
+    })
+    .map(|x| PathBuf::from(x).join(".agents/skills"))
+    .unwrap_or_else(|| PathBuf::from(".agents/skills"))
+}
+fn effective_library_path(configured: Option<PathBuf>) -> PathBuf {
     std::env::var_os("SKILLSYNC_LIBRARY")
-        .map(Into::into)
-        .or_else(|| {
-            std::env::var_os(if cfg!(target_os = "windows") {
-                "USERPROFILE"
-            } else {
-                "HOME"
-            })
-            .map(|x| PathBuf::from(x).join(".agents/skills"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".agents/skills"))
+        .map(PathBuf::from)
+        .or(configured)
+        .unwrap_or_else(default_library)
 }
 fn resolve_library_path(path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
@@ -631,11 +635,7 @@ impl App {
         } else {
             FileConfig::default()
         };
-        let configured_library = file_cfg.library.map(PathBuf::from);
-        let requested_library = std::env::var_os("SKILLSYNC_LIBRARY")
-            .map(PathBuf::from)
-            .or(configured_library)
-            .unwrap_or_else(default_library);
+        let requested_library = effective_library_path(file_cfg.library.map(PathBuf::from));
         let expected_library = resolve_library_path(&requested_library)?;
         let state_exists = checked_regular_path(&sp, "state")?;
         let mut state: State = if state_exists {
@@ -3792,17 +3792,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         } => Ok(serde_json::json!({"path":a.config.join("config.toml")})),
         Cmd::Config {
             command: ConfigCmd::Edit,
-        } => {
-            let p = a.config.join("config.toml");
-            if !p.exists() {
-                fs::create_dir_all(&a.config)?;
-                atomic(
-                    &p,
-                    format!("library = {:?}\n", a.library.display().to_string()).as_bytes(),
-                )?
-            }
-            Ok(serde_json::json!({"path":p}))
-        }
+        } => config_editor::edit_config(&a, cli.json),
         Cmd::Subscribe { repository, skill } => {
             use std::io::IsTerminal;
             let interactive =
