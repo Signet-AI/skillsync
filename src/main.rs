@@ -40,6 +40,12 @@ enum Cmd {
         #[arg(long)]
         skill: Option<String>,
     },
+    Import {
+        #[arg(long = "from")]
+        source: PathBuf,
+        #[arg(long)]
+        skill: Option<String>,
+    },
     Publish {
         skill: String,
         #[arg(long)]
@@ -118,6 +124,17 @@ struct State {
     sets: BTreeMap<String, SkillSet>,
     #[serde(default)]
     harness_links: BTreeMap<String, HarnessLink>,
+    #[serde(default)]
+    local_adoptions: BTreeMap<String, LocalAdoption>,
+}
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct LocalAdoption {
+    skill: String,
+    source_path: String,
+    source_package: String,
+    content_hash: String,
+    local_path: String,
+    status: String,
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct HarnessLink {
@@ -635,6 +652,7 @@ impl App {
         };
         assert_no_symlink_path(&library, Path::new("."))?;
         validate_harness_links(&state, &library)?;
+        validate_local_adoptions(&state, &library)?;
         let baselines = c.join("baselines");
         let recovery = c.join("recovery");
         Ok(Self {
@@ -647,6 +665,9 @@ impl App {
         })
     }
     fn save(&self) -> Result<()> {
+        if std::env::var("SKILLSYNC_TEST_FAIL_STATE_SAVE").as_deref() == Ok("1") {
+            return Err(anyhow!("injected state-save failure (test-only)"));
+        }
         atomic(&self.state_path, &serde_json::to_vec_pretty(&self.state)?)
     }
 }
@@ -705,6 +726,79 @@ fn validate_set_state(state: &State) -> Result<()> {
         for member in &set.members {
             set_member_name(member)?;
         }
+    }
+    Ok(())
+}
+fn validate_local_adoption(key: &str, record: &LocalAdoption, library: &Path) -> Result<()> {
+    let skill = strict_component(&record.skill, "local adoption skill name")?;
+    if key != format!("local:{skill}") {
+        return Err(anyhow!("local adoption key does not match skill"));
+    }
+    let source = PathBuf::from(&record.source_path);
+    if !source.is_absolute() {
+        return Err(anyhow!("local adoption source path is not absolute"));
+    }
+    let source_metadata = fs::symlink_metadata(&source).ok();
+    if source_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(anyhow!("local adoption source path is a symlink"));
+    }
+    assert_no_symlink_path(&source, Path::new("."))?;
+    let source_available = source.is_dir();
+    if source_available {
+        if fs::canonicalize(&source)? != source {
+            return Err(anyhow!("local adoption source path is not canonical"));
+        }
+    } else if source.exists() {
+        return Err(anyhow!("local adoption source path is not a directory"));
+    }
+    let source_package = source_rel(&record.source_package)?;
+    if record.content_hash.len() != 64
+        || !record.content_hash.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(anyhow!("invalid local adoption content hash"));
+    }
+    if record.status != "adopted" {
+        return Err(anyhow!("invalid local adoption status"));
+    }
+    let local = PathBuf::from(&record.local_path);
+    let expected = library.join(&skill);
+    if local != expected || !local.is_absolute() {
+        return Err(anyhow!("local adoption path does not match library"));
+    }
+    let relative = local
+        .strip_prefix(library)
+        .map_err(|_| anyhow!("local adoption escaped library"))?;
+    assert_no_symlink_path(library, relative)?;
+    if !local.is_dir() || fs::canonicalize(&local)? != local {
+        return Err(anyhow!(
+            "local adoption canonical path is not a regular directory"
+        ));
+    }
+    if manifest_name(&local)? != skill || hash_dir(&local)? != record.content_hash {
+        return Err(anyhow!(
+            "local adoption content does not match recorded provenance"
+        ));
+    }
+    if source_available {
+        let package = source.join(&source_package);
+        if !package.is_dir()
+            || fs::canonicalize(&package)? != package
+            || manifest_name(&package)? != skill
+            || hash_dir(&package)? != record.content_hash
+        {
+            return Err(anyhow!(
+                "local adoption source package does not match recorded provenance"
+            ));
+        }
+    }
+    Ok(())
+}
+fn validate_local_adoptions(state: &State, library: &Path) -> Result<()> {
+    for (key, record) in &state.local_adoptions {
+        validate_local_adoption(key, record, library)?;
     }
     Ok(())
 }
@@ -1068,8 +1162,7 @@ fn discover(root: &Path) -> Result<Vec<(String, PathBuf, String)>> {
                 let manifest = x.join("SKILL.md");
                 reject_reparse_point(&manifest, "manifest")?;
                 if manifest.is_file() {
-                    let name = manifest_name(&x)
-                        .unwrap_or_else(|| rel.file_name().unwrap().to_string_lossy().into());
+                    let name = manifest_name(&x)?;
                     o.push((name, x.clone(), portable_rel(rel)))
                 }
                 r(base, &x, o)?
@@ -1081,29 +1174,36 @@ fn discover(root: &Path) -> Result<Vec<(String, PathBuf, String)>> {
     let root_manifest = root.join("SKILL.md");
     reject_reparse_point(&root_manifest, "manifest")?;
     if root_manifest.is_file() {
-        o.push((
-            manifest_name(root).unwrap_or_else(|| {
-                root.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into()
-            }),
-            root.to_path_buf(),
-            ".".into(),
-        ))
+        let name = manifest_name(root)?;
+        o.push((name, root.to_path_buf(), ".".into()))
     }
     r(root, root, &mut o)?;
     o.sort_by(|a, b| a.2.cmp(&b.2));
     Ok(o)
 }
-fn manifest_name(p: &Path) -> Option<String> {
-    let text = String::from_utf8(read_regular_file(&p.join("SKILL.md"), None).ok()?).ok()?;
-    text.lines()
-        .find_map(|l| {
-            l.strip_prefix("name:")
-                .map(|x| x.trim().trim_matches('"').to_string())
-        })
-        .filter(|x| !x.is_empty())
+fn manifest_name(p: &Path) -> Result<String> {
+    let text = String::from_utf8(read_regular_file(&p.join("SKILL.md"), None)?)
+        .context("SKILL.md is not valid UTF-8")?;
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or("");
+    let Some(value) = first.strip_prefix("name:") else {
+        return Err(anyhow!(
+            "malformed SKILL.md front matter: first line must be name: <safe-component>"
+        ));
+    };
+    if value.is_empty() || !value.as_bytes()[0].is_ascii_whitespace() {
+        return Err(anyhow!("malformed SKILL.md front matter name"));
+    }
+    let value = value.trim();
+    if value.is_empty()
+        || value.starts_with('"')
+        || value.starts_with('\'')
+        || value.contains(':')
+        || lines.any(|line| line.trim_start().starts_with("name:"))
+    {
+        return Err(anyhow!("malformed SKILL.md front matter name"));
+    }
+    strict_component(value, "manifest skill name")
 }
 fn normalize(s: &str) -> Result<String> {
     if s.is_empty() || s.chars().any(|c| c.is_control()) {
@@ -1391,6 +1491,58 @@ fn snapshot(a: &App, skill: &str, src: &Path) -> Result<(PathBuf, String)> {
     replace_dir(&p, &staged)?;
     Ok((p, hash))
 }
+#[cfg(target_os = "linux")]
+fn install_dir_noreplace(src: &Path, dst: &Path) -> Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let parent = dst
+        .parent()
+        .ok_or_else(|| anyhow!("destination has no parent"))?;
+    let name = dst
+        .file_name()
+        .ok_or_else(|| anyhow!("destination has no name"))?;
+    let source_c = CString::new(src.as_os_str().as_bytes())?;
+    let name_c = CString::new(name.as_bytes())?;
+    let directory = open_directory_fd(parent)?;
+    let status = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source_c.as_ptr(),
+            directory,
+            name_c.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    let result = if status < 0 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    };
+    unsafe {
+        libc::close(directory);
+    }
+    result
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn install_dir_noreplace(_src: &Path, _dst: &Path) -> Result<()> {
+    Err(anyhow!(
+        "safe no-replace directory installation is unavailable on this Unix platform"
+    ))
+}
+
+#[cfg(windows)]
+fn install_dir_noreplace(src: &Path, dst: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+    let src: Vec<u16> = src.as_os_str().encode_wide().chain(Some(0)).collect();
+    let dst: Vec<u16> = dst.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn rename_staged_dir(src: &Path, dst: &Path) -> Result<()> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
@@ -2416,6 +2568,247 @@ fn set_change(
     Ok(serde_json::json!({"set":name,"skill":skill,"status":status}))
 }
 
+#[cfg(unix)]
+type DirectoryIdentity = (u64, u64);
+#[cfg(windows)]
+type DirectoryIdentity = (u32, u32, u32);
+
+fn directory_identity(path: &Path) -> Result<DirectoryIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path).context("read canonical library identity")?;
+        if !metadata.is_dir() {
+            return Err(anyhow!("canonical library is not a directory"));
+        }
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::{iter, os::windows::ffi::OsStrExt};
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+
+        fn identity(path: &Path) -> Result<(u32, u32, u32)> {
+            let wide = path
+                .as_os_str()
+                .encode_wide()
+                .chain(iter::once(0))
+                .collect::<Vec<_>>();
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    0x80000000,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+            let ok = unsafe { GetFileInformationByHandle(handle, &mut info) != 0 };
+            unsafe { CloseHandle(handle) };
+            if !ok {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(anyhow!("canonical library is a reparse point"));
+            }
+            Ok((
+                info.dwVolumeSerialNumber,
+                info.nFileIndexHigh,
+                info.nFileIndexLow,
+            ))
+        }
+
+        identity(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(anyhow!(
+            "directory identity is unavailable on this platform"
+        ))
+    }
+}
+
+fn import_local(a: &mut App, source: &Path, requested: Option<&str>) -> Result<serde_json::Value> {
+    use std::io::IsTerminal;
+    assert_no_symlink_path(source, Path::new("."))?;
+    if !source.is_dir() {
+        return Err(anyhow!("import source is not a directory"));
+    }
+    let source = fs::canonicalize(source).context("canonicalize import source")?;
+    if !source.is_dir() {
+        return Err(anyhow!("import source is not a directory"));
+    }
+    if source == a.library || source.starts_with(&a.library) || a.library.starts_with(&source) {
+        return Err(anyhow!("import source overlaps canonical library"));
+    }
+    reject_reparse_point(&source, "import source")?;
+    let found = discover(&source)?;
+    if found.is_empty() {
+        return Err(anyhow!("no SKILL.md packages found in import source"));
+    }
+    let selected = match requested {
+        Some(query) => {
+            let query = skill_query(query)?;
+            found
+                .iter()
+                .find(|(name, _, rel)| name == &query || rel == &query)
+                .ok_or_else(|| anyhow!("skill not found in import source: {query}"))?
+        }
+        None => {
+            if !std::io::stdin().is_terminal() || found.len() != 1 {
+                return Err(anyhow!(
+                    "--skill is required for noninteractive import or multiple packages"
+                ));
+            }
+            &found[0]
+        }
+    };
+    let (name, package, rel) = selected;
+    let name = strict_component(name, "manifest skill name")?;
+    let library_identity_before = directory_identity(&a.library)?;
+    let source_package_hash = hash_dir(package).context("hash discovered import package")?;
+    let destination = a.library.join(&name);
+    if !destination.starts_with(&a.library) {
+        return Err(anyhow!("destination escaped library"));
+    }
+    let staging_parent = tempfile::tempdir_in(&a.library)?;
+    let staged = staging_parent.path().join("package");
+    copy_tree(package, &staged)?;
+    let incoming_hash = hash_dir(&staged)?;
+    let source_package_hash_after =
+        hash_dir(package).context("recheck discovered import package")?;
+    if source_package_hash_after != source_package_hash {
+        return Err(anyhow!("source package changed during import; retry"));
+    }
+    let destination_metadata = match fs::symlink_metadata(&destination) {
+        Ok(metadata) => {
+            assert_no_symlink_path(&a.library, Path::new(&name))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(anyhow!(
+                    "canonical package destination is not a regular directory"
+                ));
+            }
+            if fs::canonicalize(&destination)? != destination {
+                return Err(anyhow!(
+                    "canonical package destination is not a canonical directory"
+                ));
+            }
+            checked_regular_path(&destination.join("SKILL.md"), "skill manifest")?;
+            Some(metadata)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            assert_no_symlink_path(&a.library, Path::new(&name))?;
+            None
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if destination_metadata.is_some() {
+        let existing_hash = hash_dir(&destination)?;
+        if existing_hash == incoming_hash {
+            let key = format!("local:{name}");
+            let previous_state = a.state.clone();
+            a.state.local_adoptions.insert(
+                key,
+                LocalAdoption {
+                    skill: name.clone(),
+                    source_path: source.display().to_string(),
+                    source_package: rel.clone(),
+                    content_hash: incoming_hash,
+                    local_path: destination.display().to_string(),
+                    status: "adopted".into(),
+                },
+            );
+            if let Err(error) = a.save() {
+                a.state = previous_state;
+                return Err(error).context("persist local adoption state");
+            }
+            return Ok(
+                serde_json::json!({"skill":name,"status":"already_present","provenance":"recorded"}),
+            );
+        }
+        return Err(anyhow!(
+            "canonical package already exists with different contents; not overwritten"
+        ));
+    }
+    let key = format!("local:{name}");
+    assert_no_symlink_path(&a.library, Path::new("."))?;
+    if hash_dir(package)? != source_package_hash {
+        return Err(anyhow!("source package changed during import; retry"));
+    }
+    if directory_identity(&a.library)? != library_identity_before {
+        return Err(anyhow!("canonical library changed during import; retry"));
+    }
+    if std::env::var("SKILLSYNC_TEST_IMPORT_COLLISION").as_deref() == Ok("1") {
+        fs::create_dir_all(&destination)?;
+        fs::write(destination.join("SKILL.md"), "external collision\n")?;
+    }
+    install_dir_noreplace(&staged, &destination)
+        .context("install canonical package without replacement")?;
+    if std::env::var("SKILLSYNC_TEST_IMPORT_VERIFY_FAILURE").as_deref() == Ok("1") {
+        fs::write(destination.join("SKILL.md"), "post-install mutation\n")?;
+    }
+    let installed_identity = directory_identity(&destination).ok();
+    let library_unchanged = directory_identity(&a.library)
+        .map(|identity| identity == library_identity_before)
+        .unwrap_or(false);
+    let installed_hash_matches = hash_dir(&destination)
+        .map(|hash| hash == incoming_hash)
+        .unwrap_or(false);
+    if !library_unchanged || !installed_hash_matches {
+        let still_owned = installed_identity.is_some()
+            && directory_identity(&destination).ok() == installed_identity
+            && hash_dir(&destination).ok().as_deref() == Some(&incoming_hash);
+        if still_owned {
+            let _ = fs::remove_dir_all(&destination);
+        }
+        return Err(anyhow!(
+            "canonical library changed during import; installation aborted{}",
+            if still_owned {
+                " and package rolled back"
+            } else {
+                "; recovery required"
+            }
+        ));
+    }
+    let previous_state = a.state.clone();
+    a.state.local_adoptions.insert(
+        key,
+        LocalAdoption {
+            skill: name.clone(),
+            source_path: source.display().to_string(),
+            source_package: rel.clone(),
+            content_hash: incoming_hash.clone(),
+            local_path: destination.display().to_string(),
+            status: "adopted".into(),
+        },
+    );
+    if let Err(error) = a.save() {
+        a.state = previous_state;
+        let still_owned = installed_identity.is_some()
+            && directory_identity(&destination).ok() == installed_identity
+            && hash_dir(&destination).ok().as_deref() == Some(&incoming_hash);
+        return match still_owned.then(|| fs::remove_dir_all(&destination)) {
+            Some(Ok(())) => Err(error).context("persist local adoption state; package rolled back"),
+            Some(Err(rollback_error)) => Err(anyhow!("persist local adoption state failed: {error}; package rollback failed: {rollback_error}")),
+            None => Err(anyhow!("persist local adoption state failed: {error}; installed package changed; recovery required")),
+        };
+    }
+    Ok(
+        serde_json::json!({"skill":name,"status":"adopted","source_package":rel,"canonical_path":destination}),
+    )
+}
+
 fn run(cli: Cli) -> Result<serde_json::Value> {
     let mut a = App::load()?;
     let command = match cli.command {
@@ -2535,6 +2928,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             a.save()?;
             Ok(serde_json::json!({"skill":name}))
         }
+        Cmd::Import { source, skill } => import_local(&mut a, &source, skill.as_deref()),
         Cmd::Update | Cmd::Sync => sync_all(&mut a, false),
         Cmd::Worker { once, interval } => run_worker_locked(&mut a, once, interval),
         Cmd::Harness { command } => match command {
@@ -2613,10 +3007,10 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             }
         }
         Cmd::Status => Ok(
-            serde_json::json!({"subscriptions":a.state.subscriptions,"publications":a.state.publications,"pending_publications":a.state.pending_publications,"harness_links":a.state.harness_links,"worker":worker_status(&a.config)?}),
+            serde_json::json!({"subscriptions":a.state.subscriptions,"local_adoptions":a.state.local_adoptions,"publications":a.state.publications,"pending_publications":a.state.pending_publications,"harness_links":a.state.harness_links,"worker":worker_status(&a.config)?}),
         ),
         Cmd::Doctor => Ok(
-            serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":worker_status(&a.config)?,"startup":"unsupported","harness_write_back":"explicit_directory_links_only","harness_discovery":"unsupported","harness_filtering":"unsupported","harness_reload":"unsupported","harness_links":harness_link_health(&a)?,"hermes_autonomous_curation":"unsupported","registries":"unsupported","set_publication":"unsupported","set_subscription_metadata":"unsupported","harness_enablement":"unsupported","personal_library_sync":"unsupported","membership_change_propagation":"unsupported"}),
+            serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":worker_status(&a.config)?,"startup":"unsupported","harness_write_back":"explicit_directory_links_only","harness_discovery":"unsupported","harness_filtering":"unsupported","harness_reload":"unsupported","harness_links":harness_link_health(&a)?,"hermes_autonomous_curation":"unsupported","registries":"unsupported","set_publication":"unsupported","set_subscription_metadata":"unsupported","harness_enablement":"unsupported","personal_library_sync":"unsupported","membership_change_propagation":"unsupported","local_import":"supported: explicit --from PATH --skill NAME; canonical write-back only; no subscription"}),
         ),
         Cmd::Set { command } => match command {
             SetCmd::Create { name } => {

@@ -87,6 +87,163 @@ function countPublications(status: any): number {
   return Object.keys(status.publications ?? {}).length;
 }
 
+test("does not replace a destination that appears after the absence check", async () => {
+  if (process.platform !== "linux") return;
+  const fixture = await makeFixture();
+  const source = join(fixture.root, "source");
+  await put(join(source, "SKILL.md"), "name: raced\nincoming\n");
+  skillsync(fixture, ["--json", "init"]);
+  const failed = run(binary, ["--json", "import", "--from", source, "--skill", "raced"], undefined, {
+    ...fixture.env,
+    SKILLSYNC_TEST_IMPORT_COLLISION: "1",
+  });
+  expect(failed.code).toBe(1);
+  expect(failed.stdout).toContain("without replacement");
+  expect(await readFile(join(fixture.library, "raced/SKILL.md"), "utf8")).toBe("external collision\n");
+  expect(skillsync(fixture, ["--json", "status"]).json.local_adoptions).toEqual({});
+});
+
+test("rolls back after post-install verification failure", async () => {
+  const fixture = await makeFixture();
+  const source = join(fixture.root, "source");
+  await put(join(source, "SKILL.md"), "name: verify\nv1\n");
+  skillsync(fixture, ["--json", "init"]);
+  const failed = run(binary, ["--json", "import", "--from", source, "--skill", "verify"], undefined, {
+    ...fixture.env,
+    SKILLSYNC_TEST_IMPORT_VERIFY_FAILURE: "1",
+  });
+  expect(failed.code).toBe(1);
+  expect(failed.stdout).toContain("recovery required");
+  expect(await readFile(join(fixture.library, "verify/SKILL.md"), "utf8")).toBe("post-install mutation\n");
+  expect(skillsync(fixture, ["--json", "status"]).json.local_adoptions).toEqual({});
+});
+test("imports a local package idempotently and records provenance", async () => {
+  const fixture = await makeFixture();
+  const source = join(fixture.root, "local-source");
+  await put(join(source, "nested/SKILL.md"), "name: demo\nlocal\n");
+  skillsync(fixture, ["--json", "init"]);
+  const first = skillsync(fixture, ["--json", "import", "--from", source, "--skill", "nested"]).json;
+  expect(first.status).toBe("adopted");
+  const second = skillsync(fixture, ["--json", "import", "--from", source, "--skill", "nested"]).json;
+  expect(second.status).toBe("already_present");
+  expect(second.provenance).toBe("recorded");
+  const status = skillsync(fixture, ["--json", "status"]).json;
+  expect(Object.keys(status.local_adoptions)).toEqual(["local:demo"]);
+  expect(await readFile(join(fixture.library, "demo/SKILL.md"), "utf8")).toBe("name: demo\nlocal\n");
+});
+
+test("rejects a symlinked existing destination without adopting external content", async () => {
+  if (process.platform === "win32") return;
+  const fixture = await makeFixture();
+  const source = join(fixture.root, "source");
+  const external = join(fixture.root, "external-package");
+  await put(join(source, "SKILL.md"), "name: adopted\nincoming\n");
+  await put(join(external, "SKILL.md"), "name: adopted\nexternal\n");
+  skillsync(fixture, ["--json", "init"]);
+  await symlink(external, join(fixture.library, "adopted"), "dir");
+
+  const rejected = skillsync(
+    fixture,
+    ["--json", "import", "--from", source, "--skill", "adopted"],
+    false,
+  );
+  expect(rejected.json.ok).toBe(false);
+  expect(rejected.json.message).toContain("symlink");
+  expect(await readFile(join(external, "SKILL.md"), "utf8")).toBe("name: adopted\nexternal\n");
+  expect(skillsync(fixture, ["--json", "status"]).json.local_adoptions).toEqual({});
+});
+test("imports a root package with nested resources and preserves Unix modes", async () => {
+  if (process.platform === "win32") return;
+  const fixture = await makeFixture();
+  const source = join(fixture.root, "root-package");
+  await put(join(source, "SKILL.md"), "name: root-demo\nroot\n");
+  await put(join(source, "references/nested/SKILL.md"), "name: child\n");
+  await put(join(source, "scripts/run.sh"), "#!/bin/sh\nexit 0\n");
+  await chmod(join(source, "scripts/run.sh"), 0o755);
+  skillsync(fixture, ["--json", "init"]);
+  expect(skillsync(fixture, ["--json", "import", "--from", source, "--skill", "root-demo"]).json.status).toBe("adopted");
+  expect(await readFile(join(fixture.library, "root-demo/references/nested/SKILL.md"), "utf8")).toBe("name: child\n");
+  expect((await stat(join(fixture.library, "root-demo/scripts/run.sh"))).mode & 0o111).toBe(0o111);
+});
+
+test("imports one selected package and fails missing selection", async () => {
+  const fixture = await makeFixture();
+  const source = join(fixture.root, "many");
+  await put(join(source, "one/SKILL.md"), "name: one\n");
+  await put(join(source, "two/SKILL.md"), "name: two\n");
+  skillsync(fixture, ["--json", "init"]);
+  expect(skillsync(fixture, ["--json", "import", "--from", source], false).json.message).toContain("--skill is required");
+  expect(skillsync(fixture, ["--json", "import", "--from", source, "--skill", "one"]).json.skill).toBe("one");
+  expect(await Bun.file(join(fixture.library, "two/SKILL.md")).exists()).toBe(false);
+  expect(skillsync(fixture, ["--json", "import", "--from", source, "--skill", "missing"], false).json.message).toContain("skill not found");
+});
+
+test("rejects malformed manifests and symlinked import roots", async () => {
+  if (process.platform === "win32") return;
+  const noWhitespace = await makeFixture();
+  await put(join(noWhitespace.root, "source/SKILL.md"), "name:demo\n");
+  skillsync(noWhitespace, ["--json", "init"]);
+  expect(skillsync(noWhitespace, ["--json", "import", "--from", join(noWhitespace.root, "source"), "--skill", "demo"], false).json.ok).toBe(false);
+  for (const [label, manifest] of [["indented", "  name: bad\n"], ["duplicate", "name: bad\nname: other\n"], ["quoted", 'name: "bad"\n'], ["conflicting", "name: bad\nname: other\n"], ["prose", "This is prose\n"]] as const) {
+    const fixture = await makeFixture(); const source = join(fixture.root, label);
+    await put(join(source, "SKILL.md"), manifest); skillsync(fixture, ["--json", "init"]);
+    expect(skillsync(fixture, ["--json", "import", "--from", source, "--skill", "bad"], false).json.ok).toBe(false);
+  }
+  const fixture = await makeFixture(); const real = join(fixture.root, "real"), linked = join(fixture.root, "linked");
+  await put(join(real, "SKILL.md"), "name: linked\n"); await symlink(real, linked, "dir"); skillsync(fixture, ["--json", "init"]);
+  expect(skillsync(fixture, ["--json", "import", "--from", linked, "--skill", "linked"], false).json.message).toContain("symlink");
+});
+
+test("preserves differing import collisions", async () => {
+  const fixture = await makeFixture(); const source = join(fixture.root, "source");
+  await put(join(source, "SKILL.md"), "name: collision\nincoming\n"); await put(join(fixture.library, "collision/SKILL.md"), "name: collision\nexisting\n");
+  skillsync(fixture, ["--json", "init"]); expect(skillsync(fixture, ["--json", "import", "--from", source, "--skill", "collision"], false).json.message).toContain("different contents");
+  expect(await readFile(join(fixture.library, "collision/SKILL.md"), "utf8")).toContain("existing");
+});
+
+test("local adoption provenance tampering is rejected", async () => {
+  const fixture = await makeFixture(); const source = join(fixture.root, "source");
+  await put(join(source, "SKILL.md"), "name: adopted\n"); skillsync(fixture, ["--json", "init"]); skillsync(fixture, ["--json", "import", "--from", source, "--skill", "adopted"]);
+  const statePath = join(fixture.config, "state.json"); const state = JSON.parse(await readFile(statePath, "utf8"));
+  for (const [key, field, value] of [["local:wrong", "source_package", "../escape"], ["local:adopted", "local_path", join(fixture.root, "outside")], ["local:adopted", "content_hash", "0".repeat(64)]]) {
+    const tampered = structuredClone(state); delete tampered.local_adoptions["local:adopted"]; tampered.local_adoptions[key] = { ...state.local_adoptions["local:adopted"], [field]: value }; await writeFile(statePath, JSON.stringify(tampered));
+    expect(skillsync(fixture, ["--json", "status"], false).json.ok).toBe(false);
+  }
+});
+
+test("rejects a dangling persisted local-adoption source symlink", async () => {
+  if (process.platform === "win32") return;
+  const fixture = await makeFixture();
+  const source = join(fixture.root, "source");
+  await put(join(source, "SKILL.md"), "name: adopted\n");
+  skillsync(fixture, ["--json", "init"]);
+  skillsync(fixture, ["--json", "import", "--from", source, "--skill", "adopted"]);
+  const statePath = join(fixture.config, "state.json");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  const dangling = join(fixture.root, "dangling");
+  await symlink(join(fixture.root, "does-not-exist"), dangling, "dir");
+  state.local_adoptions["local:adopted"].source_path = dangling;
+  await writeFile(statePath, JSON.stringify(state));
+  const rejected = skillsync(fixture, ["--json", "status"], false);
+  expect(rejected.json.ok).toBe(false);
+  expect(rejected.json.message).toContain("symlink");
+});
+
+test("rolls back a new import when provenance state save fails", async () => {
+  const fixture = await makeFixture();
+  const source = join(fixture.root, "source");
+  await put(join(source, "SKILL.md"), "name: rollback\nv1\n");
+  skillsync(fixture, ["--json", "init"]);
+  const failed = run(binary, ["--json", "import", "--from", source, "--skill", "rollback"], undefined, {
+    ...fixture.env,
+    SKILLSYNC_TEST_FAIL_STATE_SAVE: "1",
+  });
+  expect(failed.code).toBe(1);
+  expect(failed.stdout).toContain("rolled back");
+  expect(await Bun.file(join(fixture.library, "rollback/SKILL.md")).exists()).toBe(false);
+  expect(skillsync(fixture, ["--json", "status"]).json.local_adoptions).toEqual({});
+});
+
 test("local Git subscribe, merge, conflict recovery, and scoped publication", async () => {
   const fixture = await makeFixture();
   const source = join(fixture.root, "source");
@@ -588,17 +745,17 @@ test("rejects Windows-invalid portable set identifiers", async () => {
 test("links one canonical skill into an explicit harness root and safely unlinks it", async () => {
   if (process.platform === "win32") return;
   const fixture = await makeFixture();
-  await put(join(fixture.library, "linked/SKILL.md"), "name: linked\\nbase\\n");
+  await put(join(fixture.library, "linked/SKILL.md"), "name: linked\nbase\n");
   const harness = join(fixture.root, "harness-skills");
   await mkdir(harness, { recursive: true });
-  await put(join(harness, "bundled.txt"), "keep\\n");
+  await put(join(harness, "bundled.txt"), "keep\n");
   skillsync(fixture, ["--json", "init"]);
   const linked = skillsync(fixture, ["--json", "harness", "link", "--root", harness, "--skill", "linked"]).json;
   expect(linked.status).toBe("linked");
   expect((await lstat(join(harness, "linked"))).isSymbolicLink()).toBe(true);
-  await put(join(harness, "linked/references/learning.md"), "canonical\\n");
-  expect(await readFile(join(fixture.library, "linked/references/learning.md"), "utf8")).toBe("canonical\\n");
-  expect(await readFile(join(harness, "bundled.txt"), "utf8")).toBe("keep\\n");
+  await put(join(harness, "linked/references/learning.md"), "canonical\n");
+  expect(await readFile(join(fixture.library, "linked/references/learning.md"), "utf8")).toBe("canonical\n");
+  expect(await readFile(join(harness, "bundled.txt"), "utf8")).toBe("keep\n");
   const collision = skillsync(fixture, ["--json", "harness", "link", "--root", harness, "--skill", "linked"], false);
   expect(collision.json.ok).toBe(false);
   expect(collision.json.message).toContain("already exists");
@@ -606,7 +763,7 @@ test("links one canonical skill into an explicit harness root and safely unlinks
   const unlinked = skillsync(fixture, ["--json", "harness", "unlink", "--root", harness, "--skill", "linked"]).json;
   expect(unlinked.canonical_retained).toBe(true);
   expect(await Bun.file(join(fixture.library, "linked/SKILL.md")).exists()).toBe(true);
-  expect(await readFile(join(harness, "bundled.txt"), "utf8")).toBe("keep\\n");
+  expect(await readFile(join(harness, "bundled.txt"), "utf8")).toBe("keep\n");
   const invalid = skillsync(fixture, ["--json", "harness", "link", "--root", join(fixture.root, "missing"), "--skill", "linked"], false);
   expect(invalid.json.ok).toBe(false);
 });
@@ -637,10 +794,10 @@ test("reports missing explicit harness links and rejects tampered link state", a
 test("harness link collision is atomic and preserves the preexisting entry", async () => {
   if (process.platform === "win32") return;
   const fixture = await makeFixture();
-  await put(join(fixture.library, "collision/SKILL.md"), "name: collision\\n");
+  await put(join(fixture.library, "collision/SKILL.md"), "name: collision\n");
   const harness = join(fixture.root, "collision-harness");
   await mkdir(harness, { recursive: true });
-  await put(join(harness, "collision"), "unrelated\\n");
+  await put(join(harness, "collision"), "unrelated\n");
   skillsync(fixture, ["--json", "init"]);
   const rejected = skillsync(
     fixture,
@@ -648,6 +805,6 @@ test("harness link collision is atomic and preserves the preexisting entry", asy
     false,
   );
   expect(rejected.json.ok).toBe(false);
-  expect(await readFile(join(harness, "collision"), "utf8")).toBe("unrelated\\n");
+  expect(await readFile(join(harness, "collision"), "utf8")).toBe("unrelated\n");
   expect(Object.keys(skillsync(fixture, ["--json", "harness", "list"]).json.links)).toHaveLength(0);
 });
