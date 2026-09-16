@@ -90,6 +90,18 @@ enum Cmd {
 }
 #[derive(Subcommand)]
 enum HarnessCmd {
+    Enable {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long = "set")]
+        set: String,
+    },
+    Disable {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long = "set")]
+        set: String,
+    },
     Link {
         #[arg(long)]
         root: PathBuf,
@@ -130,6 +142,8 @@ struct State {
     #[serde(default)]
     harness_links: BTreeMap<String, HarnessLink>,
     #[serde(default)]
+    harness_sets: BTreeMap<String, HarnessSetEnablement>,
+    #[serde(default)]
     local_adoptions: BTreeMap<String, LocalAdoption>,
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -152,6 +166,12 @@ struct HarnessLink {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct SkillSet {
     #[serde(default)]
+    members: BTreeSet<String>,
+}
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct HarnessSetEnablement {
+    set: String,
+    harness_root: String,
     members: BTreeSet<String>,
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -616,12 +636,12 @@ impl App {
             serde_json::from_slice(&read_regular_file(&sp, None)?)?
         } else {
             State {
-                version: 4,
+                version: 5,
                 library: expected_library.display().to_string(),
                 ..Default::default()
             }
         };
-        if state.version > 4 {
+        if state.version > 5 {
             return Err(anyhow!("unsupported state version: {}", state.version));
         }
         if state.version < 3 {
@@ -643,6 +663,9 @@ impl App {
         if state.version < 4 {
             state.version = 4;
         }
+        if state.version < 5 {
+            state.version = 5;
+        }
         validate_set_state(&state)?;
         let library = if state_exists && !state.library.is_empty() {
             let persisted = PathBuf::from(&state.library);
@@ -657,6 +680,7 @@ impl App {
         };
         assert_no_symlink_path(&library, Path::new("."))?;
         validate_harness_links(&state, &library)?;
+        validate_harness_sets(&state, &library)?;
         validate_local_adoptions(&state, &library)?;
         let baselines = c.join("baselines");
         let recovery = c.join("recovery");
@@ -2360,6 +2384,44 @@ fn validate_harness_links(state: &State, library: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_harness_sets(state: &State, library: &Path) -> Result<()> {
+    for (relationship, record) in &state.harness_sets {
+        let set = strict_component(&record.set, "harness set name")?;
+        state
+            .sets
+            .get(&set)
+            .ok_or_else(|| anyhow!("harness set refers to missing set: {set}"))?;
+        let root = persisted_harness_root(Path::new(&record.harness_root))?;
+        if Path::new(&record.harness_root) != root {
+            return Err(anyhow!("harness set root is not canonical"));
+        }
+        if harness_set_key(&set, &root) != *relationship {
+            return Err(anyhow!(
+                "harness set relationship key does not match record"
+            ));
+        }
+        // Enablement is a one-time expansion. Validate the recorded member
+        // identities and their owned links, but do not compare them with the
+        // set's current membership: later set changes must not strand links.
+        for member in &record.members {
+            let skill = set_member_name(member)?;
+            let key = harness_key(&skill, &root);
+            let link = state
+                .harness_links
+                .get(&key)
+                .ok_or_else(|| anyhow!("harness set link record missing"))?;
+            validate_harness_link_record(&key, link, library)?;
+            if Path::new(&link.harness_root) != root
+                || Path::new(&link.link_path) != root.join(&skill)
+                || link.status != "linked"
+            {
+                return Err(anyhow!("harness set link record does not match set"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn resolve_link_target(link: &Path) -> Result<PathBuf> {
     let target = fs::read_link(link)?;
     if target.is_absolute() {
@@ -2383,6 +2445,16 @@ fn link_targets_match(target: &Path, expected: &Path) -> Result<bool> {
 }
 
 fn create_directory_link(target: &Path, link: &Path) -> Result<()> {
+    if std::env::var("SKILLSYNC_TEST_FAIL_CREATE_MEMBER").as_deref()
+        == Ok(link
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(""))
+    {
+        return Err(anyhow!(
+            "injected directory-link creation failure (test-only)"
+        ));
+    }
     #[cfg(unix)]
     {
         use std::{ffi::CString, os::unix::ffi::OsStrExt};
@@ -2418,6 +2490,13 @@ fn create_directory_link(target: &Path, link: &Path) -> Result<()> {
 }
 
 fn remove_directory_link(link: &Path) -> Result<()> {
+    if std::env::var("SKILLSYNC_TEST_FAIL_REMOVE_MEMBER").as_deref()
+        == Ok(link.file_name().and_then(|n| n.to_str()).unwrap_or(""))
+    {
+        return Err(anyhow!(
+            "injected directory-link removal failure (test-only)"
+        ));
+    }
     #[cfg(unix)]
     {
         use std::{ffi::CString, os::unix::ffi::OsStrExt};
@@ -2469,26 +2548,33 @@ fn harness_link_health(a: &App) -> Result<Vec<serde_json::Value>> {
     for (key, record) in &a.state.harness_links {
         let link = PathBuf::from(&record.link_path);
         let expected = PathBuf::from(&record.canonical_path);
-        let (status, message) = match fs::symlink_metadata(&link) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
-                "missing",
-                Some("recorded harness link is missing".to_owned()),
-            ),
-            Err(error) => ("unreadable", Some(error.to_string())),
-            Ok(metadata) if !metadata.file_type().is_symlink() => (
-                "collision",
-                Some("recorded harness path is not a symlink".to_owned()),
-            ),
-            Ok(_) => match resolve_link_target(&link)
-                .and_then(|target| link_targets_match(&target, &expected))
-            {
-                Ok(true) => ("healthy", None),
-                Ok(false) => (
-                    "wrong_target",
-                    Some("link target does not match".to_owned()),
+        let (status, message) = if !Path::new(&record.harness_root).exists() {
+            (
+                "missing_root",
+                Some("harness root is unavailable; relationship is degraded".to_owned()),
+            )
+        } else {
+            match fs::symlink_metadata(&link) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+                    "missing",
+                    Some("recorded harness link is missing".to_owned()),
                 ),
                 Err(error) => ("unreadable", Some(error.to_string())),
-            },
+                Ok(metadata) if !metadata.file_type().is_symlink() => (
+                    "collision",
+                    Some("recorded harness path is not a symlink".to_owned()),
+                ),
+                Ok(_) => match resolve_link_target(&link)
+                    .and_then(|target| link_targets_match(&target, &expected))
+                {
+                    Ok(true) => ("healthy", None),
+                    Ok(false) => (
+                        "wrong_target",
+                        Some("link target does not match".to_owned()),
+                    ),
+                    Err(error) => ("unreadable", Some(error.to_string())),
+                },
+            }
         };
         health.push(serde_json::json!({
             "relationship": key,
@@ -2498,6 +2584,22 @@ fn harness_link_health(a: &App) -> Result<Vec<serde_json::Value>> {
             "status": status,
             "message": message,
         }));
+    }
+    for (key, record) in &a.state.harness_sets {
+        if record.members.is_empty() {
+            let missing_root = !Path::new(&record.harness_root).exists();
+            health.push(serde_json::json!({
+                "relationship": key,
+                "set": record.set,
+                "harness_root": record.harness_root,
+                "status": if missing_root { "missing_root" } else { "healthy" },
+                "message": if missing_root {
+                    Some("harness root is unavailable; relationship is degraded")
+                } else {
+                    None::<&str>
+                },
+            }));
+        }
     }
     Ok(health)
 }
@@ -2518,6 +2620,18 @@ fn existing_harness_root(root: &Path) -> Result<PathBuf> {
         ));
     }
     Ok(fs::canonicalize(root)?)
+}
+
+fn persisted_harness_root(root: &Path) -> Result<PathBuf> {
+    if !root.is_absolute() {
+        return Err(anyhow!("harness root must be absolute"));
+    }
+    assert_no_symlink_path(root, Path::new("."))?;
+    if root.exists() {
+        existing_harness_root(root)
+    } else {
+        Ok(root.to_path_buf())
+    }
 }
 
 fn harness_link(a: &mut App, root: &Path, raw_skill: &str) -> Result<serde_json::Value> {
@@ -2596,6 +2710,388 @@ fn harness_unlink(a: &mut App, root: &Path, raw_skill: &str) -> Result<serde_jso
         };
     }
     Ok(serde_json::json!({"status":"unlinked","relationship":key,"canonical_retained":true}))
+}
+
+fn harness_set_key(set: &str, root: &Path) -> String {
+    let mut h = Sha256::new();
+    h.update(b"harness-set\\0");
+    h.update(set.as_bytes());
+    h.update([0]);
+    h.update(root.to_string_lossy().as_bytes());
+    format!("hset-{:x}", h.finalize())
+}
+
+fn rollback_created_links(created: &[(String, PathBuf, PathBuf)]) -> Result<()> {
+    let mut failures = Vec::new();
+    for (_, canonical, link) in created.iter().rev() {
+        let valid = fs::symlink_metadata(link)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+            && resolve_link_target(link)
+                .and_then(|target| link_targets_match(&target, canonical))
+                .unwrap_or(false);
+        if !valid {
+            failures.push(format!(
+                "{} is no longer the expected native link",
+                link.display()
+            ));
+            continue;
+        }
+        if let Err(error) = remove_directory_link(link).and_then(|_| ensure_link_absent(link)) {
+            failures.push(format!("{}: {error}", link.display()));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "rollback failed; recovery required: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+#[derive(Clone)]
+struct HarnessSetFsSnapshot {
+    library: DirectoryIdentity,
+    root: DirectoryIdentity,
+    parent: DirectoryIdentity,
+    members: BTreeMap<String, DirectoryIdentity>,
+}
+
+fn harness_set_fs_snapshot(
+    library: &Path,
+    root: &Path,
+    plans: &[(String, PathBuf, PathBuf)],
+) -> Result<HarnessSetFsSnapshot> {
+    let parent = root
+        .parent()
+        .ok_or_else(|| anyhow!("harness root has no parent"))?;
+    let mut members = BTreeMap::new();
+    for (skill, canonical, _) in plans {
+        members.insert(skill.clone(), directory_identity(canonical)?);
+    }
+    Ok(HarnessSetFsSnapshot {
+        library: directory_identity(library)?,
+        root: directory_identity(root)?,
+        parent: directory_identity(parent)?,
+        members,
+    })
+}
+
+fn verify_harness_set_fs(
+    snapshot: &HarnessSetFsSnapshot,
+    library: &Path,
+    root: &Path,
+    skill: &str,
+    canonical: &Path,
+) -> Result<()> {
+    let parent = root
+        .parent()
+        .ok_or_else(|| anyhow!("harness root has no parent"))?;
+    let member = snapshot
+        .members
+        .get(skill)
+        .copied()
+        .ok_or_else(|| anyhow!("member identity missing"))?;
+    if directory_identity(library)? != snapshot.library
+        || directory_identity(root)? != snapshot.root
+        || directory_identity(parent)? != snapshot.parent
+        || directory_identity(canonical)? != member
+    {
+        return Err(anyhow!("harness set filesystem identity changed; retry"));
+    }
+    Ok(())
+}
+
+fn verify_harness_set_link(link: &Path, canonical: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(link)?;
+    if !metadata.file_type().is_symlink() {
+        return Err(anyhow!("harness set link is no longer a native link"));
+    }
+    let target = resolve_link_target(link)?;
+    if !link_targets_match(&target, canonical)? {
+        return Err(anyhow!("harness set link target changed"));
+    }
+    Ok(())
+}
+
+fn harness_set(
+    a: &mut App,
+    root: &Path,
+    raw_set: &str,
+    enabling: bool,
+) -> Result<serde_json::Value> {
+    let set = strict_component(raw_set, "set name")?;
+    let root = if enabling {
+        existing_harness_root(root)?
+    } else {
+        persisted_harness_root(root)?
+    };
+    let definition = a
+        .state
+        .sets
+        .get(&set)
+        .cloned()
+        .ok_or_else(|| anyhow!("set not found: {set}"))?;
+    let members = definition
+        .members
+        .iter()
+        .map(|id| set_member_name(id))
+        .collect::<Result<Vec<_>>>()?;
+    let mut plans = Vec::new();
+    for skill in members {
+        let canonical = a.library.join(&skill);
+        assert_no_symlink_path(&a.library, Path::new(&skill))?;
+        if !canonical.is_dir()
+            || fs::canonicalize(&canonical)? != canonical
+            || manifest_name(&canonical)? != skill
+        {
+            return Err(anyhow!(
+                "set member is not a canonical library package: {skill}"
+            ));
+        }
+        let link = root.join(&skill);
+        assert_no_symlink_path(&root, Path::new("."))?;
+        plans.push((skill, canonical, link));
+    }
+    let relationship = harness_set_key(&set, &root);
+    if enabling {
+        if let Some(record) = a.state.harness_sets.get(&relationship).cloned() {
+            // An existing relationship is only idempotent when its persisted
+            // enablement and every expanded member link still describe the
+            // same safe, live integration. Never repair or mutate a damaged
+            // relationship on the idempotence path.
+            if record.set != set {
+                return Err(anyhow!("harness set record name does not match set"));
+            }
+            if Path::new(&record.harness_root) != root.as_path() {
+                return Err(anyhow!("harness set root does not match relationship"));
+            }
+            for member in &record.members {
+                let skill = set_member_name(member)?;
+                let key = harness_key(&skill, &root);
+                let link = a
+                    .state
+                    .harness_links
+                    .get(&key)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("set link record missing"))?;
+                validate_harness_link_record(&key, &link, &a.library)?;
+                let target = resolve_link_target(Path::new(&link.link_path))
+                    .context("recorded set harness path is not a symlink")?;
+                if !link_targets_match(&target, Path::new(&link.canonical_path))? {
+                    return Err(anyhow!("set link target does not match canonical skill"));
+                }
+            }
+            return Ok(
+                serde_json::json!({"status":"already_enabled","set":set,"relationship":relationship}),
+            );
+        }
+        // Preflight every destination before creating any link, so a later
+        // collision cannot leave an earlier member partially enabled.
+        for (skill, _, link) in &plans {
+            // A new set expansion must never adopt an existing path or link
+            // record. Only a link created by this expansion can be owned by
+            // the resulting set relationship; an existing relationship takes
+            // the separate idempotent path above.
+            let key = harness_key(skill, &root);
+            if a.state.harness_links.contains_key(&key) {
+                return Err(anyhow!("harness link already recorded: {key}"));
+            }
+            if fs::symlink_metadata(link).is_ok() {
+                return Err(anyhow!(
+                    "harness skill path already exists: {}",
+                    link.display()
+                ));
+            }
+        }
+        let snapshot = harness_set_fs_snapshot(&a.library, &root, &plans)?;
+        let mut created = Vec::new();
+        for (skill, canonical, link) in &plans {
+            if let Err(error) =
+                verify_harness_set_fs(&snapshot, &a.library, &root, skill, canonical)
+                    .and_then(|_| ensure_link_absent(link))
+            {
+                let rollback = rollback_created_links(&created);
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(anyhow!("{error}; {rollback_error}")),
+                };
+            }
+            if let Err(error) = create_directory_link(canonical, link) {
+                let rollback = rollback_created_links(&created);
+                return match rollback {
+                    Ok(()) => Err(error).context("create harness set link; links rolled back"),
+                    Err(rollback_error) => Err(anyhow!(
+                        "create harness set link failed: {error}; {rollback_error}"
+                    )),
+                };
+            }
+            created.push((skill.clone(), canonical.clone(), link.clone()));
+            if let Err(error) =
+                verify_harness_set_fs(&snapshot, &a.library, &root, skill, canonical)
+                    .and_then(|_| verify_harness_set_link(link, canonical))
+            {
+                let rollback = rollback_created_links(&created);
+                return match rollback {
+                    Ok(()) => Err(error).context("verify harness set link; links rolled back"),
+                    Err(rollback_error) => Err(anyhow!(
+                        "verify harness set link failed: {error}; {rollback_error}"
+                    )),
+                };
+            }
+        }
+        let previous = a.state.clone();
+        for (skill, _, _) in &created {
+            let key = harness_key(skill, &root);
+            a.state.harness_links.insert(
+                key,
+                HarnessLink {
+                    skill: skill.clone(),
+                    harness_root: root.display().to_string(),
+                    canonical_path: a.library.join(skill).display().to_string(),
+                    link_path: root.join(skill).display().to_string(),
+                    status: "linked".into(),
+                },
+            );
+        }
+        a.state.harness_sets.insert(
+            relationship.clone(),
+            HarnessSetEnablement {
+                set: set.clone(),
+                harness_root: root.display().to_string(),
+                members: definition.members,
+            },
+        );
+        if let Err(e) = a.save() {
+            a.state = previous;
+            let rollback = rollback_created_links(&created);
+            if let Err(rollback_error) = rollback {
+                return Err(anyhow!(
+                    "save harness set state failed: {e}; {rollback_error}"
+                ));
+            }
+            return Err(e).context("save harness set state; links rolled back");
+        }
+        Ok(
+            serde_json::json!({"status":"enabled","set":set,"relationship":relationship,"members":plans.iter().map(|x|x.0.clone()).collect::<Vec<_>>()}),
+        )
+    } else {
+        let record = a
+            .state
+            .harness_sets
+            .get(&relationship)
+            .cloned()
+            .ok_or_else(|| anyhow!("set enablement not found: {set}"))?;
+        let previous = a.state.clone();
+        // Validate every member before unlinking any member.
+        let mut removal_plan = Vec::new();
+        for skill in &record.members {
+            let key = harness_key(&set_member_name(skill)?, &root);
+            let link = a
+                .state
+                .harness_links
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| anyhow!("set link record missing"))?;
+            validate_harness_link_record(&key, &link, &a.library)?;
+            let target = resolve_link_target(Path::new(&link.link_path))?;
+            if !link_targets_match(&target, Path::new(&link.canonical_path))? {
+                return Err(anyhow!("set link target does not match canonical skill"));
+            }
+            removal_plan.push((key, link));
+        }
+        let removal_snapshot_plans = removal_plan
+            .iter()
+            .map(|(_, link)| {
+                (
+                    link.skill.clone(),
+                    PathBuf::from(&link.canonical_path),
+                    PathBuf::from(&link.link_path),
+                )
+            })
+            .collect::<Vec<_>>();
+        let snapshot = harness_set_fs_snapshot(&a.library, &root, &removal_snapshot_plans)?;
+        let mut removed: Vec<(String, HarnessLink)> = Vec::new();
+        for (key, link) in removal_plan {
+            let skill = link.skill.clone();
+            let canonical = Path::new(&link.canonical_path);
+            if let Err(error) =
+                verify_harness_set_fs(&snapshot, &a.library, &root, &skill, canonical)
+                    .and_then(|_| verify_harness_set_link(Path::new(&link.link_path), canonical))
+                    .and_then(|_| remove_directory_link(Path::new(&link.link_path)))
+                    .and_then(|_| {
+                        verify_harness_set_fs(&snapshot, &a.library, &root, &skill, canonical)
+                    })
+                    .and_then(|_| ensure_link_absent(Path::new(&link.link_path)))
+            {
+                let mut failures = Vec::new();
+                for (_, prior) in removed.iter().rev() {
+                    let link_path = Path::new(&prior.link_path);
+                    if let Err(e) =
+                        create_directory_link(Path::new(&prior.canonical_path), link_path).and_then(
+                            |_| {
+                                let target = resolve_link_target(link_path)?;
+                                if link_targets_match(&target, Path::new(&prior.canonical_path))? {
+                                    Ok(())
+                                } else {
+                                    Err(anyhow!("restored link target mismatch"))
+                                }
+                            },
+                        )
+                    {
+                        failures.push(format!("{}: {e}", link_path.display()));
+                    }
+                }
+                a.state = previous;
+                return if failures.is_empty() {
+                    Err(error).context("disable harness set; links restored")
+                } else {
+                    Err(anyhow!(
+                        "{error}; recovery required: {}",
+                        failures.join("; ")
+                    ))
+                };
+            }
+            removed.push((key, link));
+        }
+        for (key, _) in &removed {
+            a.state.harness_links.remove(key);
+        }
+        a.state.harness_sets.remove(&relationship);
+        if let Err(e) = a.save() {
+            a.state = previous;
+            let mut failures = Vec::new();
+            for (_, link) in removed.iter().rev() {
+                if let Err(error) = create_directory_link(
+                    Path::new(&link.canonical_path),
+                    Path::new(&link.link_path),
+                )
+                .and_then(|_| {
+                    let target = resolve_link_target(Path::new(&link.link_path))?;
+                    if link_targets_match(&target, Path::new(&link.canonical_path))? {
+                        Ok(())
+                    } else {
+                        Err(anyhow!("restored link target mismatch"))
+                    }
+                }) {
+                    failures.push(format!("{}: {error}", link.link_path));
+                }
+            }
+            return if failures.is_empty() {
+                Err(e).context("save harness set state; links restored")
+            } else {
+                Err(anyhow!(
+                    "save harness set state failed: {e}; recovery required: {}",
+                    failures.join("; ")
+                ))
+            };
+        }
+        Ok(
+            serde_json::json!({"status":"disabled","set":set,"relationship":relationship,"canonical_retained":true}),
+        )
+    }
 }
 
 fn requires_lock(command: &Cmd) -> bool {
@@ -3240,6 +3736,8 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Cmd::Update | Cmd::Sync => sync_all(&mut a, false),
         Cmd::Worker { once, interval } => run_worker_locked(&mut a, once, interval),
         Cmd::Harness { command } => match command {
+            HarnessCmd::Enable { root, set } => harness_set(&mut a, &root, &set, true),
+            HarnessCmd::Disable { root, set } => harness_set(&mut a, &root, &set, false),
             HarnessCmd::Link { root, skill } => harness_link(&mut a, &root, &skill),
             HarnessCmd::Unlink { root, skill } => harness_unlink(&mut a, &root, &skill),
             HarnessCmd::List => Ok(serde_json::json!({"links":a.state.harness_links})),
@@ -3315,10 +3813,10 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             }
         }
         Cmd::Status => Ok(
-            serde_json::json!({"subscriptions":a.state.subscriptions,"local_adoptions":a.state.local_adoptions,"publications":a.state.publications,"pending_publications":a.state.pending_publications,"harness_links":a.state.harness_links,"worker":worker_status(&a.config)?}),
+            serde_json::json!({"subscriptions":a.state.subscriptions,"local_adoptions":a.state.local_adoptions,"publications":a.state.publications,"pending_publications":a.state.pending_publications,"harness_links":a.state.harness_links,"harness_sets":a.state.harness_sets,"harness_health":harness_link_health(&a)?,"worker":worker_status(&a.config)?}),
         ),
         Cmd::Doctor => Ok(
-            serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":worker_status(&a.config)?,"startup":"unsupported","subscribe_picker":"supported: TTY line-oriented single-select; unattended onboarding unsupported; full TUI: unsupported","harness_write_back":"explicit_directory_links_only","harness_discovery":"unsupported","harness_filtering":"unsupported","harness_reload":"unsupported","harness_links":harness_link_health(&a)?,"hermes_autonomous_curation":"unsupported","registries":"unsupported","set_publication":"unsupported","set_subscription_metadata":"unsupported","harness_enablement":"unsupported","personal_library_sync":"unsupported","membership_change_propagation":"unsupported","local_import":"supported: explicit --from PATH --skill NAME; canonical write-back only; no subscription"}),
+            serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":worker_status(&a.config)?,"startup":"unsupported","subscribe_picker":"supported: TTY line-oriented single-select; unattended onboarding unsupported; full TUI: unsupported","harness_write_back":"explicit_directory_links_only","harness_discovery":"unsupported","harness_filtering":"unsupported","harness_reload":"unsupported","harness_links":harness_link_health(&a)?,"hermes_autonomous_curation":"unsupported","registries":"unsupported","set_publication":"unsupported","set_subscription_metadata":"unsupported","harness_enablement":"supported: explicit one-time set expansion into native directory links","personal_library_sync":"unsupported","membership_change_propagation":"unsupported","local_import":"supported: explicit --from PATH --skill NAME; canonical write-back only; no subscription"}),
         ),
         Cmd::Set { command } => match command {
             SetCmd::Create { name } => {
