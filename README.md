@@ -15,6 +15,9 @@ skillsync publish NAME --repo REPOSITORY --yes   # --dry-run previews
 skillsync unsubscribe NAME
 skillsync unpublish NAME --repo REPOSITORY
 skillsync set create NAME | list | show NAME | add NAME SKILL | remove NAME SKILL
+skillsync harness link --root PATH --skill NAME
+skillsync harness unlink --root PATH --skill NAME
+skillsync harness list
 ```
 
 Use `--json` for structured success and error envelopes. GitHub `owner/repo`, local paths, HTTPS, SSH, and scp-style SSH sources are accepted. Subscribe records a stable source-plus-relative-path relationship key, so same-named skills from different repositories do not overwrite state. Persisted subscription branches are checked out explicitly during updates.
@@ -42,4 +45,6 @@ The Bun suite uses isolated temporary Git repositories and configuration roots. 
 
 ## Honest limits
 
-The foreground worker is supported for `worker --once` and `worker --interval SECONDS`; it owns the same advisory state lock as mutating CLI commands. Named local sets are supported for organizing canonical library skills (`set create/list/show/add/remove`); membership is portable state only. Set publication, set subscription metadata, harness enablement, personal-library sync, and membership-change propagation remain unsupported. Durable sign-in startup registration, a full TUI, registry integration, Hermes autonomous curation, and harness write-back remain unsupported. Semantic conflict resolution, source-specific authentication, and cross-device worker coordination remain unsupported. `unsubscribe` and `unpublish` remove only the relationship and retain installed/published content.
+The explicit harness integration is deliberately narrow: `harness link` creates one native directory symlink from a caller-supplied existing harness skill root to one canonical library skill, and edits through that link write back to the canonical package. `harness unlink` removes only a recorded link whose target still resolves to the expected canonical skill; canonical content is retained. Existing unrelated harness files are preserved and collisions, symlink/reparse roots, and unsafe names are rejected. `harness list`, `status`, and `doctor` report these relationships. Skillsync does not currently discover harnesses automatically, filter harness skills, reload running harnesses, curate Hermes autonomous learning, or promise universal harness compatibility; there is no silent copy fallback. Windows uses native directory symlinks and reports privilege/API failures.
+
+The foreground worker is supported for `worker --once` and `worker --interval SECONDS`; it owns the same advisory state lock as mutating CLI commands. Named local sets are supported for organizing canonical library skills (`set create/list/show/add/remove`); membership is portable state only. Set publication, set subscription metadata, personal-library sync, and membership-change propagation remain unsupported. Durable sign-in startup registration, a full TUI, registry integration, Hermes autonomous curation, and automatic harness discovery/filtering/reload remain unsupported. Semantic conflict resolution, source-specific authentication, and cross-device worker coordination remain unsupported. `unsubscribe` and `unpublish` remove only the relationship and retain installed/published content.

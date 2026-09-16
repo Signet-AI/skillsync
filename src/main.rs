@@ -72,6 +72,26 @@ enum Cmd {
         #[command(subcommand)]
         command: SetCmd,
     },
+    Harness {
+        #[command(subcommand)]
+        command: HarnessCmd,
+    },
+}
+#[derive(Subcommand)]
+enum HarnessCmd {
+    Link {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        skill: String,
+    },
+    Unlink {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        skill: String,
+    },
+    List,
 }
 #[derive(Subcommand)]
 enum SetCmd {
@@ -96,6 +116,16 @@ struct State {
     pending_publications: BTreeMap<String, PendingPublication>,
     #[serde(default)]
     sets: BTreeMap<String, SkillSet>,
+    #[serde(default)]
+    harness_links: BTreeMap<String, HarnessLink>,
+}
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct HarnessLink {
+    skill: String,
+    harness_root: String,
+    canonical_path: String,
+    link_path: String,
+    status: String,
 }
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct SkillSet {
@@ -604,6 +634,7 @@ impl App {
             expected_library.clone()
         };
         assert_no_symlink_path(&library, Path::new("."))?;
+        validate_harness_links(&state, &library)?;
         let baselines = c.join("baselines");
         let recovery = c.join("recovery");
         Ok(Self {
@@ -1994,6 +2025,301 @@ fn run_worker_locked(a: &mut App, once: bool, interval: u64) -> Result<serde_jso
     Ok(serde_json::json!({"worker":"stopped","cycles":cycles,"cancelled":cancelled}))
 }
 
+fn harness_key(skill: &str, root: &Path) -> String {
+    let mut h = Sha256::new();
+    h.update(b"harness-link\0");
+    h.update(skill.as_bytes());
+    h.update([0]);
+    h.update(root.to_string_lossy().as_bytes());
+    format!("hlink-{:x}", h.finalize())
+}
+
+fn validate_harness_link_record(key: &str, record: &HarnessLink, library: &Path) -> Result<()> {
+    let skill = strict_component(&record.skill, "harness link skill")?;
+    let root = PathBuf::from(&record.harness_root);
+    if !root.is_absolute() {
+        return Err(anyhow!("harness link root must be absolute"));
+    }
+    assert_no_symlink_path(&root, Path::new("."))?;
+    if root.exists() {
+        let metadata = fs::symlink_metadata(&root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(anyhow!("harness link root is not a regular directory"));
+        }
+        if fs::canonicalize(&root)? != root {
+            return Err(anyhow!("harness link root is not canonical"));
+        }
+    }
+    let canonical = library.join(&skill);
+    assert_no_symlink_path(&canonical, Path::new("."))?;
+    let link = root.join(&skill);
+    if Path::new(&record.canonical_path) != canonical.as_path() {
+        return Err(anyhow!(
+            "harness link canonical path does not match library"
+        ));
+    }
+    if Path::new(&record.link_path) != link.as_path() {
+        return Err(anyhow!("harness link path does not match harness root"));
+    }
+    if key != harness_key(&skill, &root) {
+        return Err(anyhow!(
+            "harness link relationship key does not match record"
+        ));
+    }
+    if record.status != "linked" {
+        return Err(anyhow!(
+            "unsupported harness link status: {}",
+            record.status
+        ));
+    }
+    Ok(())
+}
+
+fn validate_harness_links(state: &State, library: &Path) -> Result<()> {
+    for (key, record) in &state.harness_links {
+        validate_harness_link_record(key, record, library)?;
+    }
+    Ok(())
+}
+
+fn resolve_link_target(link: &Path) -> Result<PathBuf> {
+    let target = fs::read_link(link)?;
+    if target.is_absolute() {
+        Ok(target)
+    } else {
+        Ok(link
+            .parent()
+            .ok_or_else(|| anyhow!("harness link has no parent"))?
+            .join(target))
+    }
+}
+
+fn link_targets_match(target: &Path, expected: &Path) -> Result<bool> {
+    if target == expected {
+        return Ok(true);
+    }
+    match (fs::canonicalize(target), fs::canonicalize(expected)) {
+        (Ok(actual), Ok(expected)) => Ok(actual == expected),
+        _ => Ok(false),
+    }
+}
+
+fn create_directory_link(target: &Path, link: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let parent = link
+            .parent()
+            .ok_or_else(|| anyhow!("harness link has no parent"))?;
+        let name = link
+            .file_name()
+            .ok_or_else(|| anyhow!("harness link has no name"))?;
+        let parent_fd = open_directory_fd(parent)?;
+        let target = CString::new(target.as_os_str().as_bytes())?;
+        let name = CString::new(name.as_bytes())?;
+        let result = unsafe { libc::symlinkat(target.as_ptr(), parent_fd, name.as_ptr()) };
+        let error = if result == 0 {
+            None
+        } else {
+            Some(std::io::Error::last_os_error())
+        };
+        unsafe { libc::close(parent_fd) };
+        error.map_or(Ok(()), Err).map_err(Into::into)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(target, link)
+            .with_context(|| "create directory symlink (Windows privilege may be required)")?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, link);
+        Err(anyhow!("directory links are unsupported on this platform"))
+    }
+}
+
+fn remove_directory_link(link: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let parent = link
+            .parent()
+            .ok_or_else(|| anyhow!("harness link has no parent"))?;
+        let name = link
+            .file_name()
+            .ok_or_else(|| anyhow!("harness link has no name"))?;
+        let parent_fd = open_directory_fd(parent)?;
+        let name = CString::new(name.as_bytes())?;
+        let result = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
+        let error = if result == 0 {
+            None
+        } else {
+            Some(std::io::Error::last_os_error())
+        };
+        unsafe { libc::close(parent_fd) };
+        error.map_or(Ok(()), Err).map_err(Into::into)
+    }
+    #[cfg(windows)]
+    {
+        let metadata = fs::symlink_metadata(link)?;
+        if !metadata.file_type().is_symlink() {
+            return Err(anyhow!(
+                "harness path is not a directory link: {}",
+                link.display()
+            ));
+        }
+        fs::remove_dir(link)?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(anyhow!("directory links are unsupported on this platform"))
+    }
+}
+
+fn ensure_link_absent(link: &Path) -> Result<()> {
+    match fs::symlink_metadata(link) {
+        Ok(_) => Err(anyhow!("harness link still exists: {}", link.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn harness_link_health(a: &App) -> Result<Vec<serde_json::Value>> {
+    let mut health = Vec::new();
+    for (key, record) in &a.state.harness_links {
+        let link = PathBuf::from(&record.link_path);
+        let expected = PathBuf::from(&record.canonical_path);
+        let (status, message) = match fs::symlink_metadata(&link) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+                "missing",
+                Some("recorded harness link is missing".to_owned()),
+            ),
+            Err(error) => ("unreadable", Some(error.to_string())),
+            Ok(metadata) if !metadata.file_type().is_symlink() => (
+                "collision",
+                Some("recorded harness path is not a symlink".to_owned()),
+            ),
+            Ok(_) => match resolve_link_target(&link)
+                .and_then(|target| link_targets_match(&target, &expected))
+            {
+                Ok(true) => ("healthy", None),
+                Ok(false) => (
+                    "wrong_target",
+                    Some("link target does not match".to_owned()),
+                ),
+                Err(error) => ("unreadable", Some(error.to_string())),
+            },
+        };
+        health.push(serde_json::json!({
+            "relationship": key,
+            "skill": record.skill,
+            "harness_root": record.harness_root,
+            "link_path": record.link_path,
+            "status": status,
+            "message": message,
+        }));
+    }
+    Ok(health)
+}
+
+fn existing_harness_root(root: &Path) -> Result<PathBuf> {
+    if !root.is_absolute() {
+        return Err(anyhow!(
+            "harness root must be an absolute existing directory"
+        ));
+    }
+    assert_no_symlink_path(root, Path::new("."))?;
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|_| anyhow!("harness root does not exist: {}", root.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(anyhow!(
+            "harness root must be a regular directory: {}",
+            root.display()
+        ));
+    }
+    Ok(fs::canonicalize(root)?)
+}
+
+fn harness_link(a: &mut App, root: &Path, raw_skill: &str) -> Result<serde_json::Value> {
+    let skill = strict_component(raw_skill, "skill name")?;
+    let root = existing_harness_root(root)?;
+    let canonical = a.library.join(&skill);
+    assert_no_symlink_path(&a.library, Path::new(&skill))?;
+    if !canonical.is_dir() || !checked_regular_path(&canonical.join("SKILL.md"), "skill manifest")?
+    {
+        return Err(anyhow!("skill not found in library: {skill}"));
+    }
+    let link = root.join(&skill);
+    assert_no_symlink_path(&root, Path::new("."))?;
+    if fs::symlink_metadata(&link).is_ok() {
+        return Err(anyhow!(
+            "harness skill path already exists: {}",
+            link.display()
+        ));
+    }
+    let key = harness_key(&skill, &root);
+    if a.state.harness_links.contains_key(&key) {
+        return Err(anyhow!("harness link already recorded: {key}"));
+    }
+    create_directory_link(&canonical, &link)
+        .with_context(|| format!("create directory symlink: {}", link.display()))?;
+    let record = HarnessLink {
+        skill: skill.clone(),
+        harness_root: root.display().to_string(),
+        canonical_path: canonical.display().to_string(),
+        link_path: link.display().to_string(),
+        status: "linked".into(),
+    };
+    a.state.harness_links.insert(key.clone(), record.clone());
+    if let Err(error) = a.save() {
+        a.state.harness_links.remove(&key);
+        return match remove_directory_link(&link).and_then(|_| ensure_link_absent(&link)) {
+            Ok(()) => Err(error).context("save harness link state; link rolled back"),
+            Err(rollback_error) => Err(anyhow!(
+                "save harness link state failed: {error}; link rollback failed: {rollback_error}"
+            )),
+        };
+    }
+    Ok(serde_json::json!({"status":"linked","relationship":key,"link":record}))
+}
+
+fn harness_unlink(a: &mut App, root: &Path, raw_skill: &str) -> Result<serde_json::Value> {
+    let skill = strict_component(raw_skill, "skill name")?;
+    let root = existing_harness_root(root)?;
+    let key = harness_key(&skill, &root);
+    let record = a
+        .state
+        .harness_links
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| anyhow!("harness link not found"))?;
+    let relationship = harness_key(&skill, &root);
+    validate_harness_link_record(&relationship, &record, &a.library)?;
+    let link = root.join(&skill);
+    let expected = a.library.join(&skill);
+    let target = resolve_link_target(&link).context("recorded harness path is not a symlink")?;
+    if !link_targets_match(&target, &expected)? {
+        return Err(anyhow!(
+            "harness link target does not match canonical skill"
+        ));
+    }
+    remove_directory_link(&link).context("remove harness directory link")?;
+    ensure_link_absent(&link)?;
+    a.state.harness_links.remove(&key);
+    if let Err(error) = a.save() {
+        a.state.harness_links.insert(key.clone(), record);
+        return match create_directory_link(&expected, &link) {
+            Ok(()) => Err(error).context("save harness unlink state; link restored"),
+            Err(restore_error) => Err(anyhow!(
+                "save harness unlink state failed: {error}; link restore failed: {restore_error}"
+            )),
+        };
+    }
+    Ok(serde_json::json!({"status":"unlinked","relationship":key,"canonical_retained":true}))
+}
+
 fn requires_lock(command: &Cmd) -> bool {
     match command {
         Cmd::Config {
@@ -2001,7 +2327,10 @@ fn requires_lock(command: &Cmd) -> bool {
         }
         | Cmd::Status
         | Cmd::Diff
-        | Cmd::Doctor => false,
+        | Cmd::Doctor
+        | Cmd::Harness {
+            command: HarnessCmd::List,
+        } => false,
         Cmd::Publish { dry_run, .. } => !dry_run,
         _ => true,
     }
@@ -2208,6 +2537,11 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         }
         Cmd::Update | Cmd::Sync => sync_all(&mut a, false),
         Cmd::Worker { once, interval } => run_worker_locked(&mut a, once, interval),
+        Cmd::Harness { command } => match command {
+            HarnessCmd::Link { root, skill } => harness_link(&mut a, &root, &skill),
+            HarnessCmd::Unlink { root, skill } => harness_unlink(&mut a, &root, &skill),
+            HarnessCmd::List => Ok(serde_json::json!({"links":a.state.harness_links})),
+        },
         Cmd::Diff => {
             let mut v = vec![];
             for (key, sub) in &a.state.subscriptions {
@@ -2279,10 +2613,10 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             }
         }
         Cmd::Status => Ok(
-            serde_json::json!({"subscriptions":a.state.subscriptions,"publications":a.state.publications,"pending_publications":a.state.pending_publications,"worker":worker_status(&a.config)?}),
+            serde_json::json!({"subscriptions":a.state.subscriptions,"publications":a.state.publications,"pending_publications":a.state.pending_publications,"harness_links":a.state.harness_links,"worker":worker_status(&a.config)?}),
         ),
         Cmd::Doctor => Ok(
-            serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":worker_status(&a.config)?,"startup":"unsupported","harness_write_back":"unsupported","hermes_autonomous_curation":"unsupported","registries":"unsupported","set_publication":"unsupported","set_subscription_metadata":"unsupported","harness_enablement":"unsupported","personal_library_sync":"unsupported","membership_change_propagation":"unsupported"}),
+            serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":worker_status(&a.config)?,"startup":"unsupported","harness_write_back":"explicit_directory_links_only","harness_discovery":"unsupported","harness_filtering":"unsupported","harness_reload":"unsupported","harness_links":harness_link_health(&a)?,"hermes_autonomous_curation":"unsupported","registries":"unsupported","set_publication":"unsupported","set_subscription_metadata":"unsupported","harness_enablement":"unsupported","personal_library_sync":"unsupported","membership_change_propagation":"unsupported"}),
         ),
         Cmd::Set { command } => match command {
             SetCmd::Create { name } => {

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -583,4 +583,71 @@ test("rejects Windows-invalid portable set identifiers", async () => {
   const trailing = skillsync(fixture, ["--json", "set", "create", "name."], false);
   expect(trailing.json.ok).toBe(false);
   expect(trailing.json.message).toContain("invalid set name");
+});
+
+test("links one canonical skill into an explicit harness root and safely unlinks it", async () => {
+  if (process.platform === "win32") return;
+  const fixture = await makeFixture();
+  await put(join(fixture.library, "linked/SKILL.md"), "name: linked\\nbase\\n");
+  const harness = join(fixture.root, "harness-skills");
+  await mkdir(harness, { recursive: true });
+  await put(join(harness, "bundled.txt"), "keep\\n");
+  skillsync(fixture, ["--json", "init"]);
+  const linked = skillsync(fixture, ["--json", "harness", "link", "--root", harness, "--skill", "linked"]).json;
+  expect(linked.status).toBe("linked");
+  expect((await lstat(join(harness, "linked"))).isSymbolicLink()).toBe(true);
+  await put(join(harness, "linked/references/learning.md"), "canonical\\n");
+  expect(await readFile(join(fixture.library, "linked/references/learning.md"), "utf8")).toBe("canonical\\n");
+  expect(await readFile(join(harness, "bundled.txt"), "utf8")).toBe("keep\\n");
+  const collision = skillsync(fixture, ["--json", "harness", "link", "--root", harness, "--skill", "linked"], false);
+  expect(collision.json.ok).toBe(false);
+  expect(collision.json.message).toContain("already exists");
+  expect(Object.keys(skillsync(fixture, ["--json", "harness", "list"]).json.links)).toHaveLength(1);
+  const unlinked = skillsync(fixture, ["--json", "harness", "unlink", "--root", harness, "--skill", "linked"]).json;
+  expect(unlinked.canonical_retained).toBe(true);
+  expect(await Bun.file(join(fixture.library, "linked/SKILL.md")).exists()).toBe(true);
+  expect(await readFile(join(harness, "bundled.txt"), "utf8")).toBe("keep\\n");
+  const invalid = skillsync(fixture, ["--json", "harness", "link", "--root", join(fixture.root, "missing"), "--skill", "linked"], false);
+  expect(invalid.json.ok).toBe(false);
+});
+
+test("reports missing explicit harness links and rejects tampered link state", async () => {
+  if (process.platform === "win32") return;
+  const fixture = await makeFixture();
+  await put(join(fixture.library, "linked/SKILL.md"), "name: linked\n");
+  const harness = join(fixture.root, "harness-skills");
+  await mkdir(harness, { recursive: true });
+  skillsync(fixture, ["--json", "init"]);
+  skillsync(fixture, ["--json", "harness", "link", "--root", harness, "--skill", "linked"]);
+  const healthy = skillsync(fixture, ["--json", "doctor"]).json;
+  expect(healthy.harness_links[0].status).toBe("healthy");
+  await unlink(join(harness, "linked"));
+  const missing = skillsync(fixture, ["--json", "doctor"]).json;
+  expect(missing.harness_links[0].status).toBe("missing");
+  const statePath = join(fixture.config, "state.json");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  const key = Object.keys(state.harness_links)[0];
+  state.harness_links[key].link_path = join(fixture.root, "unrelated");
+  await writeFile(statePath, JSON.stringify(state));
+  const rejected = skillsync(fixture, ["--json", "status"], false);
+  expect(rejected.json.ok).toBe(false);
+  expect(rejected.json.message).toContain("harness link path does not match");
+});
+
+test("harness link collision is atomic and preserves the preexisting entry", async () => {
+  if (process.platform === "win32") return;
+  const fixture = await makeFixture();
+  await put(join(fixture.library, "collision/SKILL.md"), "name: collision\\n");
+  const harness = join(fixture.root, "collision-harness");
+  await mkdir(harness, { recursive: true });
+  await put(join(harness, "collision"), "unrelated\\n");
+  skillsync(fixture, ["--json", "init"]);
+  const rejected = skillsync(
+    fixture,
+    ["--json", "harness", "link", "--root", harness, "--skill", "collision"],
+    false,
+  );
+  expect(rejected.json.ok).toBe(false);
+  expect(await readFile(join(harness, "collision"), "utf8")).toBe("unrelated\\n");
+  expect(Object.keys(skillsync(fixture, ["--json", "harness", "list"]).json.links)).toHaveLength(0);
 });
