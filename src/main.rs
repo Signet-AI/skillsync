@@ -68,6 +68,18 @@ enum Cmd {
         #[arg(long)]
         repo: String,
     },
+    Set {
+        #[command(subcommand)]
+        command: SetCmd,
+    },
+}
+#[derive(Subcommand)]
+enum SetCmd {
+    Create { name: String },
+    List,
+    Show { name: String },
+    Add { name: String, skill: String },
+    Remove { name: String, skill: String },
 }
 #[derive(Subcommand)]
 enum ConfigCmd {
@@ -82,6 +94,13 @@ struct State {
     publications: BTreeMap<String, Publication>,
     #[serde(default)]
     pending_publications: BTreeMap<String, PendingPublication>,
+    #[serde(default)]
+    sets: BTreeMap<String, SkillSet>,
+}
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct SkillSet {
+    #[serde(default)]
+    members: BTreeSet<String>,
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Subscription {
@@ -545,11 +564,14 @@ impl App {
             serde_json::from_slice(&read_regular_file(&sp, None)?)?
         } else {
             State {
-                version: 3,
+                version: 4,
                 library: expected_library.display().to_string(),
                 ..Default::default()
             }
         };
+        if state.version > 4 {
+            return Err(anyhow!("unsupported state version: {}", state.version));
+        }
         if state.version < 3 {
             let old_publications = std::mem::take(&mut state.publications);
             state.publications = old_publications
@@ -566,6 +588,10 @@ impl App {
                 .collect();
             state.version = 3;
         }
+        if state.version < 4 {
+            state.version = 4;
+        }
+        validate_set_state(&state)?;
         let library = if state_exists && !state.library.is_empty() {
             let persisted = PathBuf::from(&state.library);
             if persisted != expected_library {
@@ -607,14 +633,49 @@ fn strict_component(s: &str, what: &str) -> Result<String> {
         || s == "."
         || s == ".."
         || s.chars().any(|c| c.is_control())
+        || s.chars()
+            .any(|c| matches!(c, '<' | '>' | '"' | '|' | '?' | '*'))
         || s.contains('/')
         || s.contains('\\')
         || s.contains(':')
+        || s.ends_with('.')
+        || s.ends_with(' ')
+        || windows_reserved_component(s)
         || Path::new(s).is_absolute()
     {
         return Err(anyhow!("invalid {what}: {s:?}"));
     }
     Ok(s.to_owned())
+}
+fn windows_reserved_component(s: &str) -> bool {
+    let base = s.split('.').next().unwrap_or(s);
+    let upper = base.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit()
+            && upper.as_bytes()[3] != b'0')
+}
+fn set_member_id(skill: &str) -> Result<String> {
+    Ok(format!(
+        "library:{}",
+        strict_component(skill, "skill name")?
+    ))
+}
+fn set_member_name(id: &str) -> Result<String> {
+    let name = id
+        .strip_prefix("library:")
+        .ok_or_else(|| anyhow!("invalid set member identity"))?;
+    strict_component(name, "set member skill name")
+}
+fn validate_set_state(state: &State) -> Result<()> {
+    for (name, set) in &state.sets {
+        strict_component(name, "set name")?;
+        for member in &set.members {
+            set_member_name(member)?;
+        }
+    }
+    Ok(())
 }
 fn source_rel(s: &str) -> Result<String> {
     if s.is_empty() || s.chars().any(|c| c.is_control()) || s.contains('\\') || s.contains(':') {
@@ -1973,6 +2034,59 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn set_change(
+    a: &mut App,
+    raw_name: &str,
+    raw_skill: &str,
+    adding: bool,
+) -> Result<serde_json::Value> {
+    let name = strict_component(raw_name, "set name")?;
+    let skill = strict_component(raw_skill, "skill name")?;
+    if !a.state.sets.contains_key(&name) {
+        return Err(anyhow!("set not found: {name}"));
+    }
+    if adding {
+        let skill_path = a.library.join(&skill);
+        assert_no_symlink_path(&skill_path, Path::new("."))?;
+        if !skill_path.is_dir()
+            || !checked_regular_path(&skill_path.join("SKILL.md"), "skill manifest")?
+        {
+            return Err(anyhow!("skill not found in library: {skill}"));
+        }
+    }
+    let id = set_member_id(&skill)?;
+    let changed = if adding {
+        a.state
+            .sets
+            .get_mut(&name)
+            .expect("set existence checked")
+            .members
+            .insert(id)
+    } else {
+        a.state
+            .sets
+            .get_mut(&name)
+            .expect("set existence checked")
+            .members
+            .remove(&id)
+    };
+    if changed {
+        a.save()?;
+    }
+    let status = if changed {
+        if adding {
+            "added"
+        } else {
+            "removed"
+        }
+    } else if adding {
+        "already_present"
+    } else {
+        "already_absent"
+    };
+    Ok(serde_json::json!({"set":name,"skill":skill,"status":status}))
+}
+
 fn run(cli: Cli) -> Result<serde_json::Value> {
     let mut a = App::load()?;
     let command = match cli.command {
@@ -2168,8 +2282,36 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             serde_json::json!({"subscriptions":a.state.subscriptions,"publications":a.state.publications,"pending_publications":a.state.pending_publications,"worker":worker_status(&a.config)?}),
         ),
         Cmd::Doctor => Ok(
-            serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":worker_status(&a.config)?,"startup":"unsupported","harness_write_back":"unsupported","hermes_autonomous_curation":"unsupported","registries":"unsupported"}),
+            serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":worker_status(&a.config)?,"startup":"unsupported","harness_write_back":"unsupported","hermes_autonomous_curation":"unsupported","registries":"unsupported","set_publication":"unsupported","set_subscription_metadata":"unsupported","harness_enablement":"unsupported","personal_library_sync":"unsupported","membership_change_propagation":"unsupported"}),
         ),
+        Cmd::Set { command } => match command {
+            SetCmd::Create { name } => {
+                let name = strict_component(&name, "set name")?;
+                if a.state.sets.contains_key(&name) {
+                    return Err(anyhow!("set already exists: {name}"));
+                }
+                a.state.sets.insert(name.clone(), SkillSet::default());
+                a.save()?;
+                Ok(serde_json::json!({"set":name,"members":[]}))
+            }
+            SetCmd::List => Ok(serde_json::json!({"sets":a.state.sets.keys().collect::<Vec<_>>()})),
+            SetCmd::Show { name } => {
+                let name = strict_component(&name, "set name")?;
+                let set = a
+                    .state
+                    .sets
+                    .get(&name)
+                    .ok_or_else(|| anyhow!("set not found: {name}"))?;
+                let members = set
+                    .members
+                    .iter()
+                    .map(|id| set_member_name(id))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(serde_json::json!({"set":name,"members":members}))
+            }
+            SetCmd::Add { name, skill } => set_change(&mut a, &name, &skill, true),
+            SetCmd::Remove { name, skill } => set_change(&mut a, &name, &skill, false),
+        },
         Cmd::Unsubscribe { skill } => {
             let matches = a
                 .state

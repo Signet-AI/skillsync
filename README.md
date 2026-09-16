@@ -14,6 +14,7 @@ skillsync worker --interval 300
 skillsync publish NAME --repo REPOSITORY --yes   # --dry-run previews
 skillsync unsubscribe NAME
 skillsync unpublish NAME --repo REPOSITORY
+skillsync set create NAME | list | show NAME | add NAME SKILL | remove NAME SKILL
 ```
 
 Use `--json` for structured success and error envelopes. GitHub `owner/repo`, local paths, HTTPS, SSH, and scp-style SSH sources are accepted. Subscribe records a stable source-plus-relative-path relationship key, so same-named skills from different repositories do not overwrite state. Persisted subscription branches are checked out explicitly during updates.
@@ -41,4 +42,4 @@ The Bun suite uses isolated temporary Git repositories and configuration roots. 
 
 ## Honest limits
 
-The foreground worker is supported for `worker --once` and `worker --interval SECONDS`; it owns the same advisory state lock as mutating CLI commands. Durable sign-in startup registration, a full TUI, registry integration, Hermes autonomous curation, harness write-back, sets, and personal-library sync remain unsupported. Semantic conflict resolution, source-specific authentication, and cross-device worker coordination remain unsupported. `unsubscribe` and `unpublish` remove only the relationship and retain installed/published content.
+The foreground worker is supported for `worker --once` and `worker --interval SECONDS`; it owns the same advisory state lock as mutating CLI commands. Named local sets are supported for organizing canonical library skills (`set create/list/show/add/remove`); membership is portable state only. Set publication, set subscription metadata, harness enablement, personal-library sync, and membership-change propagation remain unsupported. Durable sign-in startup registration, a full TUI, registry integration, Hermes autonomous curation, and harness write-back remain unsupported. Semantic conflict resolution, source-specific authentication, and cross-device worker coordination remain unsupported. `unsubscribe` and `unpublish` remove only the relationship and retain installed/published content.

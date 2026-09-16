@@ -510,3 +510,77 @@ test("preserves recovery for file-directory transitions", async () => {
   expect(await readFile(join(fixture.library, "type/thing/child.txt"), "utf8")).toBe("child\n");
   expect(await readdir(join(fixture.config, "recovery"))).toHaveLength(1);
 });
+
+test("manages portable named sets over canonical library skills", async () => {
+  const fixture = await makeFixture();
+  await put(join(fixture.library, "demo/SKILL.md"), "name: demo\n");
+  skillsync(fixture, ["--json", "init"]);
+  expect(skillsync(fixture, ["--json", "set", "create", "core"]).json.members).toEqual([]);
+  expect(skillsync(fixture, ["--json", "set", "add", "core", "demo"]).json.status).toBe("added");
+  expect(skillsync(fixture, ["--json", "set", "show", "core"]).json.members).toEqual(["demo"]);
+  expect(skillsync(fixture, ["--json", "set", "remove", "core", "demo"]).json.status).toBe("removed");
+  expect(skillsync(fixture, ["--json", "set", "show", "core"]).json.members).toEqual([]);
+});
+
+test("rejects symlinked library directories as set members", async () => {
+  const fixture = await makeFixture();
+  await put(join(fixture.library, "outside/SKILL.md"), "name: outside\n");
+  skillsync(fixture, ["--json", "init"]);
+  await symlink(join(fixture.library, "outside"), join(fixture.library, "link"), "dir");
+  skillsync(fixture, ["--json", "set", "create", "core"]);
+  const rejected = skillsync(fixture, ["--json", "set", "add", "core", "link"], false);
+  expect(rejected.json.ok).toBe(false);
+  expect(rejected.json.message).toContain("symlink");
+});
+
+test("rejects malformed persisted set members before listing or mutating", async () => {
+  const fixture = await makeFixture();
+  await put(join(fixture.library, "demo/SKILL.md"), "name: demo\n");
+  skillsync(fixture, ["--json", "init"]);
+  skillsync(fixture, ["--json", "set", "create", "core"]);
+  const statePath = join(fixture.config, "state.json");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.sets.core.members = ["library:../outside"];
+  await writeFile(statePath, JSON.stringify(state));
+  const listed = skillsync(fixture, ["--json", "set", "list"], false);
+  expect(listed.json.ok).toBe(false);
+  expect(listed.json.message).toContain("invalid set member");
+  const changed = skillsync(fixture, ["--json", "set", "add", "core", "demo"], false);
+  expect(changed.json.ok).toBe(false);
+  expect(changed.json.message).toContain("invalid set member");
+});
+
+test("rejects state written by a newer Skillsync schema", async () => {
+  const fixture = await makeFixture();
+  skillsync(fixture, ["--json", "init"]);
+  const statePath = join(fixture.config, "state.json");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.version = 999;
+  await writeFile(statePath, JSON.stringify(state));
+  const rejected = skillsync(fixture, ["--json", "status"], false);
+  expect(rejected.json.ok).toBe(false);
+  expect(rejected.json.message).toContain("unsupported state version");
+});
+
+test("makes set membership retries safe and removes stale members", async () => {
+  const fixture = await makeFixture();
+  await put(join(fixture.library, "demo/SKILL.md"), "name: demo\n");
+  skillsync(fixture, ["--json", "init"]);
+  skillsync(fixture, ["--json", "set", "create", "core"]);
+  expect(skillsync(fixture, ["--json", "set", "add", "core", "demo"]).json.status).toBe("added");
+  expect(skillsync(fixture, ["--json", "set", "add", "core", "demo"]).json.status).toBe("already_present");
+  await rm(join(fixture.library, "demo"), { recursive: true, force: true });
+  expect(skillsync(fixture, ["--json", "set", "remove", "core", "demo"]).json.status).toBe("removed");
+  expect(skillsync(fixture, ["--json", "set", "remove", "core", "demo"]).json.status).toBe("already_absent");
+});
+
+test("rejects Windows-invalid portable set identifiers", async () => {
+  const fixture = await makeFixture();
+  skillsync(fixture, ["--json", "init"]);
+  const reserved = skillsync(fixture, ["--json", "set", "create", "CON"], false);
+  expect(reserved.json.ok).toBe(false);
+  expect(reserved.json.message).toContain("invalid set name");
+  const trailing = skillsync(fixture, ["--json", "set", "create", "name."], false);
+  expect(trailing.json.ok).toBe(false);
+  expect(trailing.json.message).toContain("invalid set name");
+});
