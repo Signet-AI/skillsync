@@ -79,6 +79,12 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    Restore {
+        #[arg(long = "from")]
+        recovery_path: PathBuf,
+        #[arg(long)]
+        skill: Option<String>,
+    },
     Set {
         #[command(subcommand)]
         command: SetCmd,
@@ -1684,11 +1690,42 @@ fn install_dir_noreplace(_src: &Path, _dst: &Path) -> Result<()> {
 #[cfg(windows)]
 fn install_dir_noreplace(src: &Path, dst: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
-    let src: Vec<u16> = src.as_os_str().encode_wide().chain(Some(0)).collect();
-    let dst: Vec<u16> = dst.as_os_str().encode_wide().chain(Some(0)).collect();
-    if unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
-        return Err(std::io::Error::last_os_error().into());
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesW, MoveFileExW, INVALID_FILE_ATTRIBUTES, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = src.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = dst.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    // MOVEFILE_REPLACE_EXISTING is intentionally absent.  MoveFileExW without
+    // that flag provides the kernel's atomic "destination must not exist"
+    // rename for this same-volume staged-directory move.  The preflight is
+    // only for a useful early error; the syscall remains the race-safe check.
+    let destination_exists =
+        unsafe { GetFileAttributesW(destination.as_ptr()) } != INVALID_FILE_ATTRIBUTES;
+    if destination_exists {
+        return Err(anyhow!(
+            "destination collision; existing content was not overwritten: {}",
+            dst.display()
+        ));
+    }
+
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(2 | 3 | 80 | 183)) {
+            return Err(anyhow!(
+                "destination collision; existing content was not overwritten: {}",
+                dst.display()
+            ));
+        }
+        return Err(error.into());
     }
     Ok(())
 }
@@ -3106,6 +3143,7 @@ fn requires_lock(command: &Cmd) -> bool {
             command: HarnessCmd::List,
         } => false,
         Cmd::Publish { dry_run, .. } => !dry_run,
+        Cmd::Restore { .. } => true,
         _ => true,
     }
 }
@@ -3555,6 +3593,142 @@ fn delete_skill(a: &mut App, raw_skill: &str, yes: bool) -> Result<serde_json::V
     )
 }
 
+fn restore_skill(
+    a: &App,
+    input: &Path,
+    requested_skill: Option<&str>,
+) -> Result<serde_json::Value> {
+    if !input.is_absolute() {
+        return Err(anyhow!(
+            "recovery path must be absolute and under the configured recovery root"
+        ));
+    }
+    assert_no_symlink_path(&a.recovery, Path::new("."))?;
+    // Validate the caller's spelling before canonicalization: a path alias to a
+    // valid recovery directory is not an accepted recovery directory.
+    assert_no_symlink_path(input, Path::new("."))?;
+    let input_meta = fs::symlink_metadata(input).context("recovery snapshot does not exist")?;
+    if input_meta.file_type().is_symlink() || !input_meta.is_dir() {
+        return Err(anyhow!("recovery snapshot must be a regular directory"));
+    }
+    let recovery = fs::canonicalize(input).context("recovery snapshot does not exist")?;
+    validate_state_path(&a.recovery, &recovery, "recovery")?;
+    let recovery_rel = recovery
+        .strip_prefix(&a.recovery)
+        .map_err(|_| anyhow!("recovery path escaped configured recovery root"))?;
+    if recovery_rel.components().count() != 1
+        || !recovery_rel
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(anyhow!(
+            "recovery path must be a direct child of the configured recovery root"
+        ));
+    }
+    let metadata = fs::symlink_metadata(&recovery)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(anyhow!("recovery snapshot must be a regular directory"));
+    }
+    let package = recovery.join("package");
+    validate_state_path(&a.recovery, &package, "recovery package")?;
+    let package_meta = fs::symlink_metadata(&package)
+        .map_err(|_| anyhow!("recovery snapshot is missing package"))?;
+    if !package_meta.is_dir() || package_meta.file_type().is_symlink() {
+        return Err(anyhow!(
+            "recovery snapshot package must be a regular directory"
+        ));
+    }
+    let inferred = manifest_name(&package)?;
+    let skill = match requested_skill {
+        Some(raw) => {
+            let name = strict_component(raw, "skill name")?;
+            if name != inferred {
+                return Err(anyhow!(
+                    "explicit skill does not match recovery SKILL.md manifest"
+                ));
+            }
+            name
+        }
+        None => inferred,
+    };
+    let destination = a.library.join(&skill);
+    let relative = destination
+        .strip_prefix(&a.library)
+        .map_err(|_| anyhow!("restore destination escaped library"))?;
+    assert_no_symlink_path(&a.library, relative)?;
+    if recovery == destination
+        || recovery.starts_with(&destination)
+        || destination.starts_with(&recovery)
+    {
+        return Err(anyhow!("recovery source and canonical destination overlap"));
+    }
+    let staging_parent = tempfile::tempdir_in(&a.library)?;
+    let staged = staging_parent.path().join("package");
+    let source_hash_before = hash_dir(&package)?;
+    copy_complete_tree(&package, &staged)?;
+    let hash = hash_dir(&staged)?;
+    if source_hash_before != hash || hash_dir(&package)? != hash {
+        return Err(anyhow!(
+            "recovery package changed while staging; restore aborted"
+        ));
+    }
+    fn existing_canonical_package(path: &Path, library: &Path, relative: &Path) -> Result<bool> {
+        assert_no_symlink_path(library, relative)?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                Err(anyhow!("canonical destination is not a regular directory"))
+            }
+            Ok(_) => {
+                if fs::canonicalize(path)? != path {
+                    return Err(anyhow!("canonical destination is not canonical"));
+                }
+                if !checked_regular_path(&path.join("SKILL.md"), "canonical manifest")? {
+                    return Err(anyhow!("canonical destination has no regular SKILL.md"));
+                }
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+    if existing_canonical_package(&destination, &a.library, relative)? {
+        let existing_hash =
+            hash_dir(&destination).context("validate existing canonical package before restore")?;
+        if existing_hash == hash {
+            return Ok(
+                serde_json::json!({"skill":skill,"status":"already_present","recovery_path":recovery,"canonical_path":destination,"relationships_recreated":false}),
+            );
+        }
+        return Err(anyhow!(
+            "canonical package already exists with different contents; no overwrite performed"
+        ));
+    }
+    fs::create_dir_all(&a.library)?;
+    if hash_dir(&package)? != hash {
+        return Err(anyhow!("recovery package changed before installation"));
+    }
+    if std::env::var("SKILLSYNC_TEST_RESTORE_COLLISION").as_deref() == Ok("1") {
+        fs::create_dir_all(&destination)?;
+        fs::write(destination.join("SKILL.md"), "external collision\n")?;
+    }
+    install_dir_noreplace(&staged, &destination)
+        .context("install restored canonical package without replacement")?;
+    let installed_identity = directory_identity(&destination)?;
+    if hash_dir(&destination)? != hash {
+        let cleanup =
+            remove_owned_directory(&a.library, &destination, Some(installed_identity), &hash);
+        return Err(match cleanup {
+            Ok(()) => {
+                anyhow!("restored package failed post-install validation and was rolled back")
+            }
+            Err(error) => anyhow!("restored package failed post-install validation; {error}"),
+        });
+    }
+    Ok(
+        serde_json::json!({"skill":skill,"status":"restored","recovery_path":recovery,"canonical_path":destination,"snapshot_hash":hash,"relationships_recreated":false}),
+    )
+}
+
 fn run(cli: Cli) -> Result<serde_json::Value> {
     let mut a = App::load()?;
     let command = match cli.command {
@@ -3733,6 +3907,10 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         }
         Cmd::Import { source, skill } => import_local(&mut a, &source, skill.as_deref()),
         Cmd::Delete { skill, yes } => delete_skill(&mut a, &skill, yes),
+        Cmd::Restore {
+            recovery_path,
+            skill,
+        } => restore_skill(&a, &recovery_path, skill.as_deref()),
         Cmd::Update | Cmd::Sync => sync_all(&mut a, false),
         Cmd::Worker { once, interval } => run_worker_locked(&mut a, once, interval),
         Cmd::Harness { command } => match command {

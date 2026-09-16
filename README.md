@@ -18,6 +18,7 @@ skillsync publish NAME --repo REPOSITORY --yes   # --dry-run previews
 skillsync unsubscribe NAME
 skillsync unpublish NAME --repo REPOSITORY
 skillsync delete NAME --yes
+skillsync restore --from /ABSOLUTE/CONFIG/recovery/delete-NAME-STAMP [--skill NAME]
 skillsync set create NAME | list | show NAME | add NAME SKILL | remove NAME SKILL
 skillsync harness link --root PATH --skill NAME
 skillsync harness unlink --root PATH --skill NAME
@@ -29,6 +30,9 @@ skillsync harness list
 Subscribe records a stable source-plus-relative-path relationship key, so same-named skills from different repositories do not overwrite state. `import --from PATH --skill NAME` explicitly adopts one package from an existing local directory (including a root package or nested package), stages and validates it, preserves modes/resources, and records local provenance without creating a subscription. The picker is deliberately not a full TUI: it lists discovered packages and accepts one validated number. Multi-select, unattended onboarding, automatic registry discovery, and `full TUI: unsupported` remain explicit limitations.
 
 ## Safety and storage
+
+`restore --from PATH` is an explicit, noninteractive recovery operation. PATH must be one durable deletion recovery directory beneath the configured `recovery/` root and contain a strict `package/` snapshot; the manifest supplies the skill name unless matching `--skill NAME` is provided. It stages and validates the complete no-follow snapshot, preserves operational-looking files and Unix modes, and installs only when the canonical destination is absent. Existing differing content, malformed or linked content, path escapes, and source/destination overlap fail without overwrite. An identical validated destination returns `already_present`. Restore rehydrates canonical package content only: it never recreates subscriptions, publications, harness links, sets, or remote effects; use their explicit commands separately.
+
 
 State loads strictly validate every local adoption record (identity, absolute no-follow source, canonical library destination, hash, and status); tampered records are rejected before status, doctor, or mutation. `SKILL.md` must begin with exactly one unquoted `name: <safe-component>` line; prose or duplicate/conflicting names are rejected. Imports stage content and roll back the newly installed package if provenance state cannot be persisted. Skill names and source-relative package paths reject absolute paths, parent traversal, separators where a package key is required, and control characters. Symlinks are rejected; regular-file scans use no-follow opens on Unix, and live package/publication replacements are staged and swapped through an anchored directory rename. Managed snapshots are rechecked before commit or replacement and abort when a concurrent change is detected; import installation uses an anchored no-replace primitive (Linux `renameat2`, Windows native no-overwrite move) and fails closed where unavailable. External writers are not fully serialized. Bundled files are never executed. `SKILLSYNC_TEST_FAIL_STATE_SAVE=1` is a test-only failure-injection hook for exercising rollback; it is not a configuration or recovery bypass.
 
