@@ -155,7 +155,7 @@ pub(crate) fn import_local(
     }
     let selected = match requested {
         Some(query) => {
-            let query = skill_query(query)?;
+            let query = crate::repository::skill_query(query)?;
             found
                 .iter()
                 .find(|(name, _, rel)| name == &query || rel == &query)
