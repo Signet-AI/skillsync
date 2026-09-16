@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, readdir, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -104,6 +104,10 @@ test("local Git subscribe, merge, conflict recovery, and scoped publication", as
   git(fixture, source, ["push", "-u", "origin", "trunk"]);
 
   expect(skillsync(fixture, ["--json", "init"]).json.ok).toBe(true);
+  const workerOnce = skillsync(fixture, ["--json", "worker", "--once"]).json;
+  expect(workerOnce.worker).toBe("completed");
+  expect(workerOnce.results).toEqual([]);
+  expect(skillsync(fixture, ["--json", "status"]).json.worker).toBe("stopped");
   const subscribed = skillsync(fixture, ["--json", "subscribe", upstream, "--skill", "skills/demo"]).json;
   expect(subscribed.skill).toBe("demo");
   expect(await readFile(join(fixture.library, "demo/SKILL.md"), "utf8")).toBe("name: demo\nbase\n");
@@ -288,4 +292,221 @@ test("rejects symlinked package content without copying it", async () => {
   expect(failed.json.ok).toBe(false);
   expect(await Bun.file(join(fixture.library, "unsafe/SKILL.md")).exists()).toBe(false);
   expect(await readFile(outside, "utf8")).toBe("must not be copied\n");
+});
+
+test("foreground worker owns the state lock and status reflects live ownership", async () => {
+  const fixture = await makeFixture();
+  skillsync(fixture, ["--json", "init"]);
+
+  const worker = Bun.spawn({
+    cmd: [binary, "--json", "worker", "--interval", "30"],
+    env: { ...inheritedEnv(), ...fixture.env },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  try {
+    let running = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const status = skillsync(fixture, ["--json", "status"]).json;
+      if (status.worker === "running") {
+        running = true;
+        break;
+      }
+      await Bun.sleep(20);
+    }
+    expect(running).toBe(true);
+
+    const blocked = skillsync(fixture, ["--json", "unsubscribe", "missing"], false);
+    expect(blocked.json.ok).toBe(false);
+    expect(blocked.json.message).toContain("state is busy");
+  } finally {
+    worker.kill();
+    await worker.exited;
+  }
+
+  expect(skillsync(fixture, ["--json", "status"]).json.worker).toBe("stopped");
+});
+
+test("worker once isolates malformed relationships instead of aborting the cycle", async () => {
+  const fixture = await makeFixture();
+  skillsync(fixture, ["--json", "init"]);
+  const statePath = join(fixture.config, "state.json");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  for (const key of ["../bad-one", "../bad-two"]) {
+    state.subscriptions[key] = {
+      skill: "bad",
+      source: "/unreachable",
+      branch: "trunk",
+      source_path: ".",
+      baseline_path: join(fixture.config, "baselines", key),
+      baseline_hash: "deadbeef",
+      local_path: join(fixture.library, "bad"),
+      status: "synced",
+      recovery_path: null,
+      last_sync: 0,
+      update_count: 0,
+    };
+  }
+  await writeFile(statePath, JSON.stringify(state));
+
+  const once = skillsync(fixture, ["--json", "worker", "--once"]).json;
+  expect(once.worker).toBe("completed");
+  expect(once.results).toHaveLength(2);
+  expect(once.results.every((item: any) => item.status === "conflict")).toBe(true);
+});
+
+test("worker Ctrl-C terminates a blocked Git subprocess and releases ownership", async () => {
+  if (process.platform === "win32") return;
+  const fixture = await makeFixture();
+  skillsync(fixture, ["--json", "init"]);
+  await put(join(fixture.library, "demo/SKILL.md"), "name: demo\n");
+  await put(join(fixture.config, "baselines/fixture-rel/SKILL.md"), "name: demo\n");
+  const statePath = join(fixture.config, "state.json");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.subscriptions["fixture-rel"] = {
+    skill: "demo",
+    source: "blocked-source",
+    branch: "trunk",
+    source_path: ".",
+    baseline_path: join(fixture.config, "baselines/fixture-rel"),
+    baseline_hash: "deadbeef",
+    local_path: join(fixture.library, "demo"),
+    status: "synced",
+    recovery_path: null,
+    last_sync: 0,
+    update_count: 0,
+  };
+  await writeFile(statePath, JSON.stringify(state));
+
+  const fakeBin = join(fixture.root, "fake-bin");
+  await mkdir(fakeBin, { recursive: true });
+  const fakeGit = join(fakeBin, "git");
+  await writeFile(fakeGit, "#!/bin/sh\nsleep 30\n");
+  await chmod(fakeGit, 0o755);
+  fixture.env.PATH = `${fakeBin}:${inheritedEnv().PATH ?? ""}`;
+
+  const worker = Bun.spawn({
+    cmd: [binary, "--json", "worker", "--interval", "30"],
+    env: { ...inheritedEnv(), ...fixture.env },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  try {
+    let running = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const status = skillsync(fixture, ["--json", "status"]).json;
+      if (status.worker === "running") {
+        running = true;
+        break;
+      }
+      await Bun.sleep(20);
+    }
+    expect(running).toBe(true);
+    worker.kill("SIGINT");
+    const exitCode = await Promise.race([
+      worker.exited,
+      Bun.sleep(3000).then(() => null),
+    ]);
+    expect(exitCode).not.toBeNull();
+    const output = await new Response(worker.stdout).text();
+    const result = JSON.parse(output);
+    expect(result.worker).toBe("stopped");
+    expect(result.cancelled).toBe(true);
+  } finally {
+    worker.kill();
+    await worker.exited;
+  }
+  expect(skillsync(fixture, ["--json", "status"]).json.worker).toBe("stopped");
+});
+
+test("preserves executable mode on upstream package additions", async () => {
+  if (process.platform === "win32") return;
+  const fixture = await makeFixture();
+  const source = join(fixture.root, "mode-source");
+  const upstream = join(fixture.root, "mode-upstream.git");
+  checked(run("git", ["init", "--bare", upstream], undefined, fixture.env), "init mode remote");
+  checked(run("git", ["init", "-b", "trunk", source], undefined, fixture.env), "init mode source");
+  await put(join(source, "skills/mode/SKILL.md"), "name: mode\nbase\n");
+  git(fixture, source, ["add", "."]);
+  git(fixture, source, ["commit", "-m", "initial mode package"]);
+  git(fixture, source, ["remote", "add", "origin", upstream]);
+  git(fixture, source, ["push", "-u", "origin", "trunk"]);
+  skillsync(fixture, ["--json", "init"]);
+  skillsync(fixture, ["--json", "subscribe", upstream, "--skill", "mode"]);
+
+  const script = join(source, "skills/mode/scripts/check.sh");
+  await put(script, "#!/bin/sh\nexit 0\n");
+  await chmod(script, 0o755);
+  git(fixture, source, ["add", "."]);
+  git(fixture, source, ["commit", "-m", "add executable"]);
+  git(fixture, source, ["push"]);
+  skillsync(fixture, ["--json", "update"]);
+
+  const installed = await stat(join(fixture.library, "mode/scripts/check.sh"));
+  expect(installed.mode & 0o111).toBe(0o111);
+});
+
+test("persists publication intent before a failed push and retries it", async () => {
+  if (process.platform === "win32") return;
+  const fixture = await makeFixture();
+  skillsync(fixture, ["--json", "init"]);
+  await put(join(fixture.library, "journal/SKILL.md"), "name: journal\nv1\n");
+  const destination = join(fixture.root, "journal-destination.git");
+  checked(run("git", ["init", "--bare", destination], undefined, fixture.env), "init journal destination");
+  const updateHook = join(destination, "hooks/update");
+  await writeFile(updateHook, "#!/bin/sh\nexit 1\n");
+  await chmod(updateHook, 0o755);
+
+  const failed = skillsync(
+    fixture,
+    ["--json", "publish", "journal", "--repo", destination, "--yes"],
+    false,
+  );
+  expect(failed.json.ok).toBe(false);
+  const pending = skillsync(fixture, ["--json", "status"]).json;
+  expect(Object.keys(pending.pending_publications ?? {})).toHaveLength(1);
+
+  await unlink(updateHook);
+  const retried = skillsync(fixture, ["--json", "sync"]).json;
+  expect(retried.results.some((item: any) => item.skill === "journal" && item.status === "published")).toBe(true);
+  const recovered = skillsync(fixture, ["--json", "status"]).json;
+  expect(Object.keys(recovered.pending_publications ?? {})).toHaveLength(0);
+  expect(countPublications(recovered)).toBe(1);
+});
+
+test("honors JSON mode for clap validation errors", async () => {
+  const fixture = await makeFixture();
+  const result = run(binary, ["--json", "publish"], undefined, fixture.env);
+  expect(result.code).toBe(2);
+  const json = JSON.parse(result.stdout);
+  expect(json.ok).toBe(false);
+  expect(json.message).toContain("Usage:");
+});
+
+test("preserves recovery for file-directory transitions", async () => {
+  const fixture = await makeFixture();
+  const source = join(fixture.root, "type-source");
+  const upstream = join(fixture.root, "type-upstream.git");
+  checked(run("git", ["init", "--bare", upstream], undefined, fixture.env), "init type remote");
+  checked(run("git", ["init", "-b", "trunk", source], undefined, fixture.env), "init type source");
+  await put(join(source, "skills/type/SKILL.md"), "name: type\nbase\n");
+  await put(join(source, "skills/type/thing/child.txt"), "child\n");
+  git(fixture, source, ["add", "."]);
+  git(fixture, source, ["commit", "-m", "initial type package"]);
+  git(fixture, source, ["remote", "add", "origin", upstream]);
+  git(fixture, source, ["push", "-u", "origin", "trunk"]);
+  skillsync(fixture, ["--json", "init"]);
+  skillsync(fixture, ["--json", "subscribe", upstream, "--skill", "type"]);
+
+  await rm(join(source, "skills/type/thing"), { recursive: true, force: true });
+  await put(join(source, "skills/type/thing"), "upstream file\n");
+  git(fixture, source, ["add", "-A"]);
+  git(fixture, source, ["commit", "-m", "replace directory with file"]);
+  git(fixture, source, ["push"]);
+  const updated = skillsync(fixture, ["--json", "update"]).json;
+  expect(updated.results.some((item: any) => item.skill === "type" && item.status === "conflict")).toBe(true);
+  expect((await stat(join(fixture.library, "type/thing"))).isDirectory()).toBe(true);
+  expect(await readFile(join(fixture.library, "type/thing/child.txt"), "utf8")).toBe("child\n");
+  expect(await readdir(join(fixture.config, "recovery"))).toHaveLength(1);
 });

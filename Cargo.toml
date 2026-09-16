@@ -14,5 +14,10 @@ walkdir = "2"
 thiserror = "1"
 tempfile = "3"
 libc = "0.2"
+fs2 = "0.4"
+ctrlc = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]

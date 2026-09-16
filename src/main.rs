@@ -1,14 +1,20 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Parser)]
@@ -45,6 +51,12 @@ enum Cmd {
     },
     Update,
     Sync,
+    Worker {
+        #[arg(long)]
+        once: bool,
+        #[arg(long, default_value_t = 300)]
+        interval: u64,
+    },
     Status,
     Diff,
     Doctor,
@@ -68,6 +80,8 @@ struct State {
     library: String,
     subscriptions: BTreeMap<String, Subscription>,
     publications: BTreeMap<String, Publication>,
+    #[serde(default)]
+    pending_publications: BTreeMap<String, PendingPublication>,
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Subscription {
@@ -94,9 +108,18 @@ struct Publication {
     last_hash: Option<String>,
     last_sync: u64,
 }
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct PendingPublication {
+    publication: Publication,
+}
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct FileConfig {
     library: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileData {
+    bytes: Vec<u8>,
+    mode: u32,
 }
 struct App {
     config: PathBuf,
@@ -106,6 +129,187 @@ struct App {
     recovery: PathBuf,
     state: State,
 }
+
+static WORKER_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+fn open_directory_fd(path: &Path) -> Result<std::os::fd::RawFd> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let root = CString::new("/")?;
+    let mut fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    for component in absolute.components() {
+        let std::path::Component::Normal(name) = component else {
+            if matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::CurDir
+            ) {
+                continue;
+            }
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(anyhow!("unsafe directory path: {}", path.display()));
+        };
+        let name = match CString::new(name.as_bytes()) {
+            Ok(name) => name,
+            Err(error) => {
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(error.into());
+            }
+        };
+        let next = unsafe {
+            libc::openat(
+                fd,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if next < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(error.into());
+        }
+        unsafe {
+            libc::close(fd);
+        }
+        fd = next;
+    }
+    Ok(fd)
+}
+
+#[cfg(unix)]
+fn open_child_file(config: &Path, name: &str, create: bool) -> Result<fs::File> {
+    use std::{ffi::CString, os::fd::FromRawFd};
+    let directory = open_directory_fd(config)?;
+    let name = match CString::new(name.as_bytes()) {
+        Ok(name) => name,
+        Err(error) => {
+            unsafe {
+                libc::close(directory);
+            }
+            return Err(error.into());
+        }
+    };
+    let mut flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    if create {
+        flags |= libc::O_CREAT;
+    }
+    let fd = unsafe { libc::openat(directory, name.as_ptr(), flags, 0o600) };
+    unsafe {
+        libc::close(directory);
+    }
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(not(unix))]
+fn open_child_file(config: &Path, name: &str, create: bool) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(create);
+    Ok(options.open(config.join(name))?)
+}
+
+fn open_advisory_lock(config: &Path, name: &str, create: bool) -> Result<fs::File> {
+    open_child_file(config, name, create)
+}
+
+fn acquire_named_lock(config: &Path, name: &str, busy_message: &str) -> Result<fs::File> {
+    assert_no_symlink_path(config, Path::new("."))?;
+    fs::create_dir_all(config)?;
+    assert_no_symlink_path(config, Path::new("."))?;
+    let mut file =
+        open_advisory_lock(config, name, true).with_context(|| format!("open lock: {name}"))?;
+    if let Err(error) = file.try_lock_exclusive() {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(anyhow!("{busy_message}"));
+        }
+        return Err(error).context("lock Skillsync state");
+    }
+    file.set_len(0)?;
+    file.write_all(format!("pid={}\n", std::process::id()).as_bytes())?;
+    file.sync_all()?;
+    Ok(file)
+}
+
+struct StateLock {
+    file: fs::File,
+}
+
+impl StateLock {
+    fn acquire(config: &Path) -> Result<Self> {
+        Ok(Self {
+            file: acquire_named_lock(
+                config,
+                "state.lock",
+                "skillsync state is busy (worker or another mutating command holds the lock)",
+            )?,
+        })
+    }
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+struct WorkerLease {
+    file: fs::File,
+}
+
+impl WorkerLease {
+    fn acquire(config: &Path) -> Result<Self> {
+        Ok(Self {
+            file: acquire_named_lock(
+                config,
+                "worker.active",
+                "a Skillsync worker is already running",
+            )?,
+        })
+    }
+}
+
+impl Drop for WorkerLease {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn worker_status(config: &Path) -> Result<&'static str> {
+    let path = config.join("worker.active");
+    if !checked_regular_path(&path, "worker status")? {
+        return Ok("stopped");
+    }
+    let file = open_advisory_lock(config, "worker.active", false)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            file.unlock()?;
+            Ok("stopped")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok("running"),
+        Err(error) => Err(error).context("inspect worker status"),
+    }
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -166,19 +370,155 @@ fn resolve_library_path(path: &Path) -> Result<PathBuf> {
     }
 }
 fn atomic(p: &Path, b: &[u8]) -> Result<()> {
-    if let Some(x) = p.parent() {
-        fs::create_dir_all(x)?
+    #[cfg(unix)]
+    {
+        atomic_unix(p, b)
     }
-    let t = p.with_file_name(format!(
-        ".{}.tmp-{}",
+    #[cfg(not(unix))]
+    {
+        atomic_portable(p, b)
+    }
+}
+
+#[cfg(unix)]
+fn atomic_unix(p: &Path, b: &[u8]) -> Result<()> {
+    use std::{ffi::CString, os::fd::FromRawFd, os::unix::ffi::OsStrExt};
+    let parent = p
+        .parent()
+        .ok_or_else(|| anyhow!("atomic path has no parent: {}", p.display()))?;
+    let target_name = p
+        .file_name()
+        .ok_or_else(|| anyhow!("atomic path has no name: {}", p.display()))?;
+    let target_name = CString::new(target_name.as_bytes())?;
+    let temp_name = format!(
+        ".{}.tmp-{}-{}",
         p.file_name().unwrap().to_string_lossy(),
-        std::process::id()
-    ));
-    let mut f = fs::File::create(&t)?;
-    f.write_all(b)?;
-    f.sync_all()?;
-    fs::rename(t, p)?;
+        std::process::id(),
+        unique_stamp()
+    );
+    let temp_name = CString::new(temp_name.as_bytes())?;
+    assert_no_symlink_path(parent, Path::new("."))?;
+    fs::create_dir_all(parent)?;
+    assert_no_symlink_path(parent, Path::new("."))?;
+    let directory = open_directory_fd(parent)?;
+    let fd = unsafe {
+        libc::openat(
+            directory,
+            temp_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(directory);
+        }
+        return Err(error.into());
+    }
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    let write_result = (|| {
+        file.write_all(b)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(error) = write_result {
+        unsafe {
+            libc::unlinkat(directory, temp_name.as_ptr(), 0);
+            libc::close(directory);
+        }
+        return Err(error);
+    }
+    let renamed = unsafe {
+        libc::renameat(
+            directory,
+            temp_name.as_ptr(),
+            directory,
+            target_name.as_ptr(),
+        )
+    };
+    if renamed < 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::unlinkat(directory, temp_name.as_ptr(), 0);
+            libc::close(directory);
+        }
+        return Err(error.into());
+    }
+    let synced = unsafe { libc::fsync(directory) };
+    let sync_error = if synced < 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    unsafe {
+        libc::close(directory);
+    }
+    if let Some(error) = sync_error {
+        return Err(error.into());
+    }
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn atomic_portable(p: &Path, b: &[u8]) -> Result<()> {
+    let parent = p
+        .parent()
+        .ok_or_else(|| anyhow!("atomic path has no parent: {}", p.display()))?;
+    assert_no_symlink_path(parent, Path::new("."))?;
+    fs::create_dir_all(parent)?;
+    assert_no_symlink_path(parent, Path::new("."))?;
+    let temp = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        p.file_name().unwrap().to_string_lossy(),
+        std::process::id(),
+        unique_stamp()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    file.write_all(b)?;
+    file.sync_all()?;
+    #[cfg(windows)]
+    {
+        use std::{iter, os::windows::ffi::OsStrExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+        let source = temp
+            .as_os_str()
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect::<Vec<_>>();
+        let target = p
+            .as_os_str()
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect::<Vec<_>>();
+        let moved = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                target.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        if let Err(error) = fs::rename(&temp, p) {
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
+        }
+        Ok(())
+    }
 }
 impl App {
     fn load() -> Result<Self> {
@@ -335,6 +675,7 @@ fn portable_rel(path: &Path) -> String {
         .join("/")
 }
 fn read_regular_file(path: &Path, expected: Option<&fs::Metadata>) -> Result<Vec<u8>> {
+    reject_reparse_point(path, "regular file")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -375,10 +716,12 @@ fn files(root: &Path) -> Result<Vec<(PathBuf, Vec<u8>, u32)>> {
     {
         return Err(anyhow!("symlink package root rejected: {}", root.display()));
     }
+    reject_reparse_point(root, "package root")?;
     fn r(root: &Path, p: &Path, o: &mut Vec<(PathBuf, Vec<u8>, u32)>) -> Result<()> {
         for e in fs::read_dir(p)? {
             let e = e?;
             let x = e.path();
+            reject_reparse_point(&x, "package entry")?;
             let rel = x.strip_prefix(root)?;
             if operational(rel) {
                 continue;
@@ -406,6 +749,18 @@ fn files(root: &Path) -> Result<Vec<(PathBuf, Vec<u8>, u32)>> {
     o.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(o)
 }
+fn write_file_data(path: &Path, data: &FileData) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, &data.bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(data.mode))?;
+    }
+    Ok(())
+}
 fn hash_dir(p: &Path) -> Result<String> {
     let mut h = Sha256::new();
     for (r, b, m) in files(p)? {
@@ -421,6 +776,7 @@ fn hash_dir(p: &Path) -> Result<String> {
 fn assert_no_symlink_path(root: &Path, rel: &Path) -> Result<()> {
     let mut ancestor = root;
     loop {
+        reject_reparse_point(ancestor, "destination ancestor")?;
         if fs::symlink_metadata(ancestor)
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false)
@@ -456,6 +812,7 @@ fn assert_no_symlink_path(root: &Path, rel: &Path) -> Result<()> {
             return Err(anyhow!("unsafe destination path: {}", rel.display()));
         };
         current.push(name);
+        reject_reparse_point(&current, "destination component")?;
         if fs::symlink_metadata(&current)
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false)
@@ -468,7 +825,39 @@ fn assert_no_symlink_path(root: &Path, rel: &Path) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(windows)]
+fn reject_reparse_point(path: &Path, label: &str) -> Result<()> {
+    use std::{iter, os::windows::ffi::OsStrExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT, INVALID_FILE_ATTRIBUTES,
+    };
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(anyhow!(
+            "reparse point {label} path rejected: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+#[cfg(not(windows))]
+fn reject_reparse_point(_path: &Path, _label: &str) -> Result<()> {
+    Ok(())
+}
 fn checked_regular_path(path: &Path, label: &str) -> Result<bool> {
+    reject_reparse_point(path, label)?;
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             Err(anyhow!("symlink {label} path rejected: {}", path.display()))
@@ -502,6 +891,8 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         let d = dst.join(&r);
         fs::create_dir_all(d.parent().unwrap())?;
         fs::write(&d, b)?;
+        #[cfg(not(unix))]
+        let _ = m;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -511,6 +902,7 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 fn copy_existing_tree(src: &Path, dst: &Path) -> Result<()> {
+    reject_reparse_point(src, "destination tree root")?;
     if fs::symlink_metadata(src)
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false)
@@ -524,6 +916,7 @@ fn copy_existing_tree(src: &Path, dst: &Path) -> Result<()> {
             let entry = entry?;
             let source = entry.path();
             let relative = source.strip_prefix(root)?;
+            reject_reparse_point(&source, "destination tree")?;
             if operational(relative)
                 && relative
                     .components()
@@ -566,9 +959,11 @@ fn copy_existing_tree(src: &Path, dst: &Path) -> Result<()> {
     recurse(src, src, dst)
 }
 fn discover(root: &Path) -> Result<Vec<(String, PathBuf, String)>> {
+    reject_reparse_point(root, "discovery root")?;
     fn r(base: &Path, p: &Path, o: &mut Vec<(String, PathBuf, String)>) -> Result<()> {
         for e in fs::read_dir(p)? {
             let x = e?.path();
+            reject_reparse_point(&x, "discovery entry")?;
             let rel = x.strip_prefix(base)?;
             if operational(rel) {
                 continue;
@@ -578,7 +973,9 @@ fn discover(root: &Path) -> Result<Vec<(String, PathBuf, String)>> {
                 return Err(anyhow!("symlink package path rejected: {}", rel.display()));
             }
             if metadata.is_dir() {
-                if x.join("SKILL.md").is_file() {
+                let manifest = x.join("SKILL.md");
+                reject_reparse_point(&manifest, "manifest")?;
+                if manifest.is_file() {
                     let name = manifest_name(&x)
                         .unwrap_or_else(|| rel.file_name().unwrap().to_string_lossy().into());
                     o.push((name, x.clone(), portable_rel(rel)))
@@ -589,7 +986,9 @@ fn discover(root: &Path) -> Result<Vec<(String, PathBuf, String)>> {
         Ok(())
     }
     let mut o = vec![];
-    if root.join("SKILL.md").is_file() {
+    let root_manifest = root.join("SKILL.md");
+    reject_reparse_point(&root_manifest, "manifest")?;
+    if root_manifest.is_file() {
         o.push((
             manifest_name(root).unwrap_or_else(|| {
                 root.file_name()
@@ -674,17 +1073,102 @@ fn validate_branch(branch: &str) -> Result<()> {
     }
     Ok(())
 }
+fn terminate_git_process(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let process_group = -(child.id() as libc::pid_t);
+        unsafe {
+            libc::kill(process_group, libc::SIGTERM);
+        }
+        thread::sleep(Duration::from_millis(25));
+        unsafe {
+            libc::kill(process_group, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn run_git(cwd: Option<&Path>, args: &[&str]) -> Result<String> {
-    let mut c = Command::new("git");
-    if let Some(x) = cwd {
-        c.current_dir(x);
+    let mut command = Command::new("git");
+    if let Some(path) = cwd {
+        command.current_dir(path);
     }
-    let o = c.args(args).output().context("git is not installed")?;
-    if !o.status.success() {
-        let e = String::from_utf8_lossy(&o.stderr).replace('\n', " ");
-        return Err(anyhow!("git operation failed: {}", e.trim()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
     }
-    Ok(String::from_utf8_lossy(&o.stdout).trim().into())
+    let mut child = command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("git is not installed")?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_git_process(&mut child);
+            return Err(anyhow!("git stdout pipe unavailable"));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            terminate_git_process(&mut child);
+            return Err(anyhow!("git stderr pipe unavailable"));
+        }
+    };
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stream = stdout;
+        let _ = stream.read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stream = stderr;
+        let _ = stream.read_to_end(&mut bytes);
+        bytes
+    });
+    let status = loop {
+        if WORKER_STOP_REQUESTED.load(Ordering::Relaxed) {
+            terminate_git_process(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(anyhow!("worker cancelled during git operation"));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                terminate_git_process(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(error).context("wait for git operation");
+            }
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("git stdout reader panicked"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("git stderr reader panicked"))?;
+    if !status.success() {
+        let error = String::from_utf8_lossy(&stderr).replace('\n', " ");
+        return Err(anyhow!("git operation failed: {}", error.trim()));
+    }
+    Ok(String::from_utf8_lossy(&stdout).trim().into())
 }
 fn branch(repo: &str) -> Result<String> {
     if let Some(b) = run_git(None, &["ls-remote", "--symref", repo, "HEAD"])
@@ -817,38 +1301,33 @@ fn snapshot(a: &App, skill: &str, src: &Path) -> Result<(PathBuf, String)> {
 }
 #[cfg(unix)]
 fn rename_staged_dir(src: &Path, dst: &Path) -> Result<()> {
-    use std::{
-        ffi::CString,
-        os::unix::{ffi::OsStrExt, io::RawFd},
-    };
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
     let parent = dst
         .parent()
         .ok_or_else(|| anyhow!("destination has no parent"))?;
     let name = dst
         .file_name()
         .ok_or_else(|| anyhow!("destination has no name"))?;
-    let parent_c = CString::new(parent.as_os_str().as_bytes())?;
+    let source_c = CString::new(src.as_os_str().as_bytes())?;
     let name_c = CString::new(name.as_bytes())?;
-    let fd: RawFd = unsafe {
-        libc::open(
-            parent_c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let result = (|| {
-        let source_c = CString::new(src.as_os_str().as_bytes())?;
-        let status =
-            unsafe { libc::renameat(libc::AT_FDCWD, source_c.as_ptr(), fd, name_c.as_ptr()) };
+    let directory = open_directory_fd(parent)?;
+    let result = {
+        let status = unsafe {
+            libc::renameat(
+                libc::AT_FDCWD,
+                source_c.as_ptr(),
+                directory,
+                name_c.as_ptr(),
+            )
+        };
         if status < 0 {
-            return Err(std::io::Error::last_os_error().into());
+            Err(std::io::Error::last_os_error().into())
+        } else {
+            Ok(())
         }
-        Ok(())
-    })();
+    };
     unsafe {
-        libc::close(fd);
+        libc::close(directory);
     }
     result
 }
@@ -913,6 +1392,8 @@ fn sync_managed_tree(src: &Path, dst: &Path) -> Result<Vec<PathBuf>> {
             fs::create_dir_all(parent)?;
         }
         fs::write(&target, bytes)?;
+        #[cfg(not(unix))]
+        let _ = mode;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -943,18 +1424,39 @@ fn init_empty_destination(repo: &str) -> Result<(tempfile::TempDir, String)> {
     run_git(Some(t.path()), &["remote", "add", "origin", repo])?;
     Ok((t, "main".into()))
 }
+fn type_collision(local: &BTreeSet<PathBuf>, upstream: &BTreeSet<PathBuf>) -> bool {
+    local.iter().any(|local_path| {
+        upstream.iter().any(|upstream_path| {
+            local_path != upstream_path
+                && (local_path.starts_with(upstream_path) || upstream_path.starts_with(local_path))
+        })
+    })
+}
 fn merge_tree(base: &Path, local: &Path, up: &Path, out: &Path) -> Result<bool> {
+    let local_paths = files(local)?
+        .into_iter()
+        .map(|(path, _, _)| path)
+        .collect::<BTreeSet<_>>();
+    let upstream_paths = files(up)?
+        .into_iter()
+        .map(|(path, _, _)| path)
+        .collect::<BTreeSet<_>>();
+    if type_collision(&local_paths, &upstream_paths) {
+        return Ok(true);
+    }
     copy_tree(local, out)?;
-    let mut paths = BTreeMap::<PathBuf, (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)>::new();
+    let mut paths =
+        BTreeMap::<PathBuf, (Option<FileData>, Option<FileData>, Option<FileData>)>::new();
     for root in [base, local, up] {
-        for (r, b, _) in files(root)? {
-            let e = paths.entry(r).or_insert((None, None, None));
+        for (r, bytes, mode) in files(root)? {
+            let entry = paths.entry(r).or_insert((None, None, None));
+            let data = FileData { bytes, mode };
             if root == base {
-                e.0 = Some(b)
+                entry.0 = Some(data)
             } else if root == local {
-                e.1 = Some(b)
+                entry.1 = Some(data)
             } else {
-                e.2 = Some(b)
+                entry.2 = Some(data)
             }
         }
     }
@@ -964,40 +1466,50 @@ fn merge_tree(base: &Path, local: &Path, up: &Path, out: &Path) -> Result<bool> 
             continue;
         }
         if l == b {
-            if let Some(x) = u {
-                let d = out.join(&r);
-                if let Some(parent) = d.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(d, x)?
+            if let Some(data) = u {
+                write_file_data(&out.join(&r), &data)?;
             } else {
                 let _ = fs::remove_file(out.join(&r));
             }
         } else if u == b {
             continue;
-        } else if b.is_some() && l.is_some() && u.is_some() {
+        } else if let (Some(base_data), Some(local_data), Some(upstream_data)) = (b, l, u) {
+            if local_data.mode != base_data.mode
+                && upstream_data.mode != base_data.mode
+                && local_data.mode != upstream_data.mode
+            {
+                conflict = true;
+                continue;
+            }
             let td = tempfile::tempdir()?;
-            let x = td.path().join("b");
-            let y = td.path().join("l");
-            let z = td.path().join("u");
-            fs::write(&x, b.unwrap())?;
-            fs::write(&y, l.unwrap())?;
-            fs::write(&z, u.unwrap())?;
-            let o = Command::new("git")
+            let base_file = td.path().join("base");
+            let local_file = td.path().join("local");
+            let upstream_file = td.path().join("upstream");
+            write_file_data(&base_file, &base_data)?;
+            write_file_data(&local_file, &local_data)?;
+            write_file_data(&upstream_file, &upstream_data)?;
+            let output = Command::new("git")
                 .args([
                     "merge-file",
                     "-p",
-                    y.to_str().unwrap(),
-                    x.to_str().unwrap(),
-                    z.to_str().unwrap(),
+                    local_file.to_str().unwrap(),
+                    base_file.to_str().unwrap(),
+                    upstream_file.to_str().unwrap(),
                 ])
                 .output()?;
-            if o.status.code() == Some(0) {
-                let d = out.join(&r);
-                if let Some(parent) = d.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(d, o.stdout)?
+            if output.status.code() == Some(0) {
+                let mode = if local_data.mode == base_data.mode {
+                    upstream_data.mode
+                } else {
+                    local_data.mode
+                };
+                write_file_data(
+                    &out.join(&r),
+                    &FileData {
+                        bytes: output.stdout,
+                        mode,
+                    },
+                )?;
             } else {
                 conflict = true
             }
@@ -1042,6 +1554,7 @@ fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
     }
     let (repo, b) = match clone_repo_branch(&s.source, Some(&s.branch)) {
         Ok(x) => x,
+        Err(e) if WORKER_STOP_REQUESTED.load(Ordering::Relaxed) => return Err(e),
         Err(e) => {
             s.status = if e.to_string().to_lowercase().contains("auth") {
                 "authentication_required".into()
@@ -1126,8 +1639,14 @@ fn publish_to_repo(
     if !source.is_dir() {
         return Err(anyhow!("skill not found in library"));
     }
-    let source_files = files(&source)?;
-    let current_hash = hash_dir(&source)?;
+    let source_candidate_parent = tempfile::tempdir()?;
+    let source_candidate = source_candidate_parent.path().join("skill");
+    copy_tree(&source, &source_candidate)?;
+    let current_hash = hash_dir(&source_candidate)?;
+    if hash_dir(&source)? != current_hash {
+        return Err(anyhow!("source changed during publication; retry"));
+    }
+    let source_files = files(&source_candidate)?;
     let requested_branch = previous.map(|publication| publication.branch.as_str());
     let (tmp, branch_name) = match clone_repo_branch(url, requested_branch) {
         Ok(value) => value,
@@ -1169,7 +1688,7 @@ fn publish_to_repo(
     } else {
         fs::create_dir_all(&staged_destination)?;
     }
-    let removed = sync_managed_tree(&source, &staged_destination)?;
+    let removed = sync_managed_tree(&source_candidate, &staged_destination)?;
     if let Some(parent) = destination.parent() {
         assert_no_symlink_path(tmp.path(), parent.strip_prefix(tmp.path())?)?;
         fs::create_dir_all(parent)?;
@@ -1183,12 +1702,36 @@ fn publish_to_repo(
         let relative = format!("{destination_rel}/{}", path.to_string_lossy());
         run_git(Some(tmp.path()), &["add", "-u", "--", &relative])?;
     }
+    if hash_dir(&source)? != current_hash {
+        return Err(anyhow!("source changed during publication; retry"));
+    }
     let changed = cached_changes(tmp.path())?;
+    let key = publication_key(skill, url, &branch_name, &destination_rel);
     if changed {
         run_git(
             Some(tmp.path()),
             &["commit", "-m", &format!("Update skill {skill}")],
         )?;
+        if hash_dir(&source)? != current_hash {
+            return Err(anyhow!("source changed during publication; retry"));
+        }
+        let pending = Publication {
+            skill: skill.to_owned(),
+            destination: url.to_owned(),
+            branch: branch_name.clone(),
+            path: destination_rel.clone(),
+            approved: true,
+            status: "pending_push".into(),
+            last_hash: Some(current_hash.clone()),
+            last_sync: now(),
+        };
+        a.state.pending_publications.insert(
+            key.clone(),
+            PendingPublication {
+                publication: pending,
+            },
+        );
+        a.save().context("persist publication intent before push")?;
         run_git(Some(tmp.path()), &["push", "origin", &branch_name])?;
     }
     if hash_dir(&destination)? != current_hash {
@@ -1216,18 +1759,208 @@ fn publish_to_repo(
         last_hash: Some(current_hash),
         last_sync: now(),
     };
-    let key = publication_key(
-        &publication.skill,
-        &publication.destination,
-        &publication.branch,
-        &publication.path,
-    );
+    a.state.pending_publications.remove(&key);
     a.state.publications.insert(key, publication);
     a.save()?;
     Ok(serde_json::json!({"skill":skill,"status":"published"}))
 }
+fn status_for_error(error: &str) -> &'static str {
+    let lower = error.to_lowercase();
+    if lower.contains("auth") {
+        "authentication_required"
+    } else if lower.contains("offline") || lower.contains("not installed") {
+        "offline"
+    } else if lower.contains("permission") || lower.contains("access denied") {
+        "permission_denied"
+    } else {
+        "conflict"
+    }
+}
+
+fn sync_all(a: &mut App, continue_on_error: bool) -> Result<serde_json::Value> {
+    let keys = a.state.subscriptions.keys().cloned().collect::<Vec<_>>();
+    let mut results = vec![];
+    for key in keys {
+        match update_one(a, &key) {
+            Ok(result) => results.push(result),
+            Err(error) if WORKER_STOP_REQUESTED.load(Ordering::Relaxed) => return Err(error),
+            Err(error) if !continue_on_error => return Err(error),
+            Err(error) => {
+                let error_text = error.to_string();
+                let status = status_for_error(&error_text);
+                if let Some(subscription) = a.state.subscriptions.get_mut(&key) {
+                    subscription.status = status.into();
+                    subscription.last_sync = now();
+                }
+                a.save()?;
+                results.push(serde_json::json!({
+                    "relationship": key,
+                    "status": status,
+                    "error": error_text,
+                }));
+            }
+        }
+    }
+    let pending = a
+        .state
+        .pending_publications
+        .iter()
+        .map(|(key, pending)| (key.clone(), pending.publication.clone()))
+        .collect::<Vec<_>>();
+    let pending_keys = pending
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect::<BTreeSet<_>>();
+    for (key, intent) in pending {
+        let previous = a.state.publications.get(&key).cloned();
+        match publish_to_repo(a, &intent.skill, &intent.destination, previous.as_ref()) {
+            Ok(result) => results.push(result),
+            Err(error) if WORKER_STOP_REQUESTED.load(Ordering::Relaxed) => return Err(error),
+            Err(error) if !continue_on_error => return Err(error),
+            Err(error) => {
+                let error_text = error.to_string();
+                let status = status_for_error(&error_text);
+                if let Some(pending) = a.state.pending_publications.get_mut(&key) {
+                    pending.publication.status = status.into();
+                    pending.publication.last_sync = now();
+                }
+                if let Some(publication) = a.state.publications.get_mut(&key) {
+                    publication.status = status.into();
+                    publication.last_sync = now();
+                }
+                a.save()?;
+                results.push(serde_json::json!({
+                    "skill": intent.skill,
+                    "relationship": key,
+                    "status": status,
+                    "error": error_text,
+                }));
+            }
+        }
+    }
+    let publications = a
+        .state
+        .publications
+        .iter()
+        .filter(|(key, publication)| publication.approved && !pending_keys.contains(*key))
+        .map(|(key, publication)| {
+            (
+                key.clone(),
+                publication.skill.clone(),
+                publication.destination.clone(),
+                publication.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (key, skill, destination, previous) in publications {
+        match publish_to_repo(a, &skill, &destination, Some(&previous)) {
+            Ok(result) => results.push(result),
+            Err(error) if WORKER_STOP_REQUESTED.load(Ordering::Relaxed) => return Err(error),
+            Err(error) => {
+                let error_text = error.to_string();
+                let status = status_for_error(&error_text);
+                if let Some(publication) = a.state.publications.get_mut(&key) {
+                    publication.status = status.into();
+                    publication.last_sync = now();
+                }
+                a.save()?;
+                results.push(serde_json::json!({
+                    "skill": skill,
+                    "status": status,
+                    "error": error_text,
+                }));
+            }
+        }
+    }
+    Ok(serde_json::json!({"results": results}))
+}
+
+fn wait_worker_interval(stop: &AtomicBool, interval: u64) {
+    let deadline = Instant::now() + Duration::from_secs(interval);
+    while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn run_worker_locked(a: &mut App, once: bool, interval: u64) -> Result<serde_json::Value> {
+    if interval == 0 {
+        return Err(anyhow!("worker interval must be greater than zero seconds"));
+    }
+    WORKER_STOP_REQUESTED.store(false, Ordering::Relaxed);
+    let _worker_lease = WorkerLease::acquire(&a.config)?;
+    if once {
+        let sync = sync_all(a, true)?;
+        let results = sync
+            .get("results")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+        return Ok(serde_json::json!({"worker":"completed","results":results}));
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal_stop = Arc::clone(&stop);
+    ctrlc::set_handler(move || {
+        WORKER_STOP_REQUESTED.store(true, Ordering::Relaxed);
+        signal_stop.store(true, Ordering::Relaxed);
+    })
+    .context("install Ctrl-C handler for worker")?;
+    let mut cycles = 0_u64;
+    let mut cancelled = false;
+    while !stop.load(Ordering::Relaxed) {
+        match sync_all(a, true) {
+            Ok(sync) => {
+                cycles += 1;
+                let count = sync
+                    .get("results")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                eprintln!("skillsync worker cycle {cycles} complete ({count} result(s))");
+            }
+            Err(_error) if stop.load(Ordering::Relaxed) => {
+                cancelled = true;
+                break;
+            }
+            Err(error) => {
+                cycles += 1;
+                eprintln!("skillsync worker cycle {cycles} failed: {error}");
+            }
+        }
+        wait_worker_interval(&stop, interval);
+    }
+    if stop.load(Ordering::Relaxed) {
+        cancelled = true;
+    }
+    Ok(serde_json::json!({"worker":"stopped","cycles":cycles,"cancelled":cancelled}))
+}
+
+fn requires_lock(command: &Cmd) -> bool {
+    match command {
+        Cmd::Config {
+            command: ConfigCmd::Path,
+        }
+        | Cmd::Status
+        | Cmd::Diff
+        | Cmd::Doctor => false,
+        Cmd::Publish { dry_run, .. } => !dry_run,
+        _ => true,
+    }
+}
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let json_requested = std::env::args_os()
+        .skip(1)
+        .any(|argument| argument.to_string_lossy() == "--json");
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            if json_requested {
+                let exit_code = error.exit_code();
+                envelope(true, false, &error.to_string(), serde_json::json!({}));
+                std::process::exit(exit_code);
+            }
+            error.exit();
+        }
+    };
     let json = cli.json;
     let result = run(cli);
     match result {
@@ -1256,6 +1989,15 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             }));
         }
     };
+    let needs_lock = requires_lock(&command);
+    let _state_lock = if needs_lock {
+        Some(StateLock::acquire(&a.config)?)
+    } else {
+        None
+    };
+    if needs_lock {
+        a = App::load()?;
+    }
     let result: Result<serde_json::Value> = match command {
         Cmd::Init { library } => {
             if !a.state_path.exists() {
@@ -1291,9 +2033,9 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             let p = a.config.join("config.toml");
             if !p.exists() {
                 fs::create_dir_all(&a.config)?;
-                fs::write(
+                atomic(
                     &p,
-                    format!("library = {:?}\n", a.library.display().to_string()),
+                    format!("library = {:?}\n", a.library.display().to_string()).as_bytes(),
                 )?
             }
             Ok(serde_json::json!({"path":p}))
@@ -1350,50 +2092,8 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             a.save()?;
             Ok(serde_json::json!({"skill":name}))
         }
-        Cmd::Update | Cmd::Sync => {
-            let keys = a.state.subscriptions.keys().cloned().collect::<Vec<_>>();
-            let mut v = vec![];
-            for k in keys {
-                v.push(update_one(&mut a, &k)?)
-            }
-            let publications = a
-                .state
-                .publications
-                .iter()
-                .filter(|(_, publication)| publication.approved)
-                .map(|(key, publication)| {
-                    (
-                        key.clone(),
-                        publication.skill.clone(),
-                        publication.destination.clone(),
-                        publication.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            for (key, skill, destination, previous) in publications {
-                match publish_to_repo(&mut a, &skill, &destination, Some(&previous)) {
-                    Ok(result) => v.push(result),
-                    Err(error) => {
-                        let status = if error.to_string().to_lowercase().contains("auth") {
-                            "authentication_required"
-                        } else if error.to_string().to_lowercase().contains("offline") {
-                            "offline"
-                        } else {
-                            "conflict"
-                        };
-                        if let Some(publication) = a.state.publications.get_mut(&key) {
-                            publication.status = status.into();
-                            publication.last_sync = now();
-                        }
-                        a.save()?;
-                        v.push(
-                            serde_json::json!({"skill":skill,"status":status,"error":error.to_string()}),
-                        );
-                    }
-                }
-            }
-            Ok(serde_json::json!({"results":v}))
-        }
+        Cmd::Update | Cmd::Sync => sync_all(&mut a, false),
+        Cmd::Worker { once, interval } => run_worker_locked(&mut a, once, interval),
         Cmd::Diff => {
             let mut v = vec![];
             for (key, sub) in &a.state.subscriptions {
@@ -1465,10 +2165,10 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             }
         }
         Cmd::Status => Ok(
-            serde_json::json!({"subscriptions":a.state.subscriptions,"publications":a.state.publications,"worker":"stopped/manual-only"}),
+            serde_json::json!({"subscriptions":a.state.subscriptions,"publications":a.state.publications,"pending_publications":a.state.pending_publications,"worker":worker_status(&a.config)?}),
         ),
         Cmd::Doctor => Ok(
-            serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":"unsupported","harness_write_back":"unsupported","hermes_autonomous_curation":"unsupported","registries":"unsupported"}),
+            serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":worker_status(&a.config)?,"startup":"unsupported","harness_write_back":"unsupported","hermes_autonomous_curation":"unsupported","registries":"unsupported"}),
         ),
         Cmd::Unsubscribe { skill } => {
             let matches = a
@@ -1493,7 +2193,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Cmd::Unpublish { skill, repo } => {
             let skill = strict_component(&skill, "skill name")?;
             let url = normalize(&repo)?;
-            let matches = a
+            let mut matches = a
                 .state
                 .publications
                 .iter()
@@ -1503,6 +2203,17 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>();
             if matches.is_empty() {
+                matches = a
+                    .state
+                    .pending_publications
+                    .iter()
+                    .filter(|(_, pending)| {
+                        pending.publication.skill == skill && pending.publication.destination == url
+                    })
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+            }
+            if matches.is_empty() {
                 return Err(anyhow!("publication not found for {skill} and {url}"));
             }
             if matches.len() > 1 {
@@ -1511,6 +2222,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 ));
             }
             a.state.publications.remove(&matches[0]);
+            a.state.pending_publications.remove(&matches[0]);
             a.save()?;
             Ok(serde_json::json!({"skill":skill,"status":"unpublished; destination retained"}))
         }
