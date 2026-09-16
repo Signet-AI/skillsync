@@ -1,0 +1,9 @@
+{
+  "name": "@skillsync/dev-launcher",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "skillsync": "bin/skillsync.mjs"
+  }
+}
