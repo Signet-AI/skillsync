@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 const binary = process.env.SKILLSYNC_BIN ?? resolve(import.meta.dir, "../target/debug/skillsync");
@@ -38,6 +38,23 @@ test("delete rejects symlinked entries without deleting canonical or external da
   expect(rejected.exitCode).toBe(1); expect(dec.decode(rejected.stdout)).toMatch(/symlink|unsupported delete snapshot entry/);
   expect(await readFile(external, "utf8")).toBe("must not be read\n");
   expect(await readFile(join(pkg, "SKILL.md"), "utf8")).toBe("name: demo\n");
+});
+
+test("delete fails closed when quarantine is replaced by a dangling symlink", async () => {
+  if (process.platform === "win32") return;
+  const root = await fixture(); const pkg = join(root, "library/demo");
+  await mkdir(pkg, { recursive: true }); await writeFile(join(pkg, "SKILL.md"), "name: demo\n");
+  expect(run(root, ["--json", "init"]).exitCode).toBe(0);
+  const failed = run(root, ["--json", "delete", "demo", "--yes"], { SKILLSYNC_TEST_DANGLING_QUARANTINE_SYMLINK: "1" });
+  expect(failed.exitCode).toBe(1);
+  expect(dec.decode(failed.stdout)).toMatch(/symlink|regular directory|cleanup target/);
+  const recoveryEntries = await readdir(join(root, "config/recovery"));
+  expect(recoveryEntries).toHaveLength(1);
+  const recoveryPath = join(root, "config/recovery", recoveryEntries[0]!);
+  const quarantine = join(recoveryPath, "quarantine");
+  expect((await lstat(quarantine)).isSymbolicLink()).toBe(true);
+  expect(await readlink(quarantine)).toBe("missing-quarantine-target");
+  expect(await Bun.file(pkg).exists()).toBe(false);
 });
 
 test("restore rehydrates deletion snapshot and is idempotent", async () => {
