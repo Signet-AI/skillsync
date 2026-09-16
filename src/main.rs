@@ -74,6 +74,11 @@ enum Cmd {
         #[arg(long)]
         repo: String,
     },
+    Delete {
+        skill: String,
+        #[arg(long)]
+        yes: bool,
+    },
     Set {
         #[command(subcommand)]
         command: SetCmd,
@@ -1086,6 +1091,73 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+/// Complete copy used only for deletion recovery; operational names are data.
+fn copy_complete_tree(src: &Path, dst: &Path) -> Result<()> {
+    reject_reparse_point(src, "delete snapshot source")?;
+    let metadata = fs::symlink_metadata(src)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(anyhow!("delete snapshot source is not a regular directory"));
+    }
+    assert_no_symlink_path(dst, Path::new("."))?;
+    fs::create_dir_all(dst)?;
+    fn recurse(root: &Path, current: &Path, dst: &Path) -> Result<()> {
+        for entry in fs::read_dir(current)? {
+            let source = entry?.path();
+            let relative = source.strip_prefix(root)?;
+            if !safe(relative) {
+                return Err(anyhow!(
+                    "unsafe delete snapshot path: {}",
+                    relative.display()
+                ));
+            }
+            reject_reparse_point(&source, "delete snapshot entry")?;
+            let metadata = fs::symlink_metadata(&source)?;
+            if metadata.file_type().is_symlink() {
+                return Err(anyhow!(
+                    "symlink delete snapshot entry rejected: {}",
+                    relative.display()
+                ));
+            }
+            let target = dst.join(relative);
+            if metadata.is_dir() {
+                fs::create_dir_all(&target)?;
+                recurse(root, &source, dst)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(
+                        &target,
+                        fs::Permissions::from_mode(metadata.permissions().mode()),
+                    )?;
+                }
+            } else if metadata.is_file() {
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                // Do not use path-following fs::copy for recovery snapshots.
+                // Reopen the final component with no-follow and verify identity.
+                assert_no_symlink_path(root, relative)?;
+                let bytes = read_regular_file(&source, Some(&metadata))?;
+                fs::write(&target, bytes)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(
+                        &target,
+                        fs::Permissions::from_mode(metadata.permissions().mode()),
+                    )?;
+                }
+            } else {
+                return Err(anyhow!(
+                    "unsupported delete snapshot entry: {}",
+                    relative.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+    recurse(src, src, dst)
 }
 fn copy_existing_tree(src: &Path, dst: &Path) -> Result<()> {
     reject_reparse_point(src, "destination tree root")?;
@@ -2893,6 +2965,100 @@ fn import_local(a: &mut App, source: &Path, requested: Option<&str>) -> Result<s
     )
 }
 
+fn delete_skill(a: &mut App, raw_skill: &str, yes: bool) -> Result<serde_json::Value> {
+    let skill = strict_component(raw_skill, "skill name")?;
+    if !yes {
+        return Err(anyhow!(
+            "confirmation required: pass --yes to delete a canonical library skill"
+        ));
+    }
+    let path = a.library.join(&skill);
+    let relative = path
+        .strip_prefix(&a.library)
+        .map_err(|_| anyhow!("canonical package escaped library"))?;
+    assert_no_symlink_path(&a.library, relative)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!("skill already_absent: {skill}"))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || fs::canonicalize(&path)? != path {
+        return Err(anyhow!("canonical package is not a regular directory"));
+    }
+    checked_regular_path(&path.join("SKILL.md"), "skill manifest")?;
+    if a.state.subscriptions.values().any(|s| s.skill == skill) {
+        return Err(anyhow!(
+            "cannot delete {skill}: remove its subscription first"
+        ));
+    }
+    if a.state.publications.values().any(|p| p.skill == skill)
+        || a.state
+            .pending_publications
+            .values()
+            .any(|p| p.publication.skill == skill)
+    {
+        return Err(anyhow!("cannot delete {skill}: unpublish it first"));
+    }
+    if a.state
+        .harness_links
+        .values()
+        .any(|link| link.skill == skill)
+    {
+        return Err(anyhow!(
+            "cannot delete {skill}: unlink its harness links first"
+        ));
+    }
+    if a.state.sets.values().any(|set| {
+        set.members
+            .iter()
+            .any(|m| set_member_name(m).map(|n| n == skill).unwrap_or(false))
+    }) {
+        return Err(anyhow!(
+            "cannot delete {skill}: remove it from every set first"
+        ));
+    }
+    assert_no_symlink_path(&a.recovery, Path::new("."))?;
+    fs::create_dir_all(&a.recovery)?;
+    let recovery_path = a
+        .recovery
+        .join(format!("delete-{skill}-{}", unique_stamp()));
+    validate_state_path(&a.recovery, &recovery_path, "recovery")?;
+    fs::create_dir(&recovery_path)?;
+    let snapshot = recovery_path.join("package");
+    copy_complete_tree(&path, &snapshot)?;
+    let hash = hash_dir(&snapshot)?;
+    if hash_dir(&path)? != hash {
+        return Err(anyhow!(
+            "canonical package changed while staging deletion; recovery retained"
+        ));
+    }
+    let quarantine = recovery_path.join("quarantine");
+    install_dir_noreplace(&path, &quarantine)?;
+    let quarantined_hash = hash_dir(&quarantine)?;
+    if quarantined_hash != hash || hash_dir(&snapshot)? != hash {
+        let _ = install_dir_noreplace(&quarantine, &path);
+        return Err(anyhow!(
+            "canonical package changed while quarantining deletion; recovery retained"
+        ));
+    }
+    let quarantine_identity = directory_identity(&quarantine)?;
+    let previous_state = a.state.clone();
+    a.state.local_adoptions.remove(&format!("local:{skill}"));
+    if let Err(error) = a.save() {
+        a.state = previous_state;
+        return match install_dir_noreplace(&quarantine, &path) {
+            Ok(()) => Err(error).context("persist deletion state; package restored"),
+            Err(restore_error) => Err(anyhow!("persist deletion state failed: {error}; package restore failed: {restore_error}; recovery retained")),
+        };
+    }
+    remove_owned_directory(&a.recovery, &quarantine, Some(quarantine_identity), &hash)?;
+    Ok(
+        serde_json::json!({"skill":skill,"status":"deleted","recovery_path":recovery_path,"snapshot_hash":hash,"canonical_retained":false}),
+    )
+}
+
 fn run(cli: Cli) -> Result<serde_json::Value> {
     let mut a = App::load()?;
     let command = match cli.command {
@@ -3070,6 +3236,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             Ok(serde_json::json!({"skill":name}))
         }
         Cmd::Import { source, skill } => import_local(&mut a, &source, skill.as_deref()),
+        Cmd::Delete { skill, yes } => delete_skill(&mut a, &skill, yes),
         Cmd::Update | Cmd::Sync => sync_all(&mut a, false),
         Cmd::Worker { once, interval } => run_worker_locked(&mut a, once, interval),
         Cmd::Harness { command } => match command {
