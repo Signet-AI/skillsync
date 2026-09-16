@@ -7,7 +7,9 @@ Local-first Rust CLI for importing agent skill packages, preserving local edits 
 ```sh
 skillsync init [--library PATH]
 skillsync config path
-skillsync subscribe REPOSITORY --skill NAME
+skillsync subscribe REPOSITORY [--skill NAME]
+# Without --skill, a TTY offers a line-oriented single-select picker.
+# With neither argument, the TTY asks for the repository first.
 skillsync import --from PATH --skill NAME
 skillsync update | sync | status | diff | doctor
 skillsync worker --once
@@ -21,7 +23,7 @@ skillsync harness unlink --root PATH --skill NAME
 skillsync harness list
 ```
 
-Subscribe records a stable source-plus-relative-path relationship key, so same-named skills from different repositories do not overwrite state. `import --from PATH --skill NAME` explicitly adopts one package from an existing local directory (including a root package or nested package), stages and validates it, preserves modes/resources, and records local provenance without creating a subscription. In noninteractive use `--skill` is required; existing canonical content is never overwritten.
+Subscribe records a stable source-plus-relative-path relationship key, so same-named skills from different repositories do not overwrite state. `import --from PATH --skill NAME` explicitly adopts one package from an existing local directory (including a root package or nested package), stages and validates it, preserves modes/resources, and records local provenance without creating a subscription. The picker is deliberately not a full TUI: it lists discovered packages and accepts one validated number. Multi-select, unattended onboarding, automatic registry discovery, and `full TUI: unsupported` remain explicit limitations.
 
 ## Safety and storage
 

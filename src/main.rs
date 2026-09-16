@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{Read, Write},
+    io::{BufRead, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -1181,6 +1181,30 @@ fn discover(root: &Path) -> Result<Vec<(String, PathBuf, String)>> {
     o.sort_by(|a, b| a.2.cmp(&b.2));
     Ok(o)
 }
+fn interactive_package_selection(found: &[(String, PathBuf, String)]) -> Result<usize> {
+    if found.is_empty() {
+        return Err(anyhow!("no skill packages found in repository"));
+    }
+    println!("Found {} skill package(s):", found.len());
+    for (index, (name, _, rel)) in found.iter().enumerate() {
+        println!("  {}. {} ({})", index + 1, name, rel);
+    }
+    println!("Select one package by number (full TUI: unsupported; empty or q cancels):");
+    let mut input = String::new();
+    std::io::stdin().lock().read_line(&mut input)?;
+    let value = input.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("q") || value.eq_ignore_ascii_case("cancel") {
+        return Err(anyhow!("subscription cancelled"));
+    }
+    let number = value
+        .parse::<usize>()
+        .map_err(|_| anyhow!("invalid package selection: {value}"))?;
+    if number == 0 || number > found.len() {
+        return Err(anyhow!("invalid package selection: {value}"));
+    }
+    Ok(number - 1)
+}
+
 fn manifest_name(p: &Path) -> Result<String> {
     let text = String::from_utf8(read_regular_file(&p.join("SKILL.md"), None)?)
         .context("SKILL.md is not valid UTF-8")?;
@@ -1450,6 +1474,36 @@ fn skill_query(s: &str) -> Result<String> {
         source_rel(&p)
     } else {
         strict_component(s, "skill name")
+    }
+}
+fn select_discovered<'a>(
+    found: &'a [(String, PathBuf, String)],
+    raw_query: &str,
+) -> Result<&'a (String, PathBuf, String)> {
+    let query = skill_query(raw_query)?;
+    let path_matches = found
+        .iter()
+        .filter(|(_, _, rel)| rel == &query)
+        .collect::<Vec<_>>();
+    let matches = if !path_matches.is_empty() {
+        path_matches
+    } else {
+        found
+            .iter()
+            .filter(|(name, _, _)| name == &query)
+            .collect::<Vec<_>>()
+    };
+    match matches.as_slice() {
+        [] => Err(anyhow!("skill not found in repository: {query}")),
+        [one] => Ok(one),
+        many => Err(anyhow!(
+            "skill selection is ambiguous: {}; candidates: {}",
+            query,
+            many.iter()
+                .map(|(_, _, rel)| rel.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     }
 }
 fn envelope(json: bool, ok: bool, msg: &str, extra: serde_json::Value) {
@@ -2639,6 +2693,36 @@ fn directory_identity(path: &Path) -> Result<DirectoryIdentity> {
     }
 }
 
+fn remove_owned_directory(
+    root: &Path,
+    path: &Path,
+    identity: Option<DirectoryIdentity>,
+    hash: &str,
+) -> Result<()> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| anyhow!("cleanup path escaped root"))?;
+    validate_state_path(root, path, "cleanup")?;
+    if !path.exists() {
+        return Ok(());
+    }
+    let current = directory_identity(path)?;
+    if identity != Some(current) || hash_dir(path)? != hash {
+        return Err(anyhow!(
+            "cleanup ownership changed; recovery required: {}",
+            relative.display()
+        ));
+    }
+    fs::remove_dir_all(path)?;
+    if path.exists() {
+        return Err(anyhow!(
+            "cleanup could not verify removal: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn import_local(a: &mut App, source: &Path, requested: Option<&str>) -> Result<serde_json::Value> {
     use std::io::IsTerminal;
     assert_no_symlink_path(source, Path::new("."))?;
@@ -2825,6 +2909,13 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             }));
         }
     };
+    if let Cmd::Subscribe { repository, skill } = &command {
+        use std::io::IsTerminal;
+        let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        if (!interactive || cli.json) && (repository.is_none() || skill.is_none()) {
+            return Err(anyhow!("repository and --skill are required in noninteractive mode; picker requires interactive stdin and stdout"));
+        }
+    }
     let needs_lock = requires_lock(&command);
     let _state_lock = if needs_lock {
         Some(StateLock::acquire(&a.config)?)
@@ -2877,24 +2968,45 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             Ok(serde_json::json!({"path":p}))
         }
         Cmd::Subscribe { repository, skill } => {
-            let r =
-                repository.ok_or_else(|| anyhow!("repository required in noninteractive mode"))?;
-            let n = skill.ok_or_else(|| {
-                anyhow!("--skill required in noninteractive mode; picker requires a TTY")
-            })?;
-            let n = skill_query(&n)?;
+            use std::io::IsTerminal;
+            let interactive =
+                std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && !cli.json;
+            let r = match repository {
+                Some(repository) => repository,
+                None if interactive => {
+                    println!("Repository:");
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+                    let input = input.trim();
+                    if input.is_empty() {
+                        return Err(anyhow!("subscription cancelled"));
+                    }
+                    input.to_owned()
+                }
+                None => return Err(anyhow!("repository required in noninteractive mode")),
+            };
             let url = normalize(&r)?;
             let (repo, b) = clone_repo(&url)?;
-            let (name, src, raw_source_path) = find_skill(repo.path(), &n)?;
-            let source_path = source_rel(&raw_source_path)?;
+            let found = discover(repo.path())?;
+            let selected = match skill {
+                Some(n) => select_discovered(&found, &n)?,
+                None if interactive => &found[interactive_package_selection(&found)?],
+                None => {
+                    return Err(anyhow!(
+                        "--skill required in noninteractive mode; picker requires a TTY"
+                    ))
+                }
+            };
+            let (name, src, raw_source_path) = selected;
+            let source_path = source_rel(raw_source_path)?;
             let key = relationship_key(&url, &source_path);
-            strict_component(&name, "manifest skill name")?;
+            strict_component(name, "manifest skill name")?;
             if let Some(existing) = subscription_overlaps(&a.state, &url, &source_path) {
                 return Err(anyhow!(
                     "subscription overlaps existing relationship: {existing}"
                 ));
             }
-            let dst = a.library.join(&name);
+            let dst = a.library.join(name);
             if !dst.starts_with(&a.library) {
                 return Err(anyhow!("destination escaped library"));
             }
@@ -2906,9 +3018,13 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             assert_no_symlink_path(&a.library, Path::new("."))?;
             let staging_parent = tempfile::tempdir_in(&a.library)?;
             let staged = staging_parent.path().join("package");
-            copy_tree(&src, &staged)?;
-            let (bp, h) = snapshot(&a, &key, &src)?;
+            copy_tree(src, &staged)?;
+            let (bp, h) = snapshot(&a, &key, src)?;
+            let baseline_identity = directory_identity(&bp)?;
             replace_dir(&dst, &staged)?;
+            let installed_identity = directory_identity(&dst)?;
+            let installed_hash = hash_dir(&dst)?;
+            let previous_state = a.state.clone();
             a.state.subscriptions.insert(
                 key.clone(),
                 Subscription {
@@ -2917,7 +3033,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                     branch: b,
                     source_path,
                     baseline_path: bp.display().to_string(),
-                    baseline_hash: h,
+                    baseline_hash: h.clone(),
                     local_path: dst.display().to_string(),
                     status: "synced".into(),
                     recovery_path: None,
@@ -2925,7 +3041,32 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                     update_count: 0,
                 },
             );
-            a.save()?;
+            if let Err(error) = a.save() {
+                a.state = previous_state;
+                let mut cleanup_errors = Vec::new();
+                if let Err(cleanup_error) = remove_owned_directory(
+                    &a.library,
+                    &dst,
+                    Some(installed_identity),
+                    &installed_hash,
+                ) {
+                    cleanup_errors.push(cleanup_error.to_string());
+                }
+                if let Err(cleanup_error) =
+                    remove_owned_directory(&a.baselines, &bp, Some(baseline_identity), &h)
+                {
+                    cleanup_errors.push(cleanup_error.to_string());
+                }
+                return if cleanup_errors.is_empty() {
+                    Err(error)
+                        .context("persist subscription state; package and baseline rolled back")
+                } else {
+                    Err(anyhow!(
+                        "persist subscription state failed: {error}; {}",
+                        cleanup_errors.join("; ")
+                    ))
+                };
+            }
             Ok(serde_json::json!({"skill":name}))
         }
         Cmd::Import { source, skill } => import_local(&mut a, &source, skill.as_deref()),
@@ -3010,7 +3151,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             serde_json::json!({"subscriptions":a.state.subscriptions,"local_adoptions":a.state.local_adoptions,"publications":a.state.publications,"pending_publications":a.state.pending_publications,"harness_links":a.state.harness_links,"worker":worker_status(&a.config)?}),
         ),
         Cmd::Doctor => Ok(
-            serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":worker_status(&a.config)?,"startup":"unsupported","harness_write_back":"explicit_directory_links_only","harness_discovery":"unsupported","harness_filtering":"unsupported","harness_reload":"unsupported","harness_links":harness_link_health(&a)?,"hermes_autonomous_curation":"unsupported","registries":"unsupported","set_publication":"unsupported","set_subscription_metadata":"unsupported","harness_enablement":"unsupported","personal_library_sync":"unsupported","membership_change_propagation":"unsupported","local_import":"supported: explicit --from PATH --skill NAME; canonical write-back only; no subscription"}),
+            serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":worker_status(&a.config)?,"startup":"unsupported","subscribe_picker":"supported: TTY line-oriented single-select; unattended onboarding unsupported; full TUI: unsupported","harness_write_back":"explicit_directory_links_only","harness_discovery":"unsupported","harness_filtering":"unsupported","harness_reload":"unsupported","harness_links":harness_link_health(&a)?,"hermes_autonomous_curation":"unsupported","registries":"unsupported","set_publication":"unsupported","set_subscription_metadata":"unsupported","harness_enablement":"unsupported","personal_library_sync":"unsupported","membership_change_propagation":"unsupported","local_import":"supported: explicit --from PATH --skill NAME; canonical write-back only; no subscription"}),
         ),
         Cmd::Set { command } => match command {
             SetCmd::Create { name } => {

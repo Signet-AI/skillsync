@@ -244,6 +244,28 @@ test("rolls back a new import when provenance state save fails", async () => {
   expect(skillsync(fixture, ["--json", "status"]).json.local_adoptions).toEqual({});
 });
 
+test("rolls back a failed subscribe completely and allows retry", async () => {
+  const fixture = await makeFixture();
+  const source = join(fixture.root, "source");
+  await put(join(source, "SKILL.md"), "name: subscribe-rollback\nv1\n");
+  checked(run("git", ["init", "-q"], source, fixture.env), "init subscribe source");
+  git(fixture, source, ["add", "."]);
+  git(fixture, source, ["commit", "-qm", "initial"]);
+  skillsync(fixture, ["--json", "init"]);
+  const failed = run(binary, ["--json", "subscribe", source, "--skill", "subscribe-rollback"], undefined, {
+    ...fixture.env,
+    SKILLSYNC_TEST_FAIL_STATE_SAVE: "1",
+  });
+  expect(failed.code).toBe(1);
+  expect(failed.stdout).toContain("rolled back");
+  expect(await Bun.file(join(fixture.library, "subscribe-rollback/SKILL.md")).exists()).toBe(false);
+  expect(await Bun.file(join(fixture.config, "baselines")).exists()).toBe(false);
+  expect(skillsync(fixture, ["--json", "status"]).json.subscriptions).toEqual({});
+  expect(skillsync(fixture, ["--json", "subscribe", source, "--skill", "subscribe-rollback"]).json.skill).toBe("subscribe-rollback");
+  expect(await Bun.file(join(fixture.library, "subscribe-rollback/SKILL.md")).exists()).toBe(true);
+  expect(Object.keys(skillsync(fixture, ["--json", "status"]).json.subscriptions)).toHaveLength(1);
+});
+
 test("local Git subscribe, merge, conflict recovery, and scoped publication", async () => {
   const fixture = await makeFixture();
   const source = join(fixture.root, "source");
