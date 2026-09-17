@@ -21,6 +21,8 @@ skillsync unpublish NAME --repo REPOSITORY
 skillsync delete NAME --yes
 skillsync restore --from /ABSOLUTE/CONFIG/recovery/delete-NAME-STAMP [--skill NAME]
 skillsync conflicts list
+skillsync conflicts show RELATIONSHIP
+# Manual side selection/resume and isolated workspace editing are deferred.
 skillsync set create NAME | list | show NAME | add NAME SKILL | remove NAME SKILL
 skillsync harness link --root PATH --skill NAME
 skillsync harness unlink --root PATH --skill NAME
@@ -49,7 +51,7 @@ State loads strictly validate every local adoption record (identity, absolute no
 
 Package copies exclude operational files such as `.env`, logs, credential directories, and private keys. Publication updates managed files in `skills/<name>` without deleting the destination package wholesale, preserving unrelated operational files. Destination changes that cannot be attributed to the recorded publication are rejected. Publication records are written only after a meaningful commit and successful push; a durable pending-publication intent is written before each push so a failed push or post-push state write can be retried without losing the relationship. Mutating commands share a persistent advisory lock in the config directory; the lock is held for a whole operation or worker run, and status probes the lock rather than trusting a stale PID.
 
-Updates compare the durable baseline, live package, and fetched upstream package. `conflicts list` is a read-only inventory of recorded subscription conflict recovery directories; it validates relationship ownership, containment, manifests, hashes, and whether live content has gone stale. Explicit `resolve`/`resume` is intentionally not exposed yet: the current persisted record lacks an immutable conflict snapshot and cannot safely accept a source without risking stale or ambiguous replacement. Deletion recovery remains separate via `restore`.
+Updates compare the durable baseline, live package, and fetched upstream package. `conflicts list` inventories paused conflicts, and `conflicts show RELATIONSHIP` is inspection-only: it validates and displays an immutable manifest with base/local/incoming hashes and evidence paths. Manual side selection, resolve, resume, and isolated workspace editing remain explicitly deferred; no semantic or automatic conflict resolution is performed. Deletion recovery remains separate via `restore`.
 
 `config edit` is supported only from an interactive terminal. It creates a uniquely named no-follow temporary file inside the config directory, invokes `VISUAL` before `EDITOR` as an executable with that temporary path as its sole argument, then validates and publishes the result without replacing a config created concurrently. Existing configs are published only when their identity and bytes remain unchanged; symlink/reparse substitutions and editor-replaced temporary files fail closed. It inherits terminal streams and reports editor failures. Native Windows publication deliberately fails closed and is unavailable in this implementation; native Windows runtime is not exercised here. It never parses editor command strings or runs through a shell; `--json` and redirected stdin/stdout fail instead of launching an editor.
 

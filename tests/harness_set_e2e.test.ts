@@ -1,14 +1,15 @@
 import { expect, test } from "bun:test";
 import { lstat, mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, dirname, resolve } from "node:path";
+import { join, dirname } from "node:path";
+import { childEnv, commandBinary } from "./test_harness";
 
-const bin = process.env.SKILLSYNC_BIN ?? resolve(import.meta.dir, "../target/debug/skillsync");
+const bin = commandBinary();
 const dec = new TextDecoder();
 type F = { root: string; config: string; library: string; env: Record<string,string> };
 async function put(p: string, s: string) { await mkdir(dirname(p), {recursive:true}); await writeFile(p,s); }
 async function fixture(): Promise<F> { const root=await mkdtemp(join(tmpdir(),"skillsync-set-")); const f={root,config:join(root,"config"),library:join(root,"library"),env:{...process.env as Record<string,string>,HOME:join(root,"home"),SKILLSYNC_CONFIG_DIR:join(root,"config"),SKILLSYNC_LIBRARY:join(root,"library")}}; await mkdir(join(root,"home"),{recursive:true}); return f; }
-function run(f:F,args:string[],ok=true,extra:Record<string,string>={}) { const r=Bun.spawnSync({cmd:[bin,...args],env:{...f.env,...extra},stdout:"pipe",stderr:"pipe"}); const out=dec.decode(r.stdout); expect(r.exitCode,dec.decode(r.stderr)).toBe(ok?0:1); expect(out).not.toBe(""); return {r,json:JSON.parse(out)}; }
+function run(f:F,args:string[],ok=true,extra:Record<string,string>={}) { const r=Bun.spawnSync({cmd:[commandBinary(extra),...args],env:childEnv({...f.env,...extra}),stdout:"pipe",stderr:"pipe"}); const out=dec.decode(r.stdout); expect(r.exitCode,dec.decode(r.stderr)).toBe(ok?0:1); expect(out).not.toBe(""); return {r,json:JSON.parse(out)}; }
 async function setup() { const f=await fixture(); for (const [n,c] of [["one","one\n"],["two","two\n"]]) await put(join(f.library,n,"SKILL.md"),`name: ${n}\n${c}`); const h=join(f.root,"harness"); await mkdir(h,{recursive:true}); await put(join(h,"bundled.txt"),"keep\n"); run(f,["--json","init"]); run(f,["--json","set","create","core"]); run(f,["--json","set","add","core","one"]); run(f,["--json","set","add","core","two"]); return {f,h}; }
 
 test("allows empty set enablement across reload, idempotence, and disable",async()=>{

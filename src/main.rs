@@ -122,6 +122,7 @@ enum Cmd {
 #[derive(Subcommand)]
 enum ConflictCmd {
     List,
+    Show { relationship: String },
 }
 #[derive(Subcommand)]
 enum HarnessCmd {
@@ -217,6 +218,10 @@ struct Subscription {
     source_path: String,
     baseline_path: String,
     baseline_hash: String,
+    #[serde(default)]
+    baseline_source: String,
+    #[serde(default)]
+    baseline_source_path: String,
     local_path: String,
     status: String,
     recovery_path: Option<String>,
@@ -419,6 +424,7 @@ impl App {
         })
     }
     fn save(&self) -> Result<()> {
+        #[cfg(feature = "test-hooks")]
         if std::env::var("SKILLSYNC_TEST_FAIL_STATE_SAVE").as_deref() == Ok("1") {
             return Err(anyhow!("injected state-save failure (test-only)"));
         }
@@ -769,7 +775,7 @@ fn requires_lock(command: &Cmd) -> bool {
         Cmd::Publish { dry_run, .. } => !dry_run,
         Cmd::Restore { .. } => true,
         Cmd::Conflicts {
-            command: ConflictCmd::List,
+            command: ConflictCmd::List | ConflictCmd::Show { .. },
         } => true,
         _ => true,
     }
@@ -901,7 +907,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
     let conflicts_read_lock = matches!(
         command,
         Cmd::Conflicts {
-            command: ConflictCmd::List
+            command: ConflictCmd::List | ConflictCmd::Show { .. }
         }
     );
     let inventory_read = matches!(command, Cmd::Inventory);
@@ -935,7 +941,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         && (matches!(
             command,
             Cmd::Conflicts {
-                command: ConflictCmd::List
+                command: ConflictCmd::List | ConflictCmd::Show { .. }
             }
         ) || matches!(command, Cmd::Inventory))
     {
@@ -954,7 +960,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         if matches!(
             command,
             Cmd::Conflicts {
-                command: ConflictCmd::List
+                command: ConflictCmd::List | ConflictCmd::Show { .. }
             }
         ) {
             return Ok(serde_json::json!({"conflicts": [], "count": 0}));
@@ -1052,18 +1058,20 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             let staging_parent = tempfile::tempdir_in(&a.library)?;
             let staged = staging_parent.path().join("package");
             copy_tree(src, &staged)?;
-            let (bp, h, baseline_replacement) = snapshot_transaction(&a, &key, src)?;
-            let live_replacement = replace_dir_bound(&dst, &staged, &library_parent)?;
+            let (bp, h, mut baseline_replacement) = snapshot_transaction(&a, &key, src)?;
+            let mut live_replacement = replace_dir_bound(&dst, &staged, &library_parent)?;
             let previous_state = a.state.clone();
             a.state.subscriptions.insert(
                 key.clone(),
                 Subscription {
                     skill: name.clone(),
-                    source: url,
+                    source: url.clone(),
                     branch: b,
-                    source_path,
+                    source_path: source_path.clone(),
                     baseline_path: bp.display().to_string(),
                     baseline_hash: h.clone(),
+                    baseline_source: url,
+                    baseline_source_path: source_path,
                     local_path: dst.display().to_string(),
                     status: "synced".into(),
                     recovery_path: None,
@@ -1088,6 +1096,9 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             recovery_path,
             skill,
         } => restore_skill(&a, &recovery_path, skill.as_deref()),
+        Cmd::Conflicts {
+            command: ConflictCmd::Show { relationship },
+        } => conflicts::show(&a, &relationship),
         Cmd::Conflicts {
             command: ConflictCmd::List,
         } => conflicts::list(&a),

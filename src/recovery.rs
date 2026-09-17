@@ -346,12 +346,14 @@ pub(crate) fn import_local(
     if directory_identity(&a.library)? != library_identity_before {
         return Err(anyhow!("canonical library changed during import; retry"));
     }
+    #[cfg(feature = "test-hooks")]
     if std::env::var("SKILLSYNC_TEST_IMPORT_COLLISION").as_deref() == Ok("1") {
         fs::create_dir_all(&destination)?;
         fs::write(destination.join("SKILL.md"), "external collision\n")?;
     }
     install_dir_noreplace(&staged, &destination)
         .context("install canonical package without replacement")?;
+    #[cfg(feature = "test-hooks")]
     if std::env::var("SKILLSYNC_TEST_IMPORT_VERIFY_FAILURE").as_deref() == Ok("1") {
         fs::write(destination.join("SKILL.md"), "post-install mutation\n")?;
     }
@@ -495,6 +497,7 @@ pub(crate) fn delete_skill(a: &mut App, raw_skill: &str, yes: bool) -> Result<se
         };
     }
     #[cfg(unix)]
+    #[cfg(feature = "test-hooks")]
     if std::env::var("SKILLSYNC_TEST_DANGLING_QUARANTINE_SYMLINK").as_deref() == Ok("1") {
         fs::remove_dir_all(&quarantine)?;
         std::os::unix::fs::symlink("missing-quarantine-target", &quarantine)?;
@@ -619,6 +622,7 @@ pub(crate) fn restore_skill(
     if hash_dir(&package)? != hash {
         return Err(anyhow!("recovery package changed before installation"));
     }
+    #[cfg(feature = "test-hooks")]
     if std::env::var("SKILLSYNC_TEST_RESTORE_COLLISION").as_deref() == Ok("1") {
         fs::create_dir_all(&destination)?;
         fs::write(destination.join("SKILL.md"), "external collision\n")?;

@@ -4,6 +4,7 @@ use crate::filesystem::{
     validate_state_path, write_file_data,
 };
 use crate::publication_key;
+use crate::recovery::{directory_identity, remove_owned_directory};
 use crate::{
     now, unique_stamp, App, FileData, PendingPublication, Publication, WORKER_STOP_REQUESTED,
 };
@@ -496,16 +497,45 @@ pub(crate) fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
     let mut replacement = None;
     let mut baseline_replacement = None;
     let previous_state = a.state.clone();
+    let mut conflict_artifact: Option<(PathBuf, crate::recovery::DirectoryIdentity, String)> = None;
     if conflict {
+        if s.status == "conflict" && s.recovery_path.is_some() {
+            // An open conflict is immutable evidence. Validate it before reusing it;
+            // never replace a damaged artifact with a new snapshot.
+            let existing = crate::conflicts::show(a, key)?;
+            if existing
+                .get("live_hash_at_detection")
+                .and_then(|v| v.as_str())
+                == Some(lh.as_str())
+            {
+                return Ok(
+                    serde_json::json!({"skill":s.skill,"relationship":key,"status":"conflict"}),
+                );
+            }
+            return Err(anyhow!("existing conflict evidence is invalid or stale"));
+        }
         assert_no_symlink_path(&a.recovery, Path::new("."))?;
         fs::create_dir_all(&a.recovery)?;
         assert_no_symlink_path(&a.recovery, Path::new("."))?;
         let rec = a.recovery.join(format!("{}-{}", key, unique_stamp()));
         validate_state_path(&a.recovery, &rec, "recovery")?;
         fs::create_dir_all(&rec)?;
-        copy_tree(&local, &rec.join("local"))?;
-        copy_tree(&up, &rec.join("incoming"))?;
+        // Ownership is established before any untrusted evidence copy. If a
+        // later step fails, retain this directory unless identity-safe cleanup
+        // can prove it is still ours.
+        let rec_identity = directory_identity(&rec)?;
+        copy_tree(&base, &rec.join("base")).context("copy base evidence; recovery required")?;
+        copy_tree(&local, &rec.join("local")).context("copy local evidence; recovery required")?;
+        copy_tree(&up, &rec.join("incoming"))
+            .context("copy incoming evidence; recovery required")?;
+        let manifest = serde_json::json!({"manifest_version":1,"relationship":key,"source":s.source,"source_path":s.source_path,"path":s.local_path,"base_hash":s.baseline_hash,"base_path":rec.join("base"),"local_hash":lh,"local_path":rec.join("local"),"incoming_hash":uh,"incoming_path":rec.join("incoming"),"live_hash_at_detection":lh,"baseline_path":s.baseline_path,"baseline_source":s.source,"baseline_source_path":s.source_path,"transition":"directory","status":"open"});
+        crate::filesystem::atomic(
+            &rec.join("manifest.json"),
+            &serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        let rec_hash = crate::filesystem::hash_dir(&rec)?;
         s.recovery_path = Some(rec.display().to_string());
+        conflict_artifact = Some((rec, rec_identity, rec_hash));
         s.status = "conflict".into()
     } else if hash_dir(&local)? != lh {
         s.status = "changed_during_update".into()
@@ -520,16 +550,34 @@ pub(crate) fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
         s.last_sync = now()
     }
     a.state.subscriptions.insert(key.into(), s.clone());
+    if let Some(replacement) = replacement.as_mut() {
+        replacement
+            .prepare()
+            .context("prepare live replacement commit")?;
+    }
+    if let Some(baseline) = baseline_replacement.as_mut() {
+        if let Err(error) = baseline.prepare() {
+            a.state = previous_state.clone();
+            return Err(error)
+                .context("prepare baseline replacement commit; both replacements rolled back");
+        }
+    }
     if let Err(error) = a.save() {
-        // Restore the in-memory record before both owning guards roll back.
-        // Neither replacement is committed until state persistence succeeds.
-        a.state = previous_state;
+        a.state = previous_state.clone();
+        if let Some((path, identity, hash)) = conflict_artifact {
+            if let Err(cleanup) = remove_owned_directory(&a.recovery, &path, Some(identity), &hash)
+            {
+                return Err(error).context(format!(
+                    "persist update state; recovery retained: {cleanup}"
+                ));
+            }
+        }
         return Err(error).context("persist update state; live and baseline rolled back");
     }
-    if let Some(replacement) = replacement {
+    if let Some(replacement) = replacement.as_mut() {
         replacement.commit()?;
     }
-    if let Some(baseline) = baseline_replacement {
+    if let Some(baseline) = baseline_replacement.as_mut() {
         baseline.commit()?;
     }
     Ok(serde_json::json!({"skill":s.skill,"relationship":key,"status":s.status}))
@@ -610,7 +658,8 @@ pub(crate) fn publish_to_repo(
         assert_no_symlink_path(tmp.path(), parent.strip_prefix(tmp.path())?)?;
         fs::create_dir_all(parent)?;
     }
-    let replacement = replace_dir_bound(&destination, &staged_destination, &publication_parent)?;
+    let mut replacement =
+        replace_dir_bound(&destination, &staged_destination, &publication_parent)?;
     for (path, _, _) in &source_files {
         let relative = format!("{destination_rel}/{}", path.to_string_lossy());
         run_git(Some(tmp.path()), &["add", "--", &relative])?;

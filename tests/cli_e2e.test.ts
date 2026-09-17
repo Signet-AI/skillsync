@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
 import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
+import { childEnv, commandBinary } from "./test_harness";
 
 type Env = Record<string, string>;
 type Result = { code: number; stdout: string; stderr: string };
@@ -13,7 +14,7 @@ type Fixture = {
   env: Env;
 };
 
-const binary = process.env.SKILLSYNC_BIN ?? resolve(import.meta.dir, "../target/debug/skillsync");
+const binary = commandBinary();
 const decoder = new TextDecoder();
 
 function inheritedEnv(): Env {
@@ -26,7 +27,7 @@ function run(program: string, args: string[], cwd: string | undefined, env: Env)
   const result = Bun.spawnSync({
     cmd: [program, ...args],
     cwd,
-    env: { ...inheritedEnv(), ...env },
+    env: childEnv(env),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -76,8 +77,8 @@ function git(fixture: Fixture, cwd: string, args: string[]): Result {
   return checked(run("git", args, cwd, fixture.env), `git ${args.join(" ")}`);
 }
 
-function skillsync(fixture: Fixture, args: string[], success = true): { result: Result; json: any } {
-  const result = run(binary, args, undefined, fixture.env);
+function skillsync(fixture: Fixture, args: string[], success = true, extra: Env = {}): { result: Result; json: any } {
+  const result = run(commandBinary(extra), args, undefined, { ...fixture.env, ...extra });
   expect(result.code, `skillsync ${args.join(" ")}\nstderr: ${result.stderr}`).toBe(success ? 0 : 1);
   expect(result.stdout.length, `skillsync stdout was empty: ${result.stderr}`).toBeGreaterThan(0);
   return { result, json: JSON.parse(result.stdout) };
@@ -152,7 +153,7 @@ test("does not replace a destination that appears after the absence check", asyn
   const source = join(fixture.root, "source");
   await put(join(source, "SKILL.md"), "name: raced\nincoming\n");
   skillsync(fixture, ["--json", "init"]);
-  const failed = run(binary, ["--json", "import", "--from", source, "--skill", "raced"], undefined, {
+  const failed = run(commandBinary({ SKILLSYNC_TEST_IMPORT_COLLISION: "1" }), ["--json", "import", "--from", source, "--skill", "raced"], undefined, {
     ...fixture.env,
     SKILLSYNC_TEST_IMPORT_COLLISION: "1",
   });
@@ -167,7 +168,7 @@ test("rolls back after post-install verification failure", async () => {
   const source = join(fixture.root, "source");
   await put(join(source, "SKILL.md"), "name: verify\nv1\n");
   skillsync(fixture, ["--json", "init"]);
-  const failed = run(binary, ["--json", "import", "--from", source, "--skill", "verify"], undefined, {
+  const failed = run(commandBinary({ SKILLSYNC_TEST_IMPORT_VERIFY_FAILURE: "1" }), ["--json", "import", "--from", source, "--skill", "verify"], undefined, {
     ...fixture.env,
     SKILLSYNC_TEST_IMPORT_VERIFY_FAILURE: "1",
   });
@@ -307,7 +308,7 @@ test("rolls back a new import when provenance state save fails", async () => {
   const source = join(fixture.root, "source");
   await put(join(source, "SKILL.md"), "name: rollback\nv1\n");
   skillsync(fixture, ["--json", "init"]);
-  const failed = run(binary, ["--json", "import", "--from", source, "--skill", "rollback"], undefined, {
+  const failed = run(commandBinary({ SKILLSYNC_TEST_FAIL_STATE_SAVE: "1" }), ["--json", "import", "--from", source, "--skill", "rollback"], undefined, {
     ...fixture.env,
     SKILLSYNC_TEST_FAIL_STATE_SAVE: "1",
   });
@@ -325,7 +326,7 @@ test("rolls back a failed subscribe completely and allows retry", async () => {
   git(fixture, source, ["add", "."]);
   git(fixture, source, ["commit", "-qm", "initial"]);
   skillsync(fixture, ["--json", "init"]);
-  const failed = run(binary, ["--json", "subscribe", source, "--skill", "subscribe-rollback"], undefined, {
+  const failed = run(commandBinary({ SKILLSYNC_TEST_FAIL_STATE_SAVE: "1" }), ["--json", "subscribe", source, "--skill", "subscribe-rollback"], undefined, {
     ...fixture.env,
     SKILLSYNC_TEST_FAIL_STATE_SAVE: "1",
   });
@@ -402,6 +403,31 @@ test("local Git subscribe, merge, conflict recovery, and scoped publication", as
   const stateBefore = await readFile(statePath, "utf8");
   const state = JSON.parse(stateBefore);
   const relationship = Object.keys(state.subscriptions)[0]!;
+  const shown = skillsync(fixture, ["--json", "conflicts", "show", relationship]);
+  expect(shown.json.status).toBe("conflict");
+  expect(shown.json.manifest_version).toBe(1);
+
+  const identityTampered = structuredClone(state);
+  identityTampered.subscriptions[relationship].baseline_source = "tampered-source";
+  await writeFile(statePath, JSON.stringify(identityTampered));
+  const identityRejected = skillsync(fixture, ["--json", "conflicts", "show", relationship], false);
+  expect(identityRejected.json.ok).toBe(false);
+  expect(identityRejected.json.message).toBe("subscription baseline source does not match source");
+  expect(await readFile(statePath, "utf8")).toBe(JSON.stringify(identityTampered));
+  expect(await readdir(join(fixture.config, "recovery"))).toHaveLength(1);
+  expect(await readFile(join(fixture.library, "demo/SKILL.md"), "utf8")).toContain("local conflict");
+
+  const legacyTampered = structuredClone(state);
+  delete legacyTampered.subscriptions[relationship].baseline_source;
+  delete legacyTampered.subscriptions[relationship].baseline_source_path;
+  await writeFile(statePath, JSON.stringify(legacyTampered));
+  const legacyRejected = skillsync(fixture, ["--json", "conflicts", "list"], false);
+  expect(legacyRejected.json.ok).toBe(false);
+  expect(legacyRejected.json.message).toBe("subscription baseline source is required");
+  expect(await readFile(statePath, "utf8")).toBe(JSON.stringify(legacyTampered));
+  expect(await readdir(join(fixture.config, "recovery"))).toHaveLength(1);
+
+  await writeFile(statePath, stateBefore);
   await put(join(fixture.config, "baselines", relationship, "tampered.txt"), "tampered\n");
   const rejectedInventory = skillsync(fixture, ["--json", "conflicts", "list"], false);
   expect(rejectedInventory.json.ok).toBe(false);
@@ -482,6 +508,8 @@ test("tampered persisted paths are rejected without reading outside state", asyn
     source_path: ".",
     baseline_path: join(fixture.root, "outside-baseline"),
     baseline_hash: "deadbeef",
+    baseline_source: "",
+    baseline_source_path: ".",
     local_path: join(fixture.library, "tampered"),
     status: "synced",
     recovery_path: null,
@@ -621,6 +649,8 @@ test("worker once isolates malformed relationships instead of aborting the cycle
       source_path: ".",
       baseline_path: join(fixture.config, "baselines", key),
       baseline_hash: "deadbeef",
+      baseline_source: "",
+      baseline_source_path: ".",
       local_path: join(fixture.library, "bad"),
       status: "synced",
       recovery_path: null,
@@ -651,6 +681,8 @@ test("worker Ctrl-C terminates a blocked Git subprocess and releases ownership",
     source_path: ".",
     baseline_path: join(fixture.config, "baselines/fixture-rel"),
     baseline_hash: "deadbeef",
+    baseline_source: "",
+    baseline_source_path: ".",
     local_path: join(fixture.library, "demo"),
     status: "synced",
     recovery_path: null,

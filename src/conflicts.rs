@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     fs,
@@ -6,8 +7,7 @@ use std::{
 };
 
 use crate::filesystem::{
-    assert_no_symlink_path, files, hash_dir, manifest_name, safe, strict_component,
-    validate_state_path,
+    assert_no_symlink_path, hash_dir, manifest_name, safe, strict_component, validate_state_path,
 };
 use crate::{relationship_key, App};
 
@@ -25,6 +25,22 @@ fn validate_subscription(
     crate::repository::normalize(&subscription.source)?;
     crate::repository::validate_branch(&subscription.branch)?;
     crate::filesystem::source_rel(&subscription.source_path)?;
+    if subscription.baseline_source.is_empty() {
+        return Err(anyhow!("subscription baseline source is required"));
+    }
+    if subscription.baseline_source != subscription.source {
+        return Err(anyhow!(
+            "subscription baseline source does not match source"
+        ));
+    }
+    if subscription.baseline_source_path.is_empty() {
+        return Err(anyhow!("subscription baseline source path is required"));
+    }
+    if subscription.baseline_source_path != subscription.source_path {
+        return Err(anyhow!(
+            "subscription baseline source path does not match source path"
+        ));
+    }
     if !matches!(
         subscription.status.as_str(),
         "synced"
@@ -142,61 +158,157 @@ pub(crate) fn list(a: &App) -> Result<serde_json::Value> {
         if subscription.status != "conflict" && subscription.recovery_path.is_none() {
             continue;
         }
-        validate_baseline_integrity(a, relationship, subscription)?;
-        let recovery_raw = subscription
-            .recovery_path
-            .as_ref()
-            .ok_or_else(|| anyhow!("conflict relationship has no recovery path: {relationship}"))?;
-        let recovery = PathBuf::from(recovery_raw);
-        validate_state_path(&a.recovery, &recovery, "recovery")?;
-        let relative = recovery
-            .strip_prefix(&a.recovery)
-            .map_err(|_| anyhow!("recovery path escaped configured recovery root"))?;
-        if relative.components().count() != 1
-            || !relative
-                .components()
-                .all(|c| matches!(c, Component::Normal(_)))
-        {
-            return Err(anyhow!(
-                "conflict recovery must be a direct child of the recovery root"
-            ));
-        }
-        let name = relative
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        if !name.starts_with(&format!("{relationship}-")) {
-            return Err(anyhow!(
-                "recovery path does not belong to subscription relationship: {relationship}"
-            ));
-        }
-        let local = recovery.join("local");
-        let incoming = recovery.join("incoming");
-        for (label, package) in [("local", &local), ("incoming", &incoming)] {
-            validate_state_path(&a.recovery, package, "recovery package")?;
-            let metadata = fs::symlink_metadata(package)
-                .map_err(|_| anyhow!("recovery is missing {label} package"))?;
-            if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Err(anyhow!(
-                    "recovery {label} package must be a regular directory"
-                ));
-            }
-            assert_no_symlink_path(&a.recovery, package.strip_prefix(&a.recovery)?)?;
-            if files(package)?.is_empty() || manifest_name(package)? != subscription.skill {
-                return Err(anyhow!(
-                    "recovery {label} package manifest does not match subscription"
-                ));
-            }
-        }
-        let live = PathBuf::from(&subscription.local_path);
-        let live_hash = hash_dir(&live)?;
-        let local_hash = hash_dir(&local)?;
-        let stale = live_hash != local_hash;
-        conflicts.push(json!({"relationship": relationship, "skill": subscription.skill,
-            "status": subscription.status, "recovery_path": recovery,
-            "local_hash": local_hash, "incoming_hash": hash_dir(&incoming)?,
-            "live_hash": live_hash, "stale": stale,
-            "resolution": "explicit resume is not yet available: state lacks immutable conflict snapshot"}));
+        // Use the same strict manifest/evidence validator as `conflicts show`.
+        // Inventory must fail closed rather than emit a weaker representation.
+        let validated = show(a, relationship)?;
+        conflicts.push(validated);
+        continue;
     }
     Ok(json!({"conflicts": conflicts, "count": conflicts.len()}))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictManifest {
+    manifest_version: u32,
+    relationship: String,
+    source: String,
+    source_path: String,
+    path: String,
+    base_hash: String,
+    base_path: String,
+    local_hash: String,
+    local_path: String,
+    incoming_hash: String,
+    incoming_path: String,
+    live_hash_at_detection: String,
+    baseline_path: String,
+    baseline_source: String,
+    baseline_source_path: String,
+    transition: String,
+    status: String,
+}
+
+fn validate_evidence_package(
+    root: &PathBuf,
+    path: &PathBuf,
+    skill: &str,
+    expected_hash: &str,
+    label: &str,
+) -> Result<()> {
+    validate_state_path(root, path, label)?;
+    let meta =
+        fs::symlink_metadata(path).map_err(|_| anyhow!("conflict evidence is missing {label}"))?;
+    if !meta.is_dir() || meta.file_type().is_symlink() || fs::canonicalize(path)? != *path {
+        return Err(anyhow!(
+            "conflict evidence {label} must be a canonical regular directory"
+        ));
+    }
+    assert_no_symlink_path(root, path.strip_prefix(root)?)?;
+    if manifest_name(path)? != skill {
+        return Err(anyhow!(
+            "conflict evidence {label} manifest does not match subscription"
+        ));
+    }
+    if hash_dir(path)? != expected_hash {
+        return Err(anyhow!(
+            "conflict evidence {label} hash does not match manifest"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn show(a: &App, relationship: &str) -> Result<serde_json::Value> {
+    let s = a
+        .state
+        .subscriptions
+        .get(relationship)
+        .ok_or_else(|| anyhow!("conflict relationship not found"))?;
+    validate_subscription(a, relationship, s)?;
+    validate_baseline_integrity(a, relationship, s)?;
+    if s.status != "conflict" {
+        return Err(anyhow!("relationship is not an open conflict"));
+    }
+    let recovery = PathBuf::from(
+        s.recovery_path
+            .as_ref()
+            .ok_or_else(|| anyhow!("conflict has no recovery evidence"))?,
+    );
+    validate_state_path(&a.recovery, &recovery, "recovery")?;
+    let meta = fs::symlink_metadata(&recovery)?;
+    if !meta.is_dir() || meta.file_type().is_symlink() || fs::canonicalize(&recovery)? != recovery {
+        return Err(anyhow!("conflict recovery is not a canonical directory"));
+    }
+    let raw = fs::read(recovery.join("manifest.json"))
+        .map_err(|_| anyhow!("conflict manifest is missing"))?;
+    let manifest: ConflictManifest =
+        serde_json::from_slice(&raw).map_err(|_| anyhow!("conflict manifest is malformed"))?;
+    if manifest.manifest_version != 1
+        || manifest.relationship != relationship
+        || manifest.source != s.source
+        || manifest.source_path != s.source_path
+        || manifest.path != s.local_path
+        || manifest.baseline_path != s.baseline_path
+        || manifest.baseline_source != s.source
+        || manifest.baseline_source_path != s.source_path
+        || manifest.status != "open"
+        || manifest.transition != "directory"
+    {
+        return Err(anyhow!("conflict manifest is incompatible or mismatched"));
+    }
+    crate::repository::normalize(&manifest.source)?;
+    crate::repository::validate_branch(&s.branch)?;
+    crate::filesystem::source_rel(&manifest.source_path)?;
+    if manifest.base_hash != s.baseline_hash {
+        return Err(anyhow!(
+            "conflict base evidence does not match subscription baseline"
+        ));
+    }
+    // Verify the persisted baseline itself, not only the copied evidence.
+    validate_baseline_integrity(a, relationship, s)?;
+    for (value, label) in [
+        (&manifest.base_hash, "base"),
+        (&manifest.local_hash, "local"),
+        (&manifest.incoming_hash, "incoming"),
+        (&manifest.live_hash_at_detection, "live"),
+    ] {
+        if value.len() != 64 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(anyhow!("invalid {label} evidence hash"));
+        }
+    }
+    let paths = [
+        (
+            "base",
+            manifest.base_path.clone(),
+            manifest.base_hash.clone(),
+        ),
+        (
+            "local",
+            manifest.local_path.clone(),
+            manifest.local_hash.clone(),
+        ),
+        (
+            "incoming",
+            manifest.incoming_path.clone(),
+            manifest.incoming_hash.clone(),
+        ),
+    ];
+    for (label, raw_path, hash) in paths {
+        let path = PathBuf::from(raw_path);
+        if path != recovery.join(label) {
+            return Err(anyhow!(
+                "conflict {label} path does not match contained evidence"
+            ));
+        }
+        validate_evidence_package(&a.recovery, &path, &s.skill, &hash, label)?;
+    }
+    if manifest.live_hash_at_detection != manifest.local_hash {
+        return Err(anyhow!("conflict live hash does not match local evidence"));
+    }
+    let current_live_hash = hash_dir(&PathBuf::from(&s.local_path))?;
+    let mut output = serde_json::to_value(manifest)?;
+    output["status"] = json!(s.status);
+    output["current_live_hash"] = json!(current_live_hash.clone());
+    output["stale"] = json!(current_live_hash != output["live_hash_at_detection"]);
+    Ok(output)
 }

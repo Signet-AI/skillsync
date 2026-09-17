@@ -132,6 +132,7 @@ fn link_targets_match(target: &Path, expected: &Path) -> Result<bool> {
 }
 
 fn create_directory_link(target: &Path, link: &Path) -> Result<()> {
+    #[cfg(feature = "test-hooks")]
     if std::env::var("SKILLSYNC_TEST_FAIL_CREATE_MEMBER").as_deref()
         == Ok(link
             .file_name()
@@ -177,6 +178,7 @@ fn create_directory_link(target: &Path, link: &Path) -> Result<()> {
 }
 
 fn remove_directory_link(link: &Path) -> Result<()> {
+    #[cfg(feature = "test-hooks")]
     if std::env::var("SKILLSYNC_TEST_FAIL_REMOVE_MEMBER").as_deref()
         == Ok(link.file_name().and_then(|n| n.to_str()).unwrap_or(""))
     {

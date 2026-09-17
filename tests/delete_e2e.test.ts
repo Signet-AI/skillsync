@@ -1,11 +1,12 @@
 import { expect, test } from "bun:test";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-const binary = process.env.SKILLSYNC_BIN ?? resolve(import.meta.dir, "../target/debug/skillsync");
+import { join } from "node:path";
+import { childEnv, commandBinary } from "./test_harness";
+const binary = commandBinary();
 const dec = new TextDecoder();
 function env(root: string) { return { ...process.env, HOME: join(root, "home"), SKILLSYNC_CONFIG_DIR: join(root, "config"), SKILLSYNC_LIBRARY: join(root, "library") }; }
-function run(root: string, args: string[], extra: Record<string, string> = {}) { return Bun.spawnSync({ cmd: [binary, ...args], env: { ...env(root), ...extra }, stdout: "pipe", stderr: "pipe" }); }
+function run(root: string, args: string[], extra: Record<string, string> = {}) { return Bun.spawnSync({ cmd: [commandBinary(extra), ...args], env: childEnv({ ...env(root), ...extra }), stdout: "pipe", stderr: "pipe" }); }
 async function fixture() { const root = await mkdtemp(join(tmpdir(), "skillsync-delete-")); await mkdir(join(root, "library"), { recursive: true }); return root; }
 test("delete requires --yes and preserves a complete recovery snapshot", async () => {
   const root = await fixture(); const pkg = join(root, "library/demo");
@@ -24,7 +25,7 @@ test("delete requires --yes and preserves a complete recovery snapshot", async (
 test("delete state-save failure restores canonical content and keeps recovery", async () => {
   const root = await fixture(); const pkg = join(root, "library/demo"); await mkdir(pkg, { recursive: true }); await writeFile(join(pkg, "SKILL.md"), "name: demo\ncontent\n");
   expect(run(root, ["--json", "init"]).exitCode).toBe(0);
-  const failed = Bun.spawnSync({ cmd: [binary, "--json", "delete", "demo", "--yes"], env: { ...env(root), SKILLSYNC_TEST_FAIL_STATE_SAVE: "1" }, stdout: "pipe", stderr: "pipe" });
+  const failed = Bun.spawnSync({ cmd: [commandBinary({ SKILLSYNC_TEST_FAIL_STATE_SAVE: "1" }), "--json", "delete", "demo", "--yes"], env: childEnv({ ...env(root), SKILLSYNC_TEST_FAIL_STATE_SAVE: "1" }), stdout: "pipe", stderr: "pipe" });
   expect(failed.exitCode).toBe(1); expect(await readFile(join(pkg, "SKILL.md"), "utf8")).toContain("content"); expect((await readdir(join(root, "config", "recovery"))).length).toBe(1);
   expect(JSON.parse(dec.decode(run(root, ["--json", "status"]).stdout)).local_adoptions).toEqual({});
 });

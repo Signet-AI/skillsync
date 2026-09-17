@@ -1466,7 +1466,7 @@ pub(crate) fn copy_existing_tree(src: &Path, dst: &Path) -> Result<()> {
 }
 #[allow(dead_code)]
 pub(crate) fn snapshot(a: &App, skill: &str, src: &Path) -> Result<(PathBuf, String)> {
-    let (path, hash, replacement) = snapshot_transaction(a, skill, src)?;
+    let (path, hash, mut replacement) = snapshot_transaction(a, skill, src)?;
     replacement.commit()?;
     Ok((path, hash))
 }
@@ -1635,9 +1635,20 @@ pub(crate) struct Replacement {
 }
 
 impl Replacement {
+    pub(crate) fn prepare(&self) -> Result<()> {
+        #[cfg(feature = "test-hooks")]
+        if std::env::var("SKILLSYNC_TEST_FAIL_REPLACEMENT_COMMIT").as_deref() == Ok("1") {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+            if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 1 {
+                return Err(anyhow!("injected replacement commit failure (test-only)"));
+            }
+        }
+        Ok(())
+    }
     /// Finish the owning transaction.  Backups are intentionally retained:
     /// pathname deletion cannot be made safe against an external rename/race.
-    pub(crate) fn commit(mut self) -> Result<()> {
+    pub(crate) fn commit(&mut self) -> Result<()> {
         self.committed = true;
         Ok(())
     }

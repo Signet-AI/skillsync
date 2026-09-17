@@ -256,6 +256,7 @@ pub(crate) fn edit_config(a: &super::App, json: bool) -> Result<serde_json::Valu
                 let publish_result = (|| -> Result<()> {
                     target.set_len(0)?;
                     target.rewind()?;
+                    #[cfg(feature = "test-hooks")]
                     if std::env::var_os("SKILLSYNC_TEST_CONFIG_PUBLISH_FAILURE").is_some() {
                         std::env::remove_var("SKILLSYNC_TEST_CONFIG_PUBLISH_FAILURE");
                         return Err(anyhow!("injected config publication failure"));

@@ -1,13 +1,14 @@
 import { expect, test } from "bun:test";
 import { chmod, mkdtemp, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
+import { childEnv, commandBinary } from "./test_harness";
 
 type Env = Record<string, string>;
 type Result = { code: number; stdout: string; stderr: string };
 type Fixture = { root: string; config: string; library: string; home: string; gitconfig: string; env: Env };
 
-const binary = process.env.SKILLSYNC_BIN ?? resolve(import.meta.dir, "../target/debug/skillsync");
+const binary = commandBinary();
 const decoder = new TextDecoder();
 
 function inheritedEnv(): Env {
@@ -20,7 +21,7 @@ function run(args: string[], env: Env, cwd?: string): Result {
   const result = Bun.spawnSync({
     cmd: [binary, ...args],
     cwd,
-    env: { ...inheritedEnv(), ...env },
+    env: childEnv(env),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -36,10 +37,10 @@ function shellQuote(value: string): string {
 }
 
 function runInPty(args: string[], env: Env): Result {
-  const command = [binary, ...args].map(shellQuote).join(" ");
+  const command = [commandBinary(env), ...args].map(shellQuote).join(" ");
   const result = Bun.spawnSync({
     cmd: ["script", "-qefc", command, "/dev/null"],
-    env: { ...inheritedEnv(), ...env },
+    env: childEnv(env),
     stdout: "pipe",
     stderr: "pipe",
   });
