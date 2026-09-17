@@ -59,7 +59,9 @@ pub(crate) struct FileData {
 #[cfg(unix)]
 pub(crate) fn open_directory_fd(path: &Path) -> Result<std::os::fd::RawFd> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
-    let absolute = if path.is_absolute() {
+    let absolute = if cfg!(target_os = "macos") {
+        canonicalize_path_with_missing(path)?
+    } else if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()?.join(path)
@@ -1429,6 +1431,13 @@ pub(crate) fn assert_no_symlink_path(root: &Path, rel: &Path) -> Result<()> {
     if root.starts_with("/proc/self/fd") {
         return Ok(());
     }
+    let canonical_root;
+    let root = if cfg!(target_os = "macos") {
+        canonical_root = canonicalize_path_with_missing(root)?;
+        canonical_root.as_path()
+    } else {
+        root
+    };
     let mut ancestor = root;
     loop {
         reject_reparse_point(ancestor, "destination ancestor")?;
