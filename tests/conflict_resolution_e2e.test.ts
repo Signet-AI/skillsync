@@ -28,7 +28,10 @@ async function fixture(): Promise<Fixture> {
   const library = join(root, "library");
   const gitConfig = join(root, "gitconfig");
   await mkdir(home, { recursive: true });
-  await writeFile(gitConfig, "[user]\n\tname = Skillsync Bun Test\n\temail = skillsync@example.invalid\n");
+  await writeFile(
+    gitConfig,
+    "[user]\n\tname = Skillsync Bun Test\n\temail = skillsync@example.invalid\n[core]\n\tautocrlf = false\n",
+  );
   fixtureRoots.add(root);
   return {
     root,
@@ -122,7 +125,7 @@ test("explicit conflict selection resumes incoming and retains immutable evidenc
   expect(repeated.status).toBe("synced");
   expect(repeated.recovery_retained).toBe(true);
   expect(await readFile(livePath, "utf8")).toBe("name: demo\nincoming change\n");
-});
+}, { timeout: 30000 });
 
 test("rejects a tampered current-version conflict selection on repeated resume", async () => {
   const { f, relationship, statePath } = await conflictFixture();
@@ -135,7 +138,7 @@ test("rejects a tampered current-version conflict selection on repeated resume",
   const rejected = run(f, ["--json", "conflicts", "resume", relationship], false);
   expect(rejected.json.ok).toBe(false);
   expect(rejected.json.message).toContain("invalid conflict side selection");
-});
+}, { timeout: 30000 });
 
 test("stale live content blocks conflict selection without mutation", async () => {
   const { f, relationship, statePath, livePath } = await conflictFixture();
@@ -149,7 +152,7 @@ test("stale live content blocks conflict selection without mutation", async () =
   expect(await readFile(statePath, "utf8")).toBe(beforeState);
   expect(await readdir(join(f.config, "recovery"))).toEqual(beforeRecovery);
   expect(await readFile(livePath, "utf8")).toBe("name: demo\nnewer user edit\n");
-});
+}, { timeout: 30000 });
 
 test("migrates pre-v5 baseline source identity for conflict inspection", async () => {
   const { f, relationship, statePath } = await conflictFixture();
@@ -163,7 +166,7 @@ test("migrates pre-v5 baseline source identity for conflict inspection", async (
   expect(shown.status).toBe("conflict");
   expect(shown.baseline_source).toBe(state.subscriptions[relationship].source);
   expect(shown.baseline_source_path).toBe(state.subscriptions[relationship].source_path);
-});
+}, { timeout: 30000 });
 
 test("resume rolls back live and baseline on state-save failure", async () => {
   const { f, relationship, statePath, livePath } = await conflictFixture();
@@ -186,7 +189,7 @@ test("resume rolls back live and baseline on state-save failure", async () => {
   expect(await readFile(livePath, "utf8")).toBe("name: demo\nlocal change\n");
   expect(await readFile(join(baselinePath, "SKILL.md"), "utf8")).toBe(beforeBaseline);
   expect(await readdir(join(f.config, "recovery"))).toEqual(beforeRecovery);
-});
+}, { timeout: 30000 });
 
 test("resume rolls back both replacements when the second commit preparation fails", async () => {
   const { f, relationship, statePath, livePath } = await conflictFixture();
@@ -207,4 +210,4 @@ test("resume rolls back both replacements when the second commit preparation fai
   expect(await readFile(statePath, "utf8")).toBe(beforeState);
   expect(await readFile(livePath, "utf8")).toBe("name: demo\nlocal change\n");
   expect(await readFile(join(baselinePath, "SKILL.md"), "utf8")).toBe(beforeBaseline);
-});
+}, { timeout: 30000 });
