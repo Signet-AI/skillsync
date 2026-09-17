@@ -44,14 +44,23 @@ def main() -> int:
             status = child_status
             break
     try:
-        while True:
-            data = os.read(master, 4096)
+        os.set_blocking(master, False)
+        idle_deadline = time.monotonic() + 0.5
+        while time.monotonic() < idle_deadline:
+            readable, _, _ = select.select([master], [], [], 0.05)
+            if not readable:
+                continue
+            try:
+                data = os.read(master, 4096)
+            except OSError as error:
+                if error.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EIO):
+                    break
+                raise
             if not data:
                 break
             sys.stdout.buffer.write(data)
-    except OSError as error:
-        if error.errno != errno.EIO:
-            raise
+            sys.stdout.buffer.flush()
+            idle_deadline = time.monotonic() + 0.5
     finally:
         os.close(master)
     return os.waitstatus_to_exitcode(status)

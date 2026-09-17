@@ -7,7 +7,7 @@ import { childEnv, commandBinary } from "./test_harness";
 type F = { root: string; config: string; data: string; env: Record<string,string> };
 const fixtures: F[] = [];
 const dec = new TextDecoder();
-async function fixture(): Promise<F> { const root=await mkdtemp(join(tmpdir(),"skillsync-worker-")); const f={root,config:join(root,"config"),data:join(root,"data"),env:{...process.env as Record<string,string>,HOME:join(root,"home"),XDG_DATA_HOME:join(root,"data"),SKILLSYNC_CONFIG_DIR:join(root,"config")}}; await mkdir(join(root,"home"),{recursive:true}); fixtures.push(f); return f; }
+async function fixture(): Promise<F> { const root=await mkdtemp(join(tmpdir(),"skillsync-worker-")); const env: Record<string,string>={...process.env as Record<string,string>,HOME:join(root,"home"),XDG_DATA_HOME:join(root,"data"),SKILLSYNC_CONFIG_DIR:join(root,"config")}; if (process.platform === "win32") { env.LOCALAPPDATA=join(root,"data"); env.APPDATA=join(root,"appdata"); env.USERPROFILE=join(root,"home"); } const f={root,config:join(root,"config"),data:join(root,"data"),env}; await mkdir(join(root,"home"),{recursive:true}); fixtures.push(f); return f; }
 function run(f:F,args:string[],ok=true,extra:Record<string,string>={}) { const r=Bun.spawnSync({cmd:[commandBinary(extra),"--json",...args],env:childEnv({...f.env,...extra}),stdout:"pipe",stderr:"pipe"}); const out=dec.decode(r.stdout); expect(r.exitCode,dec.decode(r.stderr)).toBe(ok?0:1); return JSON.parse(out); }
 afterEach(async()=>{ await Promise.all(fixtures.splice(0).map(f=>rm(f.root,{recursive:true,force:true}))); });
 
@@ -20,7 +20,7 @@ function expectedArtifacts(f: F) {
     };
   }
   if (process.platform === "win32") {
-    const root = join(process.env.LOCALAPPDATA ?? "", "skillsync");
+    const root = join(f.env.LOCALAPPDATA ?? "", "skillsync");
     return { executable: join(root, "bin", "skillsync.exe"), registration: join(root, "worker-task.xml") };
   }
   const root = join(f.env.HOME, ".local/share/skillsync");

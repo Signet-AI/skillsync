@@ -45,7 +45,7 @@ fn paths() -> Result<(PathBuf, PathBuf, String)> {
             .unwrap_or(home()?.join(".local/share"))
             .join("skillsync");
         return Ok((
-            root.join("bin/skillsync"),
+            root.join("bin").join("skillsync"),
             home()?.join(".config/systemd/user/skillsync-worker.service"),
             SERVICE.into(),
         ));
@@ -54,7 +54,7 @@ fn paths() -> Result<(PathBuf, PathBuf, String)> {
     {
         let root = home()?.join("Library/Application Support/skillsync");
         return Ok((
-            root.join("bin/skillsync"),
+            root.join("bin").join("skillsync"),
             home()?.join("Library/LaunchAgents/com.skillsync.worker.plist"),
             "com.skillsync.worker".into(),
         ));
@@ -66,7 +66,7 @@ fn paths() -> Result<(PathBuf, PathBuf, String)> {
         )
         .join("skillsync");
         return Ok((
-            root.join("bin/skillsync.exe"),
+            root.join("bin").join("skillsync.exe"),
             root.join("worker-task.xml"),
             "Skillsync Worker".into(),
         ));
