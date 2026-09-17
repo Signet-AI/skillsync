@@ -6,10 +6,12 @@ use std::{
 
 #[cfg(unix)]
 use crate::filesystem::open_entry_checked;
+#[cfg(unix)]
+use crate::filesystem::read_directory_entries;
 use crate::filesystem::{
     assert_no_symlink_path, canonicalize_path, checked_regular_path, copy_complete_tree, copy_tree,
-    discover, hash_dir, install_dir_noreplace, manifest_name, read_directory_entries,
-    reject_reparse_point, strict_component, validate_state_path,
+    discover, hash_dir, install_dir_noreplace, manifest_name, reject_reparse_point,
+    strict_component, validate_state_path,
 };
 use crate::*;
 
