@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -9,12 +8,7 @@ use std::{
     io::BufRead,
     path::{Path, PathBuf},
     process::Command,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 mod config_editor;
@@ -25,12 +19,14 @@ mod inventory;
 mod recovery;
 mod repository;
 mod tui;
+mod worker;
+pub(crate) use worker::{worker_status, WORKER_STOP_REQUESTED};
 
 use filesystem::{
     assert_no_symlink_path, atomic, checked_regular_path, copy_tree, discover,
-    effective_library_path, files, hash_dir, manifest_name, open_advisory_lock, read_regular_file,
-    replace_dir_bound, resolve_library_path, safe, snapshot_transaction, source_rel,
-    strict_component, validate_state_path, FileData, StateLock, WorkerLease,
+    effective_library_path, files, hash_dir, manifest_name, read_regular_file, replace_dir_bound,
+    resolve_library_path, safe, snapshot_transaction, source_rel, strict_component,
+    validate_state_path, FileData, StateLock,
 };
 #[cfg(unix)]
 use filesystem::{open_child_file, open_directory_fd};
@@ -270,24 +266,6 @@ struct App {
     state: State,
     #[cfg(unix)]
     config_directory: fs::File,
-}
-
-static WORKER_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-fn worker_status(config: &Path) -> Result<&'static str> {
-    let path = config.join("worker.active");
-    if !checked_regular_path(&path, "worker status")? {
-        return Ok("stopped");
-    }
-    let file = open_advisory_lock(config, "worker.active", false)?;
-    match file.try_lock_exclusive() {
-        Ok(()) => {
-            file.unlock()?;
-            Ok("stopped")
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok("running"),
-        Err(error) => Err(error).context("inspect worker status"),
-    }
 }
 
 fn now() -> u64 {
@@ -610,176 +588,6 @@ fn interactive_package_selection(found: &[(String, PathBuf, String)]) -> Result<
         return Err(anyhow!("invalid package selection: {value}"));
     }
     Ok(number - 1)
-}
-
-fn status_for_error(error: &str) -> &'static str {
-    let lower = error.to_lowercase();
-    if lower.contains("auth") {
-        "authentication_required"
-    } else if lower.contains("offline") || lower.contains("not installed") {
-        "offline"
-    } else if lower.contains("permission") || lower.contains("access denied") {
-        "permission_denied"
-    } else {
-        "conflict"
-    }
-}
-
-fn sync_all(a: &mut App, continue_on_error: bool) -> Result<serde_json::Value> {
-    let keys = a.state.subscriptions.keys().cloned().collect::<Vec<_>>();
-    let mut results = vec![];
-    for key in keys {
-        match repository::update_one(a, &key) {
-            Ok(result) => results.push(result),
-            Err(error) if WORKER_STOP_REQUESTED.load(Ordering::Relaxed) => return Err(error),
-            Err(error) if !continue_on_error => return Err(error),
-            Err(error) => {
-                let error_text = error.to_string();
-                let status = status_for_error(&error_text);
-                if let Some(subscription) = a.state.subscriptions.get_mut(&key) {
-                    subscription.status = status.into();
-                    subscription.last_sync = now();
-                }
-                a.save()?;
-                results.push(serde_json::json!({
-                    "relationship": key,
-                    "status": status,
-                    "error": error_text,
-                }));
-            }
-        }
-    }
-    let pending = a
-        .state
-        .pending_publications
-        .iter()
-        .map(|(key, pending)| (key.clone(), pending.publication.clone()))
-        .collect::<Vec<_>>();
-    let pending_keys = pending
-        .iter()
-        .map(|(key, _)| key.clone())
-        .collect::<BTreeSet<_>>();
-    for (key, intent) in pending {
-        let previous = a.state.publications.get(&key).cloned();
-        match repository::publish_to_repo(a, &intent.skill, &intent.destination, previous.as_ref())
-        {
-            Ok(result) => results.push(result),
-            Err(error) if WORKER_STOP_REQUESTED.load(Ordering::Relaxed) => return Err(error),
-            Err(error) if !continue_on_error => return Err(error),
-            Err(error) => {
-                let error_text = error.to_string();
-                let status = status_for_error(&error_text);
-                if let Some(pending) = a.state.pending_publications.get_mut(&key) {
-                    pending.publication.status = status.into();
-                    pending.publication.last_sync = now();
-                }
-                if let Some(publication) = a.state.publications.get_mut(&key) {
-                    publication.status = status.into();
-                    publication.last_sync = now();
-                }
-                a.save()?;
-                results.push(serde_json::json!({
-                    "skill": intent.skill,
-                    "relationship": key,
-                    "status": status,
-                    "error": error_text,
-                }));
-            }
-        }
-    }
-    let publications = a
-        .state
-        .publications
-        .iter()
-        .filter(|(key, publication)| publication.approved && !pending_keys.contains(*key))
-        .map(|(key, publication)| {
-            (
-                key.clone(),
-                publication.skill.clone(),
-                publication.destination.clone(),
-                publication.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-    for (key, skill, destination, previous) in publications {
-        match repository::publish_to_repo(a, &skill, &destination, Some(&previous)) {
-            Ok(result) => results.push(result),
-            Err(error) if WORKER_STOP_REQUESTED.load(Ordering::Relaxed) => return Err(error),
-            Err(error) => {
-                let error_text = error.to_string();
-                let status = status_for_error(&error_text);
-                if let Some(publication) = a.state.publications.get_mut(&key) {
-                    publication.status = status.into();
-                    publication.last_sync = now();
-                }
-                a.save()?;
-                results.push(serde_json::json!({
-                    "skill": skill,
-                    "status": status,
-                    "error": error_text,
-                }));
-            }
-        }
-    }
-    Ok(serde_json::json!({"results": results}))
-}
-
-fn wait_worker_interval(stop: &AtomicBool, interval: u64) {
-    let deadline = Instant::now() + Duration::from_secs(interval);
-    while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn run_worker_locked(a: &mut App, once: bool, interval: u64) -> Result<serde_json::Value> {
-    if interval == 0 {
-        return Err(anyhow!("worker interval must be greater than zero seconds"));
-    }
-    WORKER_STOP_REQUESTED.store(false, Ordering::Relaxed);
-    let _worker_lease = WorkerLease::acquire(&a.config)?;
-    if once {
-        let sync = sync_all(a, true)?;
-        let results = sync
-            .get("results")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([]));
-        return Ok(serde_json::json!({"worker":"completed","results":results}));
-    }
-    let stop = Arc::new(AtomicBool::new(false));
-    let signal_stop = Arc::clone(&stop);
-    ctrlc::set_handler(move || {
-        WORKER_STOP_REQUESTED.store(true, Ordering::Relaxed);
-        signal_stop.store(true, Ordering::Relaxed);
-    })
-    .context("install Ctrl-C handler for worker")?;
-    let mut cycles = 0_u64;
-    let mut cancelled = false;
-    while !stop.load(Ordering::Relaxed) {
-        match sync_all(a, true) {
-            Ok(sync) => {
-                cycles += 1;
-                let count = sync
-                    .get("results")
-                    .and_then(serde_json::Value::as_array)
-                    .map(Vec::len)
-                    .unwrap_or(0);
-                eprintln!("skillsync worker cycle {cycles} complete ({count} result(s))");
-            }
-            Err(_error) if stop.load(Ordering::Relaxed) => {
-                cancelled = true;
-                break;
-            }
-            Err(error) => {
-                cycles += 1;
-                eprintln!("skillsync worker cycle {cycles} failed: {error}");
-            }
-        }
-        wait_worker_interval(&stop, interval);
-    }
-    if stop.load(Ordering::Relaxed) {
-        cancelled = true;
-    }
-    Ok(serde_json::json!({"worker":"stopped","cycles":cycles,"cancelled":cancelled}))
 }
 
 fn requires_lock(command: &Cmd) -> bool {
@@ -1136,8 +944,8 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Cmd::Conflicts {
             command: ConflictCmd::Resume { relationship },
         } => conflicts::resume(&mut a, &relationship),
-        Cmd::Update | Cmd::Sync => sync_all(&mut a, false),
-        Cmd::Worker { once, interval } => run_worker_locked(&mut a, once, interval),
+        Cmd::Update | Cmd::Sync => worker::sync_all(&mut a, false),
+        Cmd::Worker { once, interval } => worker::run_worker_locked(&mut a, once, interval),
         Cmd::Harness { command } => match command {
             HarnessCmd::Enable { root, set } => harness::harness_set(&mut a, &root, &set, true),
             HarnessCmd::Disable { root, set } => harness::harness_set(&mut a, &root, &set, false),
@@ -1216,11 +1024,11 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             }
         }
         Cmd::Status => Ok(
-            serde_json::json!({"subscriptions":a.state.subscriptions,"local_adoptions":a.state.local_adoptions,"publications":a.state.publications,"pending_publications":a.state.pending_publications,"harness_links":a.state.harness_links,"harness_sets":a.state.harness_sets,"harness_health":harness::harness_link_health(&a)?,"worker":worker_status(&a.config)?}),
+            serde_json::json!({"subscriptions":a.state.subscriptions,"local_adoptions":a.state.local_adoptions,"publications":a.state.publications,"pending_publications":a.state.pending_publications,"harness_links":a.state.harness_links,"harness_sets":a.state.harness_sets,"harness_health":harness::harness_link_health(&a)?,"worker":worker::worker_status(&a.config)?}),
         ),
         Cmd::Inventory => Ok(serde_json::to_value(inventory::query(&a)?)?),
         Cmd::Doctor => Ok(
-            serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":worker_status(&a.config)?,"startup":"unsupported","subscribe_picker":"supported: TTY line-oriented single-select; unattended onboarding unsupported; full TUI: unsupported","harness_write_back":"explicit_directory_links_only","harness_discovery":"unsupported","harness_filtering":"unsupported","harness_reload":"unsupported","harness_links":harness::harness_link_health(&a)?,"hermes_autonomous_curation":"unsupported","registries":"unsupported","set_publication":"unsupported","set_subscription_metadata":"unsupported","harness_enablement":"supported: explicit one-time set expansion into native directory links","personal_library_sync":"unsupported","membership_change_propagation":"unsupported","local_import":"supported: explicit --from PATH --skill NAME; canonical write-back only; no subscription"}),
+            serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":worker::worker_status(&a.config)?,"startup":"unsupported","subscribe_picker":"supported: TTY line-oriented single-select; unattended onboarding unsupported; full TUI: unsupported","harness_write_back":"explicit_directory_links_only","harness_discovery":"unsupported","harness_filtering":"unsupported","harness_reload":"unsupported","harness_links":harness::harness_link_health(&a)?,"hermes_autonomous_curation":"unsupported","registries":"unsupported","set_publication":"unsupported","set_subscription_metadata":"unsupported","harness_enablement":"supported: explicit one-time set expansion into native directory links","personal_library_sync":"unsupported","membership_change_propagation":"unsupported","local_import":"supported: explicit --from PATH --skill NAME; canonical write-back only; no subscription"}),
         ),
         Cmd::Set { command } => match command {
             SetCmd::Create { name } => {
