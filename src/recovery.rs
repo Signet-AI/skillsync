@@ -7,7 +7,7 @@ use std::{
 #[cfg(unix)]
 use crate::filesystem::open_entry_checked;
 use crate::filesystem::{
-    assert_no_symlink_path, checked_regular_path, copy_complete_tree, copy_tree, discover,
+    assert_no_symlink_path, canonicalize_path, checked_regular_path, copy_complete_tree, copy_tree, discover,
     hash_dir, install_dir_noreplace, manifest_name, reject_reparse_point, strict_component,
     validate_state_path,
 };
@@ -244,7 +244,7 @@ pub(crate) fn import_local(
     if !source.is_dir() {
         return Err(anyhow!("import source is not a directory"));
     }
-    let source = fs::canonicalize(source).context("canonicalize import source")?;
+    let source = canonicalize_path(source).context("canonicalize import source")?;
     if !source.is_dir() {
         return Err(anyhow!("import source is not a directory"));
     }
@@ -298,7 +298,7 @@ pub(crate) fn import_local(
                     "canonical package destination is not a regular directory"
                 ));
             }
-            if fs::canonicalize(&destination)? != destination {
+            if canonicalize_path(&destination)? != destination {
                 return Err(anyhow!(
                     "canonical package destination is not a canonical directory"
                 ));
@@ -429,7 +429,7 @@ pub(crate) fn delete_skill(a: &mut App, raw_skill: &str, yes: bool) -> Result<se
         }
         Err(error) => return Err(error.into()),
     };
-    if !metadata.is_dir() || fs::canonicalize(&path)? != path {
+    if !metadata.is_dir() || canonicalize_path(&path)? != path {
         return Err(anyhow!("canonical package is not a regular directory"));
     }
     checked_regular_path(&path.join("SKILL.md"), "skill manifest")?;
@@ -528,7 +528,7 @@ pub(crate) fn restore_skill(
     if input_meta.file_type().is_symlink() || !input_meta.is_dir() {
         return Err(anyhow!("recovery snapshot must be a regular directory"));
     }
-    let recovery = fs::canonicalize(input).context("recovery snapshot does not exist")?;
+    let recovery = canonicalize_path(input).context("recovery snapshot does not exist")?;
     validate_state_path(&a.recovery, &recovery, "recovery")?;
     let recovery_rel = recovery
         .strip_prefix(&a.recovery)
@@ -596,7 +596,7 @@ pub(crate) fn restore_skill(
                 Err(anyhow!("canonical destination is not a regular directory"))
             }
             Ok(_) => {
-                if fs::canonicalize(path)? != path {
+                if canonicalize_path(path)? != path {
                     return Err(anyhow!("canonical destination is not canonical"));
                 }
                 if !checked_regular_path(&path.join("SKILL.md"), "canonical manifest")? {

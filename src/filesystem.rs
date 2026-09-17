@@ -917,7 +917,7 @@ pub(crate) fn resolve_library_path(path: &Path) -> Result<PathBuf> {
     };
     assert_no_symlink_path(&absolute, Path::new("."))?;
     if absolute.exists() {
-        Ok(fs::canonicalize(absolute)?)
+        Ok(canonicalize_path(&absolute)?)
     } else {
         Ok(absolute)
     }
@@ -1490,6 +1490,21 @@ fn remove_relative_file(root: &Path, relative: &Path) -> Result<()> {
             "safe descriptor-relative removal unavailable on this platform"
         ))
     }
+}
+
+pub(crate) fn canonicalize_path(path: &Path) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(path)?;
+    #[cfg(windows)]
+    {
+        let value = canonical.to_string_lossy();
+        if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+            return Ok(PathBuf::from(format!(r"\\{}", rest)));
+        }
+        if let Some(rest) = value.strip_prefix(r"\\?\") {
+            return Ok(PathBuf::from(rest));
+        }
+    }
+    Ok(canonical)
 }
 
 #[cfg(unix)]

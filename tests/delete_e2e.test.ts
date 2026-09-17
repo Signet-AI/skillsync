@@ -19,7 +19,7 @@ test("delete requires --yes and preserves a complete recovery snapshot", async (
   const result = JSON.parse(dec.decode(deleted.stdout)); expect(result.status).toBe("deleted");
   const snapshot = join(result.recovery_path, "package");
   expect(await readFile(join(snapshot, ".env"), "utf8")).toBe("SECRET=x\n"); expect(await readFile(join(snapshot, "logs/run.log"), "utf8")).toBe("log\n");
-  expect((await stat(join(snapshot, "scripts.sh"))).mode & 0o111).toBe(0o111); expect(await Bun.file(pkg).exists()).toBe(false);
+  if (process.platform !== "win32") expect((await stat(join(snapshot, "scripts.sh"))).mode & 0o111).toBe(0o111); expect(await Bun.file(pkg).exists()).toBe(false);
   const absent = run(root, ["--json", "delete", "demo", "--yes"]); expect(absent.exitCode).toBe(1); expect(JSON.parse(dec.decode(absent.stdout)).message).toContain("already_absent");
 });
 test("delete state-save failure restores canonical content and keeps recovery", async () => {
@@ -67,7 +67,7 @@ test("restore rehydrates deletion snapshot and is idempotent", async () => {
   const deleted = JSON.parse(dec.decode(run(root, ["--json", "delete", "demo", "--yes"]).stdout));
   const restored = run(root, ["--json", "restore", "--from", deleted.recovery_path]);
   expect(restored.exitCode).toBe(0); expect(JSON.parse(dec.decode(restored.stdout)).status).toBe("restored");
-  expect(await readFile(join(pkg, ".env"), "utf8")).toBe("SECRET=x\n"); expect((await stat(join(pkg, "scripts.sh"))).mode & 0o111).toBe(0o111);
+  expect(await readFile(join(pkg, ".env"), "utf8")).toBe("SECRET=x\n"); if (process.platform !== "win32") expect((await stat(join(pkg, "scripts.sh"))).mode & 0o111).toBe(0o111);
   const rerun = run(root, ["--json", "restore", "--from", deleted.recovery_path]);
   expect(JSON.parse(dec.decode(rerun.stdout)).status).toBe("already_present");
 });

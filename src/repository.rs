@@ -1,5 +1,5 @@
 use crate::filesystem::{
-    assert_no_symlink_path, copy_existing_tree, copy_tree, discover, files, hash_dir,
+    assert_no_symlink_path, canonicalize_path, copy_existing_tree, copy_tree, discover, files, hash_dir,
     replace_dir_bound, safe, snapshot_transaction, source_rel, strict_component, sync_managed_tree,
     validate_state_path, write_file_data,
 };
@@ -25,7 +25,13 @@ pub(crate) fn normalize(s: &str) -> Result<String> {
         return Err(anyhow!("unsupported repository source"));
     }
     if Path::new(s).exists() {
-        return Ok(fs::canonicalize(s)?.display().to_string());
+        let path = canonicalize_path(Path::new(s))?;
+        #[cfg(windows)]
+        {
+            return Ok(path.to_string_lossy().replace('\\', "/"));
+        }
+        #[cfg(not(windows))]
+        return Ok(path.display().to_string());
     }
     if s.contains('?') || s.contains('#') {
         return Err(anyhow!("repository URL contains query or fragment"));

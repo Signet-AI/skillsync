@@ -9,7 +9,7 @@ use std::{
 #[cfg(unix)]
 use crate::filesystem::open_directory_fd;
 use crate::filesystem::{
-    assert_no_symlink_path, checked_regular_path, manifest_name, strict_component,
+    assert_no_symlink_path, canonicalize_path, checked_regular_path, manifest_name, strict_component,
 };
 use crate::recovery::{directory_identity, DirectoryIdentity};
 use crate::{set_member_name, App, HarnessLink, HarnessSetEnablement, State};
@@ -35,7 +35,7 @@ fn validate_harness_link_record(key: &str, record: &HarnessLink, library: &Path)
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(anyhow!("harness link root is not a regular directory"));
         }
-        if fs::canonicalize(&root)? != root {
+        if canonicalize_path(&root)? != root {
             return Err(anyhow!("harness link root is not canonical"));
         }
     }
@@ -125,7 +125,7 @@ fn link_targets_match(target: &Path, expected: &Path) -> Result<bool> {
     if target == expected {
         return Ok(true);
     }
-    match (fs::canonicalize(target), fs::canonicalize(expected)) {
+    match (canonicalize_path(target), canonicalize_path(expected)) {
         (Ok(actual), Ok(expected)) => Ok(actual == expected),
         _ => Ok(false),
     }
@@ -308,7 +308,7 @@ fn existing_harness_root(root: &Path) -> Result<PathBuf> {
             root.display()
         ));
     }
-    Ok(fs::canonicalize(root)?)
+    Ok(canonicalize_path(root)?)
 }
 
 fn persisted_harness_root(root: &Path) -> Result<PathBuf> {
@@ -617,7 +617,7 @@ pub(crate) fn harness_set(
         let canonical = a.library.join(&skill);
         assert_no_symlink_path(&a.library, Path::new(&skill))?;
         if !canonical.is_dir()
-            || fs::canonicalize(&canonical)? != canonical
+            || canonicalize_path(&canonical)? != canonical
             || manifest_name(&canonical)? != skill
         {
             return Err(anyhow!(
