@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -7,7 +7,8 @@ use std::{
 };
 
 use crate::filesystem::{
-    assert_no_symlink_path, canonicalize_path, hash_dir, manifest_name, safe, strict_component, validate_state_path,
+    assert_no_symlink_path, canonicalize_path, copy_tree, hash_dir, manifest_name,
+    replace_dir_bound, safe, snapshot_transaction, strict_component, validate_state_path,
 };
 use crate::{relationship_key, App};
 
@@ -55,6 +56,11 @@ fn validate_subscription(
             "invalid subscription status: {}",
             subscription.status
         ));
+    }
+    if let Some(selection) = &subscription.conflict_selection {
+        if !matches!(selection.as_str(), "local" | "incoming") {
+            return Err(anyhow!("invalid conflict side selection: {selection}"));
+        }
     }
     let expected_local = a.library.join(&subscription.skill);
     let local = PathBuf::from(&subscription.local_path);
@@ -156,6 +162,9 @@ pub(crate) fn list(a: &App) -> Result<serde_json::Value> {
     let mut conflicts = Vec::new();
     for (relationship, subscription) in &a.state.subscriptions {
         if subscription.status != "conflict" && subscription.recovery_path.is_none() {
+            continue;
+        }
+        if subscription.status != "conflict" {
             continue;
         }
         // Use the same strict manifest/evidence validator as `conflicts show`.
@@ -311,4 +320,141 @@ pub(crate) fn show(a: &App, relationship: &str) -> Result<serde_json::Value> {
     output["current_live_hash"] = json!(current_live_hash.clone());
     output["stale"] = json!(current_live_hash != output["live_hash_at_detection"]);
     Ok(output)
+}
+
+pub(crate) fn resolve(
+    a: &mut App,
+    relationship: &str,
+    local: bool,
+    incoming: bool,
+) -> Result<serde_json::Value> {
+    if local == incoming {
+        return Err(anyhow!("exactly one conflict side must be selected"));
+    }
+    let view = show(a, relationship)?;
+    let detected = view["live_hash_at_detection"]
+        .as_str()
+        .ok_or_else(|| anyhow!("conflict manifest has no live detection hash"))?
+        .to_owned();
+    let local_path = a
+        .state
+        .subscriptions
+        .get(relationship)
+        .ok_or_else(|| anyhow!("conflict relationship not found"))?
+        .local_path
+        .clone();
+    if hash_dir(PathBuf::from(&local_path).as_path())? != detected {
+        return Err(anyhow!(
+            "live content changed since conflict detection; selection refused"
+        ));
+    }
+    let side = if local { "local" } else { "incoming" };
+    if a.state.subscriptions[relationship]
+        .conflict_selection
+        .as_deref()
+        == Some(side)
+    {
+        return Ok(json!({"relationship":relationship,"status":"selected","selected_side":side}));
+    }
+    a.state
+        .subscriptions
+        .get_mut(relationship)
+        .unwrap()
+        .conflict_selection = Some(side.into());
+    if let Err(error) = a.save() {
+        a.state
+            .subscriptions
+            .get_mut(relationship)
+            .unwrap()
+            .conflict_selection = None;
+        return Err(error).context("persist conflict side selection");
+    }
+    Ok(json!({"relationship":relationship,"status":"selected","selected_side":side}))
+}
+
+pub(crate) fn resume(a: &mut App, relationship: &str) -> Result<serde_json::Value> {
+    if let Some(existing) = a.state.subscriptions.get(relationship) {
+        if existing.status == "synced" && existing.recovery_path.is_some() {
+            validate_subscription(a, relationship, existing)?;
+            validate_baseline_integrity(a, relationship, existing)?;
+            if hash_dir(PathBuf::from(&existing.local_path).as_path())? == existing.baseline_hash {
+                return Ok(json!({
+                    "relationship": relationship,
+                    "status": "synced",
+                    "selected_side": existing.conflict_selection,
+                    "recovery_retained": true,
+                }));
+            }
+            return Err(anyhow!(
+                "relationship was already resumed but live content has newer edits"
+            ));
+        }
+    }
+    let view = show(a, relationship)?;
+    let s = a
+        .state
+        .subscriptions
+        .get(relationship)
+        .cloned()
+        .ok_or_else(|| anyhow!("conflict relationship not found"))?;
+    let side = s
+        .conflict_selection
+        .clone()
+        .ok_or_else(|| anyhow!("conflict side selection is required; use --local or --incoming"))?;
+    let evidence = view[&format!("{side}_path")]
+        .as_str()
+        .ok_or_else(|| anyhow!("selected conflict evidence path is missing"))?;
+    let expected = view[&format!("{side}_hash")]
+        .as_str()
+        .ok_or_else(|| anyhow!("selected conflict evidence hash is missing"))?;
+    let live = PathBuf::from(&s.local_path);
+    if hash_dir(&live)? != view["live_hash_at_detection"].as_str().unwrap() {
+        return Err(anyhow!(
+            "live content changed since conflict detection; resume refused"
+        ));
+    }
+    let stage_parent = tempfile::tempdir_in(
+        live.parent()
+            .ok_or_else(|| anyhow!("live path has no parent"))?,
+    )?;
+    let staged = stage_parent.path().join("selected");
+    copy_tree(PathBuf::from(evidence).as_path(), &staged)?;
+    if hash_dir(&staged)? != expected {
+        return Err(anyhow!(
+            "selected conflict evidence changed; resume refused"
+        ));
+    }
+    let parent = crate::filesystem::open_directory_file_bound(live.parent().unwrap())?;
+    if hash_dir(&live)? != view["live_hash_at_detection"].as_str().unwrap() {
+        return Err(anyhow!(
+            "live content changed since conflict detection; resume refused"
+        ));
+    }
+    let (baseline_path, baseline_hash, mut baseline_replacement) =
+        snapshot_transaction(a, relationship, &staged)?;
+    if hash_dir(&live)? != view["live_hash_at_detection"].as_str().unwrap() {
+        return Err(anyhow!(
+            "live content changed during resume; replacements rolled back"
+        ));
+    }
+    let mut live_replacement = replace_dir_bound(&live, &staged, &parent)?;
+    let previous = a.state.clone();
+    let mut updated = s;
+    updated.status = "synced".into();
+    updated.baseline_path = baseline_path.display().to_string();
+    updated.baseline_hash = baseline_hash;
+    updated.last_sync = crate::now();
+    updated.update_count += 1;
+    a.state.subscriptions.insert(relationship.into(), updated);
+    live_replacement.prepare()?;
+    baseline_replacement.prepare()?;
+    if let Err(error) = a.save() {
+        a.state = previous;
+        return Err(error).context("persist resumed conflict state; replacements rolled back");
+    }
+    live_replacement.commit()?;
+    baseline_replacement.commit()?;
+    Ok(
+        json!({"relationship":relationship,"status":"synced","selected_side":side,"recovery_retained":true}),
+    )
 }
