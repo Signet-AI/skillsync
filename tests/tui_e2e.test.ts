@@ -23,12 +23,16 @@ test("no-arg TTY opens read-only library browser and quits without mutation", as
     for (const name of ["state.json", "state.lock"]) before.set(name, await readFile(join(config, name), "utf8").catch(() => ""));
     before.set("library", JSON.stringify((await readdir(library, { recursive: true })).sort()));
     const command = `stty rows 30 cols 120; exec ${[binary].map(quote).join(" ")}`;
-    const child = Bun.spawn({ cmd: ["script", "-qefc", command, "/dev/null"], env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const scriptCommand = process.platform === "darwin"
+      ? ["python3", resolve(import.meta.dir, "pty_runner.py"), "sh", "-c", command]
+      : ["script", "-qefc", command, "/dev/null"];
+    const child = Bun.spawn({ cmd: scriptCommand, env: { ...env, SKILLSYNC_PTY_KEYS: "rq" }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     const outputPromise = new Response(child.stdout).text();
     await Bun.sleep(300);
     child.stdin.write("\r"); await Bun.sleep(50); child.stdin.write("q"); child.stdin.end();
-    expect(await child.exited).toBe(0);
+    const exitCode = await child.exited;
     const output = await outputPromise;
+    expect(exitCode).toBe(0);
     expect(output).toContain("Library"); expect(output).toContain("root-skill"); expect(output).toContain("parent/nested"); expect(output).toContain("Provenance");
     expect(await readFile(join(config, "state.json"), "utf8")).toBe(before.get("state.json") ?? "");
     expect(await readFile(join(config, "state.lock"), "utf8").catch(() => "")).toBe(before.get("state.lock") ?? "");

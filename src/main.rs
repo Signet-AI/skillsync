@@ -26,9 +26,9 @@ pub(crate) use worker::{worker_status, WORKER_STOP_REQUESTED};
 
 use filesystem::{
     assert_no_symlink_path, atomic, canonicalize_path, checked_regular_path, copy_tree, discover,
-    effective_library_path, files, hash_dir, manifest_name, read_regular_file,
-    replace_dir_bound, resolve_library_path, safe, snapshot_transaction, source_rel,
-    strict_component, validate_state_path, FileData, StateLock,
+    effective_library_path, files, hash_dir, manifest_name, read_regular_file, replace_dir_bound,
+    resolve_library_path, safe, snapshot_transaction, source_rel, strict_component,
+    validate_state_path, FileData, StateLock,
 };
 #[cfg(unix)]
 use filesystem::{open_child_file, open_directory_fd};
@@ -310,10 +310,9 @@ fn unique_stamp() -> u128 {
         .as_nanos()
 }
 pub(crate) fn config_dir() -> PathBuf {
-    if let Some(x) = std::env::var_os("SKILLSYNC_CONFIG_DIR") {
-        return x.into();
-    }
-    if cfg!(target_os = "windows") {
+    let raw = if let Some(x) = std::env::var_os("SKILLSYNC_CONFIG_DIR") {
+        PathBuf::from(x)
+    } else if cfg!(target_os = "windows") {
         std::env::var_os("LOCALAPPDATA")
             .map(|x| PathBuf::from(x).join("skillsync/config"))
             .unwrap_or_else(|| PathBuf::from(".skillsync/config"))
@@ -328,7 +327,8 @@ pub(crate) fn config_dir() -> PathBuf {
                 std::env::var_os("HOME").map(|x| PathBuf::from(x).join(".config/skillsync"))
             })
             .unwrap_or_else(|| PathBuf::from(".skillsync"))
-    }
+    };
+    filesystem::canonicalize_path_with_missing(&raw).unwrap_or(raw)
 }
 impl App {
     pub(crate) fn load(anchor: Option<&StateLock>) -> Result<Self> {
@@ -450,7 +450,8 @@ impl App {
         } else {
             expected_library.clone()
         };
-        assert_no_symlink_path(&library, Path::new("."))?;
+        let safe_library = filesystem::canonicalize_path_with_missing(&library)?;
+        assert_no_symlink_path(&safe_library, Path::new("."))?;
         harness::validate_harness_links(&state, &library)?;
         harness::validate_harness_sets(&state, &library)?;
         validate_local_adoptions(&state, &library)?;
@@ -882,12 +883,14 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Cmd::Init { library } => {
             if !a.state_path.exists() {
                 if let Some(l) = library {
+                    let l = filesystem::canonicalize_path_with_missing(&l)?;
                     assert_no_symlink_path(&l, Path::new("."))?;
                     fs::create_dir_all(&l)?;
                     assert_no_symlink_path(&l, Path::new("."))?;
                     a.library = canonicalize_path(&l)?;
                     a.state.library = a.library.display().to_string()
                 }
+                a.library = filesystem::canonicalize_path_with_missing(&a.library)?;
                 assert_no_symlink_path(&a.library, Path::new("."))?;
                 fs::create_dir_all(&a.library)?;
                 assert_no_symlink_path(&a.library, Path::new("."))?;
@@ -930,7 +933,8 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             };
             let url = repository::normalize(&r)?;
             let (repo, b) = repository::clone_repo(&url)?;
-            let found = discover(repo.path())?;
+            let repo_path = filesystem::canonicalize_path_with_missing(repo.path())?;
+            let found = discover(&repo_path)?;
             let selected = match skill {
                 Some(n) => repository::select_discovered(&found, &n)?,
                 None if interactive => &found[interactive_package_selection(&found)?],

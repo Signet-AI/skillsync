@@ -94,7 +94,7 @@ test("inventory discovers an effective library before initialization without mut
   await put(join(fixture.library, "references/child/SKILL.md"), "name: child\n");
   const before = (await readdir(fixture.library, { recursive: true })).sort();
   const result = skillsync(fixture, ["--json", "inventory"]).json;
-  expect(result.library).toBe(process.platform === "win32" ? await realpath(fixture.library) : fixture.library);
+  expect(result.library).toBe(await realpath(fixture.library));
   expect(result.packages.map((item: any) => [item.name, item.path])).toEqual([
     ["root", "."],
     ["child", "references/child"],
@@ -181,10 +181,11 @@ test("imports a local package idempotently and records provenance", async () => 
   const fixture = await makeFixture();
   const source = join(fixture.root, "local-source");
   await put(join(source, "nested/SKILL.md"), "name: demo\nlocal\n");
+  const sourcePath = process.platform === "win32" ? await realpath(source) : source;
   skillsync(fixture, ["--json", "init"]);
-  const first = skillsync(fixture, ["--json", "import", "--from", source, "--skill", "nested"]).json;
+  const first = skillsync(fixture, ["--json", "import", "--from", sourcePath, "--skill", "nested"]).json;
   expect(first.status).toBe("adopted");
-  const second = skillsync(fixture, ["--json", "import", "--from", source, "--skill", "nested"]).json;
+  const second = skillsync(fixture, ["--json", "import", "--from", sourcePath, "--skill", "nested"]).json;
   expect(second.status).toBe("already_present");
   expect(second.provenance).toBe("recorded");
   const status = skillsync(fixture, ["--json", "status"]).json;
@@ -245,11 +246,12 @@ test("imports one selected package and fails missing selection", async () => {
   const source = join(fixture.root, "many");
   await put(join(source, "one/SKILL.md"), "name: one\n");
   await put(join(source, "two/SKILL.md"), "name: two\n");
+  const sourcePath = process.platform === "win32" ? await realpath(source) : source;
   skillsync(fixture, ["--json", "init"]);
-  expect(skillsync(fixture, ["--json", "import", "--from", source], false).json.message).toContain("--skill is required");
-  expect(skillsync(fixture, ["--json", "import", "--from", source, "--skill", "one"]).json.skill).toBe("one");
+  expect(skillsync(fixture, ["--json", "import", "--from", sourcePath], false).json.message).toContain("--skill is required");
+  expect(skillsync(fixture, ["--json", "import", "--from", sourcePath, "--skill", "one"]).json.skill).toBe("one");
   expect(await Bun.file(join(fixture.library, "two/SKILL.md")).exists()).toBe(false);
-  expect(skillsync(fixture, ["--json", "import", "--from", source, "--skill", "missing"], false).json.message).toContain("skill not found");
+  expect(skillsync(fixture, ["--json", "import", "--from", sourcePath, "--skill", "missing"], false).json.message).toContain("skill not found");
 });
 
 test("rejects malformed manifests and symlinked import roots", async () => {

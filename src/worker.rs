@@ -159,8 +159,8 @@ pub(crate) fn run_worker_locked(
         return Err(anyhow!("worker interval must be greater than zero seconds"));
     }
     WORKER_STOP_REQUESTED.store(false, Ordering::Relaxed);
-    let _worker_lease = WorkerLease::acquire(&a.config)?;
     if once {
+        let _worker_lease = WorkerLease::acquire(&a.config)?;
         let sync = sync_all(a, true)?;
         let results = sync
             .get("results")
@@ -175,6 +175,7 @@ pub(crate) fn run_worker_locked(
         signal_stop.store(true, Ordering::Relaxed);
     })
     .context("install Ctrl-C handler for worker")?;
+    let _worker_lease = WorkerLease::acquire(&a.config)?;
     let mut cycles = 0_u64;
     let mut cancelled = false;
     while !stop.load(Ordering::Relaxed) {

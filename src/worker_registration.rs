@@ -45,7 +45,7 @@ fn paths() -> Result<(PathBuf, PathBuf, String)> {
             .unwrap_or(home()?.join(".local/share"))
             .join("skillsync");
         return Ok((
-            root.join("bin/skillsync"),
+            root.join("bin").join("skillsync"),
             home()?.join(".config/systemd/user/skillsync-worker.service"),
             SERVICE.into(),
         ));
@@ -54,7 +54,7 @@ fn paths() -> Result<(PathBuf, PathBuf, String)> {
     {
         let root = home()?.join("Library/Application Support/skillsync");
         return Ok((
-            root.join("bin/skillsync"),
+            root.join("bin").join("skillsync"),
             home()?.join("Library/LaunchAgents/com.skillsync.worker.plist"),
             "com.skillsync.worker".into(),
         ));
@@ -66,7 +66,7 @@ fn paths() -> Result<(PathBuf, PathBuf, String)> {
         )
         .join("skillsync");
         return Ok((
-            root.join("bin/skillsync.exe"),
+            root.join("bin").join("skillsync.exe"),
             root.join("worker-task.xml"),
             "Skillsync Worker".into(),
         ));
@@ -221,7 +221,7 @@ fn provider_install(
     registration: &[u8],
     state: &mut ProviderInstallState,
 ) -> Result<()> {
-    let _ = (exe, interval);
+    let _ = (exe, interval, identity);
     #[cfg(feature = "test-hooks")]
     if let Ok(v) = std::env::var("SKILLSYNC_TEST_WORKER_PROVIDER") {
         if v == "fail" {
@@ -292,6 +292,7 @@ fn provider_install(
     Err(anyhow!("worker registration unsupported on this platform"))
 }
 fn provider_disable(identity: &str, reg: &Path) -> Result<()> {
+    let _ = reg;
     #[cfg(feature = "test-hooks")]
     if let Ok(v) = std::env::var("SKILLSYNC_TEST_WORKER_PROVIDER") {
         if v == "fail" {
@@ -608,7 +609,7 @@ fn provider_activate_existing(
     registration: &[u8],
     state: &mut ProviderInstallState,
 ) -> Result<()> {
-    let _ = (exe, interval);
+    let _ = (exe, interval, identity);
     ensure_owned_bytes(reg, registration, "registration artifact")?;
     #[cfg(feature = "test-hooks")]
     if let Ok(v) = std::env::var("SKILLSYNC_TEST_WORKER_PROVIDER") {

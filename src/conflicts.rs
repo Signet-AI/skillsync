@@ -245,7 +245,8 @@ pub(crate) fn show(a: &App, relationship: &str) -> Result<serde_json::Value> {
     );
     validate_state_path(&a.recovery, &recovery, "recovery")?;
     let meta = fs::symlink_metadata(&recovery)?;
-    if !meta.is_dir() || meta.file_type().is_symlink() || canonicalize_path(&recovery)? != recovery {
+    if !meta.is_dir() || meta.file_type().is_symlink() || canonicalize_path(&recovery)? != recovery
+    {
         return Err(anyhow!("conflict recovery is not a canonical directory"));
     }
     let raw = fs::read(recovery.join("manifest.json"))

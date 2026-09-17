@@ -6,10 +6,12 @@ use std::{
 
 #[cfg(unix)]
 use crate::filesystem::open_entry_checked;
+#[cfg(unix)]
+use crate::filesystem::read_directory_entries;
 use crate::filesystem::{
-    assert_no_symlink_path, canonicalize_path, checked_regular_path, copy_complete_tree, copy_tree, discover,
-    hash_dir, install_dir_noreplace, manifest_name, reject_reparse_point, strict_component,
-    validate_state_path,
+    assert_no_symlink_path, canonicalize_path, checked_regular_path, copy_complete_tree, copy_tree,
+    discover, hash_dir, install_dir_noreplace, manifest_name, reject_reparse_point,
+    strict_component, validate_state_path,
 };
 use crate::*;
 
@@ -197,8 +199,7 @@ fn remove_owned_directory_at(
     }
     fn recurse(dir: &fs::File) -> Result<()> {
         use std::os::fd::AsRawFd;
-        for entry in fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
-            let name = entry?.file_name();
+        for name in read_directory_entries(dir.as_raw_fd())? {
             let c = CString::new(name.as_encoded_bytes())?;
             let child = open_entry_checked(dir.as_raw_fd(), &c, Path::new("cleanup child"))?;
             let m = child.metadata()?;
@@ -240,11 +241,18 @@ pub(crate) fn import_local(
     requested: Option<&str>,
 ) -> Result<serde_json::Value> {
     use std::io::IsTerminal;
-    assert_no_symlink_path(source, Path::new("."))?;
-    if !source.is_dir() {
-        return Err(anyhow!("import source is not a directory"));
+    if fs::symlink_metadata(source)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(anyhow!(
+            "import source symlink rejected: {}",
+            source.display()
+        ));
     }
-    let source = canonicalize_path(source).context("canonicalize import source")?;
+    let source = crate::filesystem::canonicalize_path_with_missing(source)
+        .context("canonicalize import source")?;
+    assert_no_symlink_path(&source, Path::new("."))?;
     if !source.is_dir() {
         return Err(anyhow!("import source is not a directory"));
     }

@@ -1,0 +1,52 @@
+name: macOS
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: macOS build and integration tests (${{ matrix.architecture }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            architecture: arm64
+          - runner: macos-15-intel
+            architecture: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Build native CLI
+        run: cargo build --locked
+
+      - name: Build test-hook CLI
+        run: cargo build --locked --features test-hooks --target-dir target/test-hooks
+
+      - name: Run Rust tests
+        run: cargo test --locked
+
+      - name: Install JavaScript test dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Type-check JavaScript harness
+        run: bun x tsc --noEmit
+
+      - name: Run macOS integration tests
+        run: bun test --max-concurrency=1 --timeout=30000
