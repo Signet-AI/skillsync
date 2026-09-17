@@ -15,6 +15,19 @@ test("status is read-only before setup and enable is idempotent with exact artif
 
 test("changed executable and malformed metadata fail closed",async()=>{ const f=await fixture(); run(f,["worker","enable"],true,{SKILLSYNC_TEST_WORKER_PROVIDER:"ok"}); const metaPath=join(f.config,"worker-registration.json"); const m=JSON.parse(await readFile(metaPath,"utf8")); await writeFile(m.executable_path,"tampered"); expect(run(f,["worker","status"],false).ok).toBe(false); await writeFile(metaPath,JSON.stringify({...m,registration_path:join(f.root,"victim")})); expect(run(f,["worker","uninstall"],false).ok).toBe(false); });
 
+test("uninstall rejects a tampered executable hash without deleting the executable", async () => {
+  const f = await fixture();
+  run(f, ["worker", "enable"], true, { SKILLSYNC_TEST_WORKER_PROVIDER: "ok" });
+  const metaPath = join(f.config, "worker-registration.json");
+  const metadata = JSON.parse(await readFile(metaPath, "utf8"));
+  await writeFile(metaPath, JSON.stringify({ ...metadata, executable_hash: "0".repeat(64) }));
+  const failed = run(f, ["worker", "uninstall"], false, { SKILLSYNC_TEST_WORKER_PROVIDER: "ok" });
+  expect(failed.ok).toBe(false);
+  expect(failed.message).toContain("executable ownership");
+  expect(await Bun.file(metadata.executable_path).exists()).toBe(true);
+  expect(await Bun.file(metaPath).exists()).toBe(true);
+});
+
 test("provider failure never reports success",async()=>{ const f=await fixture(); const r=run(f,["worker","enable"],false,{SKILLSYNC_TEST_WORKER_PROVIDER:"fail"}); expect(r.ok).toBe(false); expect(await Bun.file(join(f.config,"worker-registration.json")).exists()).toBe(false); });
 
 test("disable and uninstall are idempotent", async () => {

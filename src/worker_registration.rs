@@ -808,6 +808,10 @@ pub(crate) fn uninstall(config: &Path) -> Result<serde_json::Value> {
         return Ok(serde_json::json!({"worker":"already_absent"}));
     };
     let (exe, reg, id) = validate(config, &r)?;
+    regular_owned(&exe)?;
+    if hash(&exe)? != r.executable_hash {
+        return Err(anyhow!("worker executable ownership validation failed"));
+    }
     let metadata = metadata_path(config);
     let metadata_bytes = owned_bytes(&metadata, "registration metadata")?;
     let exe_bytes = owned_bytes(&exe, "worker executable")?;
