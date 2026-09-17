@@ -116,11 +116,13 @@ pub(crate) fn remove_owned_directory(
     }
     #[cfg(unix)]
     remove_owned_directory_at(root, relative, current)?;
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    crate::filesystem::remove_owned_directory_path_windows(path, current)?;
+    #[cfg(not(any(unix, windows)))]
     return Err(anyhow!(
         "safe descriptor-relative removal unavailable on this platform"
     ));
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             return Err(anyhow!(

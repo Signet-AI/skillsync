@@ -41,7 +41,13 @@ fn same_object(a: &fs::Metadata, b: &fs::Metadata) -> bool {
         use std::os::unix::fs::MetadataExt;
         a.dev() == b.dev() && a.ino() == b.ino()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        a.volume_serial_number() == b.volume_serial_number()
+            && a.file_index() == b.file_index()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         a.len() == b.len() && a.modified().ok() == b.modified().ok()
     }
@@ -162,6 +168,8 @@ pub(crate) fn edit_config(a: &super::App, json: bool) -> Result<serde_json::Valu
     let path = a.config.join("config.toml");
     super::assert_no_symlink_path(&a.config, Path::new("."))?;
     let config_identity = fs::metadata(&a.config)?;
+    #[cfg(windows)]
+    let config_directory_identity = super::windows_path_identity(&a.config)?;
     #[cfg(unix)]
     let directory = {
         use std::os::fd::FromRawFd;
@@ -275,20 +283,74 @@ pub(crate) fn edit_config(a: &super::App, json: bool) -> Result<serde_json::Valu
                     .map_err(|error| anyhow!("config publication target changed: {error}"))?;
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            let current_directory = fs::metadata(&a.config)?;
-            if current_directory.len() != config_identity.len()
-                || current_directory.modified().ok() != config_identity.modified().ok()
-            {
+            if super::windows_path_identity(&a.config)? != config_directory_identity {
                 return Err(anyhow!(
                     "config directory changed while it was being edited"
                 ));
             }
-            if original.is_some() {
-                verify_original_unchanged(&path, original.as_ref().unwrap())?;
+            if let Some((original_metadata, original_bytes)) = &original {
+                verify_original_unchanged(
+                    &path,
+                    &(original_metadata.clone(), original_bytes.clone()),
+                )?;
+                let mut target = super::open_regular_file_bound(&path, true, false)?;
+                let mut current = Vec::new();
+                target.read_to_end(&mut current)?;
+                if current != *original_bytes {
+                    return Err(anyhow!("config changed while it was being edited"));
+                }
+                let publish_result = (|| -> Result<()> {
+                    target.set_len(0)?;
+                    target.rewind()?;
+                    #[cfg(feature = "test-hooks")]
+                    if std::env::var_os("SKILLSYNC_TEST_CONFIG_PUBLISH_FAILURE").is_some() {
+                        std::env::remove_var("SKILLSYNC_TEST_CONFIG_PUBLISH_FAILURE");
+                        return Err(anyhow!("injected config publication failure"));
+                    }
+                    target.write_all(&edited)?;
+                    target.sync_all()?;
+                    target.rewind()?;
+                    let mut verified = Vec::new();
+                    target.read_to_end(&mut verified)?;
+                    if verified != edited {
+                        return Err(anyhow!("published config bytes do not match the editor result"));
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = publish_result {
+                    if let Err(recovery) = restore_target(&mut target, original_bytes) {
+                        return Err(anyhow!("recovery required: {error}; restoring original config failed: {recovery}"));
+                    }
+                    return Err(error);
+                }
+                verify_original_unchanged(&path, &(original_metadata.clone(), edited.clone()))
+                    .map_err(|error| anyhow!("config publication target changed: {error}"))?;
+            } else {
+                let mut target = super::open_regular_file_bound(&path, true, true)?;
+                let publication = (|| -> Result<()> {
+                    target.write_all(&edited)?;
+                    target.sync_all()?;
+                    target.rewind()?;
+                    let mut verified = Vec::new();
+                    target.read_to_end(&mut verified)?;
+                    if verified != edited {
+                        return Err(anyhow!("published config bytes do not match the editor result"));
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = publication {
+                    drop(target);
+                    let _ = fs::remove_file(&path);
+                    return Err(error);
+                }
             }
-            return Err(anyhow!("native Windows config publication is unavailable: no safe handle-anchored replacement primitive is guaranteed"));
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = config_identity;
+            return Err(anyhow!("native config publication is unavailable on this platform"));
         }
         #[cfg(unix)]
         if original.is_none() {
@@ -343,13 +405,8 @@ fn verify_original_unchanged(path: &Path, original: &(fs::Metadata, Vec<u8>)) ->
     if !current_metadata.is_file() || current_metadata.file_type().is_symlink() {
         return Err(anyhow!("config path changed while it was being edited"));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if current_metadata.dev() != original.0.dev() || current_metadata.ino() != original.0.ino()
-        {
-            return Err(anyhow!("config path changed while it was being edited"));
-        }
+    if !same_object(&current_metadata, &original.0) {
+        return Err(anyhow!("config path changed while it was being edited"));
     }
     let current = super::read_regular_file(path, Some(&original.0))?;
     if current != original.1 {
@@ -358,7 +415,7 @@ fn verify_original_unchanged(path: &Path, original: &(fs::Metadata, Vec<u8>)) ->
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn restore_target(target: &mut fs::File, original: &[u8]) -> Result<()> {
     target.set_len(0)?;
     target.rewind()?;

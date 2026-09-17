@@ -3,9 +3,10 @@ import { existsSync } from "node:fs";
 
 type Env = Record<string, string>;
 
-const defaultBinary = process.env.SKILLSYNC_BIN ?? resolve(import.meta.dir, "../target/debug/skillsync");
+const nativeName = process.platform === "win32" ? "skillsync.exe" : "skillsync";
+const defaultBinary = process.env.SKILLSYNC_BIN ?? resolve(import.meta.dir, "../target/debug", nativeName);
 const featureTarget = resolve(import.meta.dir, "../target/test-hooks");
-const featureBinary = process.env.SKILLSYNC_TEST_HOOKS_BIN ?? resolve(featureTarget, "debug/skillsync");
+const featureBinary = process.env.SKILLSYNC_TEST_HOOKS_BIN ?? resolve(featureTarget, "debug", nativeName);
 let featureBuilt = false;
 
 function cleanInheritedEnv(): Env {
