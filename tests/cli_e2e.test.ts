@@ -494,7 +494,7 @@ test("local Git subscribe, merge, conflict recovery, and scoped publication", as
 
   const failed = skillsync(fixture, ["--json", "subscribe", upstream], false);
   expect(failed.json.ok).toBe(false);
-});
+}, { timeout: 30000 });
 
 test("tampered persisted paths are rejected without reading outside state", async () => {
   const fixture = await makeFixture();

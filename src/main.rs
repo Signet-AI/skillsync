@@ -32,6 +32,7 @@ use filesystem::{
     replace_dir_bound, resolve_library_path, safe, snapshot_transaction, source_rel,
     strict_component, validate_state_path, FileData, StateLock, WorkerLease,
 };
+use filesystem::lock_is_contended;
 #[cfg(unix)]
 use filesystem::{open_child_file, open_directory_fd};
 
@@ -271,7 +272,7 @@ fn worker_status(config: &Path) -> Result<&'static str> {
             file.unlock()?;
             Ok("stopped")
         }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok("running"),
+        Err(error) if lock_is_contended(&error) => Ok("running"),
         Err(error) => Err(error).context("inspect worker status"),
     }
 }

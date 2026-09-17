@@ -12,6 +12,20 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+pub(crate) fn lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || {
+            #[cfg(windows)]
+            {
+                error.raw_os_error() == Some(33)
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        }
+}
+
 pub(crate) fn effective_library_path(configured: Option<PathBuf>) -> PathBuf {
     std::env::var_os("SKILLSYNC_LIBRARY")
         .map(PathBuf::from)
@@ -533,7 +547,7 @@ pub(crate) fn acquire_named_lock(
         open_advisory_lock(config, name, true).with_context(|| format!("open lock: {name}"))?;
     ensure_regular_file(&file, name)?;
     if let Err(error) = file.try_lock_exclusive() {
-        if error.kind() == std::io::ErrorKind::WouldBlock {
+        if lock_is_contended(&error) {
             return Err(anyhow!("{busy_message}"));
         }
         return Err(error).context("lock Skillsync state");
@@ -664,7 +678,7 @@ impl StateLock {
         );
         #[cfg(unix)]
         if let Err(error) = file.try_lock_exclusive() {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
+            if lock_is_contended(&error) {
                 return Err(anyhow!(
                     "skillsync state is busy (worker or another mutating command holds the lock)"
                 ));
@@ -689,6 +703,9 @@ impl StateLock {
         };
         file.try_lock_shared().map_err(|error| match error {
             std::fs::TryLockError::WouldBlock => anyhow!(
+                "skillsync state is busy (worker or another mutating command holds the lock)"
+            ),
+            std::fs::TryLockError::Error(error) if lock_is_contended(&error) => anyhow!(
                 "skillsync state is busy (worker or another mutating command holds the lock)"
             ),
             std::fs::TryLockError::Error(error) => {
