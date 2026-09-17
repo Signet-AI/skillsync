@@ -20,6 +20,7 @@ mod recovery;
 mod repository;
 mod tui;
 mod worker;
+mod worker_registration;
 pub(crate) use worker::{worker_status, WORKER_STOP_REQUESTED};
 
 use filesystem::{
@@ -74,6 +75,8 @@ enum Cmd {
     Update,
     Sync,
     Worker {
+        #[command(subcommand)]
+        command: Option<WorkerCmd>,
         #[arg(long)]
         once: bool,
         #[arg(long, default_value_t = 300)]
@@ -114,6 +117,16 @@ enum Cmd {
         #[command(subcommand)]
         command: HarnessCmd,
     },
+}
+#[derive(Subcommand)]
+enum WorkerCmd {
+    Enable {
+        #[arg(long, default_value_t = 300)]
+        interval: u64,
+    },
+    Disable,
+    Status,
+    Uninstall,
 }
 #[derive(Subcommand)]
 enum ConflictCmd {
@@ -607,7 +620,11 @@ fn interactive_package_selection(found: &[(String, PathBuf, String)]) -> Result<
 
 fn requires_lock(command: &Cmd) -> bool {
     match command {
-        Cmd::Config {
+        Cmd::Worker {
+            command: Some(WorkerCmd::Status),
+            ..
+        }
+        | Cmd::Config {
             command: ConfigCmd::Path,
         }
         | Cmd::Status
@@ -960,7 +977,27 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             command: ConflictCmd::Resume { relationship },
         } => conflicts::resume(&mut a, &relationship),
         Cmd::Update | Cmd::Sync => worker::sync_all(&mut a, false),
-        Cmd::Worker { once, interval } => worker::run_worker_locked(&mut a, once, interval),
+        Cmd::Worker {
+            command: Some(WorkerCmd::Enable { interval }),
+            ..
+        } => worker_registration::enable(&a.config, interval),
+        Cmd::Worker {
+            command: Some(WorkerCmd::Disable),
+            ..
+        } => worker_registration::disable(&a.config),
+        Cmd::Worker {
+            command: Some(WorkerCmd::Status),
+            ..
+        } => worker_registration::status(&a.config),
+        Cmd::Worker {
+            command: Some(WorkerCmd::Uninstall),
+            ..
+        } => worker_registration::uninstall(&a.config),
+        Cmd::Worker {
+            command: None,
+            once,
+            interval,
+        } => worker::run_worker_locked(&mut a, once, interval),
         Cmd::Harness { command } => match command {
             HarnessCmd::Enable { root, set } => harness::harness_set(&mut a, &root, &set, true),
             HarnessCmd::Disable { root, set } => harness::harness_set(&mut a, &root, &set, false),
@@ -1039,7 +1076,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             }
         }
         Cmd::Status => Ok(
-            serde_json::json!({"subscriptions":a.state.subscriptions,"local_adoptions":a.state.local_adoptions,"publications":a.state.publications,"pending_publications":a.state.pending_publications,"harness_links":a.state.harness_links,"harness_sets":a.state.harness_sets,"harness_health":harness::harness_link_health(&a)?,"worker":worker::worker_status(&a.config)?}),
+            serde_json::json!({"subscriptions":a.state.subscriptions,"local_adoptions":a.state.local_adoptions,"publications":a.state.publications,"pending_publications":a.state.pending_publications,"harness_links":a.state.harness_links,"harness_sets":a.state.harness_sets,"harness_health":harness::harness_link_health(&a)?,"worker":worker::worker_status(&a.config)?,"worker_registration":worker_registration::status(&a.config)?}),
         ),
         Cmd::Inventory => Ok(serde_json::to_value(inventory::query(&a)?)?),
         Cmd::Doctor => Ok(
