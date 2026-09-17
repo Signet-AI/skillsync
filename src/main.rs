@@ -26,7 +26,7 @@ use filesystem::{
     assert_no_symlink_path, atomic, canonicalize_path, checked_regular_path, copy_tree, discover,
     effective_library_path, files, hash_dir, manifest_name, read_regular_file,
     replace_dir_bound, resolve_library_path, safe, snapshot_transaction, source_rel,
-    strict_component, validate_state_path, StateLock,
+    strict_component, validate_state_path, FileData, StateLock,
 };
 #[cfg(unix)]
 use filesystem::{open_child_file, open_directory_fd};
