@@ -161,6 +161,7 @@ pub(crate) fn edit_config(a: &super::App, json: bool) -> Result<serde_json::Valu
     }
     let path = a.config.join("config.toml");
     super::assert_no_symlink_path(&a.config, Path::new("."))?;
+    #[cfg(not(windows))]
     let config_identity = fs::metadata(&a.config)?;
     #[cfg(windows)]
     let config_directory_identity = super::filesystem::windows_path_identity(&a.config)?;

@@ -317,9 +317,13 @@ impl App {
         }
         let c = if configured_config.exists() {
             #[cfg(windows)]
-            canonicalize_path(&configured_config)?
+            {
+                canonicalize_path(&configured_config)?
+            }
             #[cfg(not(windows))]
-            configured_config.clone()
+            {
+                configured_config.clone()
+            }
         } else {
             configured_config
         };
