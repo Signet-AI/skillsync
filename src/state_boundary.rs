@@ -1,0 +1,349 @@
+use crate::{
+    filesystem::{assert_no_symlink_path, atomic, checked_regular_path, source_rel},
+    App,
+};
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Component, Path},
+};
+
+fn canonical_source_rel(value: &str) -> Result<String> {
+    source_rel(value)?;
+    if value == "." {
+        return Ok(".".into());
+    }
+    Ok(Path::new(value)
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/"))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Bundle {
+    format: String,
+    version: u32,
+    metadata_only: bool,
+    subscriptions: BTreeMap<String, Subscription>,
+    publications: BTreeMap<String, Publication>,
+    pending_publications: BTreeMap<String, Publication>,
+    sets: BTreeMap<String, SkillSet>,
+    local_adoptions: BTreeMap<String, LocalAdoption>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Subscription {
+    skill: String,
+    source: String,
+    branch: String,
+    source_path: String,
+    baseline_hash: String,
+    baseline_source: String,
+    baseline_source_path: String,
+    status: String,
+    conflict_selection: Option<String>,
+    last_sync: u64,
+    update_count: u64,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Publication {
+    skill: String,
+    destination: String,
+    branch: String,
+    path: String,
+    approved: bool,
+    status: String,
+    last_hash: Option<String>,
+    last_sync: u64,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillSet {
+    members: Vec<String>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalAdoption {
+    skill: String,
+    source_package: String,
+    content_hash: String,
+    status: String,
+}
+
+fn portable_state(app: &App) -> Result<Bundle> {
+    let mut subscriptions = BTreeMap::new();
+    for (key, s) in &app.state.subscriptions {
+        let source_path = canonical_source_rel(&s.source_path)?;
+        validate_remote(&s.source, "source")?;
+        crate::strict_component(&s.skill, "subscription skill name")?;
+        crate::repository::validate_branch(&s.branch)?;
+        validate_hash(&s.baseline_hash, "baseline hash")?;
+        validate_remote(&s.baseline_source, "baseline source")?;
+        if s.baseline_source != s.source {
+            return Err(anyhow!("baseline source does not match source"));
+        }
+        if canonical_source_rel(&s.baseline_source_path)? != source_path {
+            return Err(anyhow!("baseline source path does not match source path"));
+        }
+        validate_subscription_status(&s.status)?;
+        if let Some(selection) = &s.conflict_selection {
+            validate_conflict_selection(selection)?;
+        }
+        if *key != crate::relationship_key(&s.source, &source_path) {
+            return Err(anyhow!("subscription key does not match relationship"));
+        }
+        subscriptions.insert(
+            key.clone(),
+            Subscription {
+                skill: s.skill.clone(),
+                source: s.source.clone(),
+                branch: s.branch.clone(),
+                source_path,
+                baseline_hash: s.baseline_hash.clone(),
+                baseline_source: s.baseline_source.clone(),
+                baseline_source_path: canonical_source_rel(&s.baseline_source_path)?,
+                status: s.status.clone(),
+                conflict_selection: s.conflict_selection.clone(),
+                last_sync: s.last_sync,
+                update_count: s.update_count,
+            },
+        );
+    }
+    let publications = app
+        .state
+        .publications
+        .iter()
+        .map(|(key, p)| checked_publication(key, p).map(|p| (key.clone(), p)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let pending_publications = app
+        .state
+        .pending_publications
+        .iter()
+        .map(|(key, p)| checked_publication(key, &p.publication).map(|p| (key.clone(), p)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let mut sets = BTreeMap::new();
+    for (key, s) in &app.state.sets {
+        crate::set_member_name(&format!("library:{}", key))
+            .or_else(|_| crate::strict_component(key, "set name").map(|_| key.clone()))?;
+        for m in &s.members {
+            crate::set_member_name(m)?;
+        }
+        sets.insert(
+            key.clone(),
+            SkillSet {
+                members: s.members.iter().cloned().collect(),
+            },
+        );
+    }
+    let mut local_adoptions = BTreeMap::new();
+    for (key, a) in &app.state.local_adoptions {
+        let skill = crate::strict_component(&a.skill, "skill name")?;
+        if *key != format!("local:{skill}") {
+            return Err(anyhow!("local adoption key does not match skill"));
+        }
+        local_adoptions.insert(
+            key.clone(),
+            LocalAdoption {
+                skill: a.skill.clone(),
+                source_package: canonical_source_rel(&a.source_package)?,
+                content_hash: a.content_hash.clone(),
+                status: a.status.clone(),
+            },
+        );
+    }
+    Ok(Bundle {
+        format: "skillsync-state-metadata".into(),
+        version: 1,
+        metadata_only: true,
+        subscriptions,
+        publications,
+        pending_publications,
+        sets,
+        local_adoptions,
+    })
+}
+fn validate_text(s: &str, label: &str) -> Result<()> {
+    if s.is_empty() || s.chars().any(|c| c.is_control()) {
+        Err(anyhow!("invalid {label}"))
+    } else {
+        Ok(())
+    }
+}
+fn checked_publication(key: &str, p: &crate::Publication) -> Result<Publication> {
+    validate_text(&p.skill, "skill")?;
+    validate_remote(&p.destination, "destination")?;
+    crate::repository::validate_branch(&p.branch)?;
+    let path = canonical_source_rel(&p.path)?;
+    if key != crate::publication_key(&p.skill, &p.destination, &p.branch, &path) {
+        return Err(anyhow!("publication key does not match identity"));
+    }
+    if let Some(h) = &p.last_hash {
+        validate_hash(h, "publication hash")?;
+    }
+    validate_text(&p.status, "status")?;
+    Ok(Publication {
+        skill: p.skill.clone(),
+        destination: p.destination.clone(),
+        branch: p.branch.clone(),
+        path,
+        approved: p.approved,
+        status: p.status.clone(),
+        last_hash: p.last_hash.clone(),
+        last_sync: p.last_sync,
+    })
+}
+fn validate_remote(s: &str, label: &str) -> Result<()> {
+    validate_text(s, label)?;
+    if s.starts_with("git@") && s.contains(':') {
+        return Err(anyhow!("credential-bearing {label}"));
+    }
+    if let Some((scheme, rest)) = s.split_once("://") {
+        if !matches!(scheme, "http" | "https" | "ssh") {
+            return Err(anyhow!("unsupported remote scheme for {label}"));
+        }
+        if rest.split('/').next().is_some_and(|x| x.contains('@')) {
+            return Err(anyhow!("credential-bearing {label}"));
+        }
+    } else {
+        return Err(anyhow!("nonportable {label}"));
+    }
+    if s.starts_with("/") {
+        return Err(anyhow!("credential-bearing {label}"));
+    }
+    Ok(())
+}
+fn validate_hash(s: &str, label: &str) -> Result<()> {
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Err(anyhow!("invalid {label}"))
+    } else {
+        Ok(())
+    }
+}
+fn validate_subscription_status(s: &str) -> Result<()> {
+    if matches!(
+        s,
+        "synced"
+            | "customized"
+            | "conflict"
+            | "changed_during_update"
+            | "authentication_required"
+            | "offline"
+            | "permission_denied"
+    ) {
+        Ok(())
+    } else {
+        Err(anyhow!("invalid subscription status: {s}"))
+    }
+}
+fn validate_conflict_selection(s: &str) -> Result<()> {
+    if matches!(s, "local" | "incoming") {
+        Ok(())
+    } else {
+        Err(anyhow!("invalid conflict selection: {s}"))
+    }
+}
+fn validate_branch(s: &str) -> Result<()> {
+    crate::repository::validate_branch(s)
+}
+fn validate_bundle(path: &Path) -> Result<Bundle> {
+    checked_regular_path(path, "state bundle")?;
+    assert_no_symlink_path(
+        path.parent().unwrap_or(Path::new(".")),
+        Path::new(path.file_name().unwrap()),
+    )?;
+    let mut b: Bundle = serde_json::from_slice(&fs::read(path)?)
+        .map_err(|e| anyhow!("invalid state bundle: {e}"))?;
+    if b.format != "skillsync-state-metadata" || b.version != 1 || !b.metadata_only {
+        return Err(anyhow!("unsupported or non-metadata state bundle"));
+    }
+    for (key, s) in &mut b.subscriptions {
+        validate_text(&s.skill, "skill")?;
+        validate_remote(&s.source, "source")?;
+        crate::repository::validate_branch(&s.branch)?;
+        canonical_source_rel(&s.source_path)?;
+        if key != &crate::relationship_key(&s.source, &canonical_source_rel(&s.source_path)?) {
+            return Err(anyhow!("subscription key does not match relationship"));
+        }
+        s.source_path = canonical_source_rel(&s.source_path)?;
+        s.baseline_source_path = canonical_source_rel(&s.baseline_source_path)?;
+        validate_remote(&s.baseline_source, "baseline source")?;
+        if s.baseline_source != s.source {
+            return Err(anyhow!("baseline source does not match source"));
+        }
+        if canonical_source_rel(&s.baseline_source_path)? != canonical_source_rel(&s.source_path)? {
+            return Err(anyhow!("baseline source path does not match source path"));
+        }
+        validate_hash(&s.baseline_hash, "baseline hash")?;
+        validate_subscription_status(&s.status)?;
+        if let Some(x) = &s.conflict_selection {
+            validate_conflict_selection(x)?;
+        }
+    }
+    for (kind, entries) in [
+        ("publications", &b.publications),
+        ("pending publications", &b.pending_publications),
+    ] {
+        for (key, p) in entries {
+            validate_text(&p.skill, "skill")?;
+            validate_remote(&p.destination, "destination")?;
+            crate::repository::validate_branch(&p.branch)?;
+            let path = canonical_source_rel(&p.path)?;
+            if key != &crate::publication_key(&p.skill, &p.destination, &p.branch, &path) {
+                return Err(anyhow!("{kind} key does not match identity"));
+            }
+        }
+    }
+    for entries in [&mut b.publications, &mut b.pending_publications] {
+        for p in entries.values_mut() {
+            validate_text(&p.skill, "skill")?;
+            validate_remote(&p.destination, "destination")?;
+            validate_branch(&p.branch)?;
+            p.path = canonical_source_rel(&p.path)?;
+            if let Some(h) = &p.last_hash {
+                validate_hash(h, "publication hash")?;
+            }
+            validate_text(&p.status, "status")?;
+        }
+    }
+    for (key, s) in &b.sets {
+        crate::strict_component(key, "set name")?;
+        for m in &s.members {
+            crate::set_member_name(m)?;
+        }
+    }
+    for (key, a) in &mut b.local_adoptions {
+        validate_text(&a.skill, "skill")?;
+        crate::strict_component(&a.skill, "skill name")?;
+        if key != &format!("local:{}", a.skill) {
+            return Err(anyhow!("local adoption key does not match skill"));
+        }
+        a.source_package = canonical_source_rel(&a.source_package)?;
+        validate_hash(&a.content_hash, "content hash")?;
+        validate_text(&a.status, "status")?;
+    }
+    Ok(b)
+}
+pub(crate) fn export(app: &App, out: &Path) -> Result<Value> {
+    if out.exists() {
+        checked_regular_path(out, "export destination")?;
+    }
+    let b = portable_state(app)?;
+    let bytes = serde_json::to_vec_pretty(&b)?;
+    if let Some(p) = out.parent() {
+        fs::create_dir_all(p)?;
+    }
+    atomic(out, &bytes)?;
+    Ok(serde_json::json!({"format":b.format,"version":b.version,"metadata_only":true,"out":out}))
+}
+pub(crate) fn inspect(from: &Path) -> Result<Value> {
+    serde_json::to_value(validate_bundle(from)?).map_err(Into::into)
+}

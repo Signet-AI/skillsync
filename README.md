@@ -13,6 +13,8 @@ skillsync subscribe REPOSITORY [--skill NAME]
 # With neither argument, the TTY asks for the repository first.
 skillsync import --from PATH --skill NAME
 skillsync update | sync | status | inventory | diff | doctor
+skillsync state inspect --from PATH
+skillsync state export --out PATH   # deterministic metadata-only bundle
 skillsync worker --once
 skillsync worker --interval 300
 skillsync worker enable [--interval 300]
@@ -44,7 +46,7 @@ holding the shared read lock, then releases the lock before waiting for input;
 it never executes skill files or mutates the library/state. Redirected and
 `--json` invocations retain the noninteractive readiness JSON behavior.
 
-Subscribe records a stable source-plus-relative-path relationship key, so same-named skills from different repositories do not overwrite state. `import --from PATH --skill NAME` explicitly adopts one package from an existing local directory (including a root package or nested package), stages and validates it, preserves modes/resources, and records local provenance without creating a subscription. The picker is deliberately not a full TUI: it lists discovered packages and accepts one validated number. Multi-select, unattended onboarding, automatic registry discovery, and `full TUI: unsupported` remain explicit limitations.
+Subscribe records a stable source-plus-relative-path relationship key, so same-named skills from different repositories do not overwrite state. `import --from PATH --skill NAME` explicitly adopts one package from an existing local directory (including a root package or nested package), stages and validates it, preserves modes/resources, and records local provenance without creating a subscription. `state export --out PATH` writes a deterministic, versioned **metadata-only** bundle containing portable relationship/provenance hashes, sets, publications, and pending intent; device-local library/baseline/recovery paths and operational files are omitted. `state inspect --from PATH` is read-only and validates the bundle strictly. Export is not a package backup and there is no import/apply command: automatic import, remote sync, worker restoration, harness recreation, credential copying, and baseline/recovery rehydration remain deferred. The picker is deliberately not a full TUI: it lists discovered packages and accepts one validated number. Multi-select, unattended onboarding, automatic registry discovery, and `full TUI: unsupported` remain explicit limitations.
 
 ## Safety and storage
 

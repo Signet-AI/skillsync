@@ -18,6 +18,7 @@ mod harness;
 mod inventory;
 mod recovery;
 mod repository;
+mod state_boundary;
 mod tui;
 mod worker;
 mod worker_registration;
@@ -44,6 +45,10 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Cmd {
+    State {
+        #[command(subcommand)]
+        command: StateCmd,
+    },
     Init {
         #[arg(long)]
         library: Option<PathBuf>,
@@ -116,6 +121,17 @@ enum Cmd {
     Harness {
         #[command(subcommand)]
         command: HarnessCmd,
+    },
+}
+#[derive(Subcommand)]
+enum StateCmd {
+    Inspect {
+        #[arg(long = "from")]
+        from: PathBuf,
+    },
+    Export {
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 #[derive(Subcommand)]
@@ -571,7 +587,7 @@ pub(crate) fn relationship_key(source: &str, source_path: &str) -> String {
     h.update(source_path.as_bytes());
     format!("rel-{:x}", h.finalize())
 }
-fn publication_key(skill: &str, destination: &str, branch: &str, path: &str) -> String {
+pub(crate) fn publication_key(skill: &str, destination: &str, branch: &str, path: &str) -> String {
     let mut h = Sha256::new();
     h.update(b"publication");
     h.update([0]);
@@ -620,6 +636,9 @@ fn interactive_package_selection(found: &[(String, PathBuf, String)]) -> Result<
 
 fn requires_lock(command: &Cmd) -> bool {
     match command {
+        Cmd::State {
+            command: StateCmd::Inspect { .. },
+        } => false,
         Cmd::Worker {
             command: Some(WorkerCmd::Status),
             ..
@@ -759,6 +778,12 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             }));
         }
     };
+    if let Cmd::State {
+        command: StateCmd::Inspect { from },
+    } = &command
+    {
+        return state_boundary::inspect(from);
+    }
     if let Cmd::Worker {
         command: Some(_),
         once,
@@ -848,6 +873,12 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         lock.verify_config_identity(&a.config)?;
     }
     let result: Result<serde_json::Value> = match command {
+        Cmd::State {
+            command: StateCmd::Export { out },
+        } => state_boundary::export(&a, &out),
+        Cmd::State {
+            command: StateCmd::Inspect { .. },
+        } => unreachable!("state inspect handled before App load"),
         Cmd::Init { library } => {
             if !a.state_path.exists() {
                 if let Some(l) = library {
