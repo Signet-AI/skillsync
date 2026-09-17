@@ -87,43 +87,7 @@ fn safe_temp_path(dir: &Path) -> Result<(PathBuf, fs::File)> {
     Err(anyhow!("could not create a unique temporary config file"))
 }
 
-#[cfg(unix)]
-#[allow(dead_code)]
-fn publish_anchored(
-    directory: std::os::fd::RawFd,
-    name: &std::ffi::OsStr,
-    temp: &Path,
-    replace: bool,
-) -> Result<()> {
-    use std::{ffi::CString, os::unix::ffi::OsStrExt};
-    let src = CString::new(
-        temp.file_name()
-            .ok_or_else(|| anyhow!("temporary config file has no name"))?
-            .as_bytes(),
-    )?;
-    let dst = CString::new(name.as_bytes())?;
-    let rc = if replace {
-        unsafe { libc::renameat(directory, src.as_ptr(), directory, dst.as_ptr()) }
-    } else {
-        unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                directory,
-                src.as_ptr(),
-                directory,
-                dst.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            ) as libc::c_int
-        }
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error().into())
-    }
-}
-
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn publish_missing_from_handle(
     directory: std::os::fd::RawFd,
     name: &std::ffi::OsStr,
@@ -149,6 +113,39 @@ fn publish_missing_from_handle(
     } else {
         Err(std::io::Error::last_os_error().into())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn publish_missing_from_path(
+    directory: std::os::fd::RawFd,
+    name: &std::ffi::OsStr,
+    temp: &Path,
+) -> Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    let source = CString::new(
+        temp.file_name()
+            .ok_or_else(|| anyhow!("temporary config file has no name"))?
+            .as_bytes(),
+    )?;
+    let destination = CString::new(name.as_bytes())?;
+    let linked = unsafe {
+        libc::linkat(
+            directory,
+            source.as_ptr(),
+            directory,
+            destination.as_ptr(),
+            0,
+        )
+    };
+    if linked < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let removed = unsafe { libc::unlinkat(directory, source.as_ptr(), 0) };
+    if removed < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
 }
 
 #[allow(unreachable_code)]
@@ -310,7 +307,9 @@ pub(crate) fn edit_config(a: &super::App, json: bool) -> Result<serde_json::Valu
                     let mut verified = Vec::new();
                     target.read_to_end(&mut verified)?;
                     if verified != edited {
-                        return Err(anyhow!("published config bytes do not match the editor result"));
+                        return Err(anyhow!(
+                            "published config bytes do not match the editor result"
+                        ));
                     }
                     Ok(())
                 })();
@@ -331,7 +330,9 @@ pub(crate) fn edit_config(a: &super::App, json: bool) -> Result<serde_json::Valu
                     let mut verified = Vec::new();
                     target.read_to_end(&mut verified)?;
                     if verified != edited {
-                        return Err(anyhow!("published config bytes do not match the editor result"));
+                        return Err(anyhow!(
+                            "published config bytes do not match the editor result"
+                        ));
                     }
                     Ok(())
                 })();
@@ -345,9 +346,11 @@ pub(crate) fn edit_config(a: &super::App, json: bool) -> Result<serde_json::Valu
         #[cfg(not(any(unix, windows)))]
         {
             let _ = config_identity;
-            return Err(anyhow!("native config publication is unavailable on this platform"));
+            return Err(anyhow!(
+                "native config publication is unavailable on this platform"
+            ));
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         if original.is_none() {
             use std::os::fd::AsRawFd;
             publish_missing_from_handle(
@@ -355,6 +358,11 @@ pub(crate) fn edit_config(a: &super::App, json: bool) -> Result<serde_json::Valu
                 path.file_name().unwrap(),
                 &staged_file,
             )?;
+        }
+        #[cfg(target_os = "macos")]
+        if original.is_none() {
+            use std::os::fd::AsRawFd;
+            publish_missing_from_path(directory.as_raw_fd(), path.file_name().unwrap(), &staged)?;
         }
         Ok(())
     })();

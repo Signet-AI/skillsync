@@ -94,7 +94,7 @@ test("inventory discovers an effective library before initialization without mut
   await put(join(fixture.library, "references/child/SKILL.md"), "name: child\n");
   const before = (await readdir(fixture.library, { recursive: true })).sort();
   const result = skillsync(fixture, ["--json", "inventory"]).json;
-  expect(result.library).toBe(process.platform === "win32" ? await realpath(fixture.library) : fixture.library);
+  expect(result.library).toBe(await realpath(fixture.library));
   expect(result.packages.map((item: any) => [item.name, item.path])).toEqual([
     ["root", "."],
     ["child", "references/child"],

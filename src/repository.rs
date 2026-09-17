@@ -1,7 +1,7 @@
 use crate::filesystem::{
-    assert_no_symlink_path, canonicalize_path, copy_existing_tree, copy_tree, discover, files, hash_dir,
-    replace_dir_bound, safe, snapshot_transaction, source_rel, strict_component, sync_managed_tree,
-    validate_state_path, write_file_data,
+    assert_no_symlink_path, canonicalize_path, copy_existing_tree, copy_tree, discover, files,
+    hash_dir, replace_dir_bound, safe, snapshot_transaction, source_rel, strict_component,
+    sync_managed_tree, validate_state_path, write_file_data,
 };
 use crate::publication_key;
 use crate::recovery::{directory_identity, remove_owned_directory};
@@ -472,7 +472,9 @@ pub(crate) fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
         }
     };
     s.branch = b.clone();
-    let (_, up, _) = find_skill(repo.path(), &s.source_path)?;
+    let repo_path = crate::filesystem::canonicalize_path_with_missing(repo.path())
+        .context("canonicalize update repository")?;
+    let (_, up, _) = find_skill(&repo_path, &s.source_path)?;
     let base = PathBuf::from(&s.baseline_path);
     let lh = hash_dir(&local)?;
     if lh != s.baseline_hash {
@@ -623,10 +625,12 @@ pub(crate) fn publish_to_repo(
         }
         Err(error) => return Err(error),
     };
+    let tmp_path = crate::filesystem::canonicalize_path_with_missing(tmp.path())
+        .context("canonicalize publication repository")?;
     let destination_rel = format!("skills/{skill}");
     let destination_rel_path = Path::new(&destination_rel);
-    assert_no_symlink_path(tmp.path(), destination_rel_path)?;
-    let destination = tmp.path().join(destination_rel_path);
+    assert_no_symlink_path(&tmp_path, destination_rel_path)?;
+    let destination = tmp_path.join(destination_rel_path);
     let destination_exists = destination.exists();
     if let Ok(metadata) = fs::symlink_metadata(&destination) {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -649,10 +653,10 @@ pub(crate) fn publish_to_repo(
     {
         return Err(anyhow!("destination has unexplained modifications"));
     }
-    let destination_parent_dir = tmp.path().join("skills");
+    let destination_parent_dir = tmp_path.join("skills");
     fs::create_dir_all(&destination_parent_dir)?;
     let publication_parent = crate::filesystem::open_directory_file_bound(&destination_parent_dir)?;
-    let destination_stage_parent = tempfile::tempdir_in(tmp.path())?;
+    let destination_stage_parent = tempfile::tempdir_in(&tmp_path)?;
     let staged_destination = destination_stage_parent.path().join("skill");
     if destination_exists {
         copy_existing_tree(&destination, &staged_destination)?;
@@ -661,27 +665,27 @@ pub(crate) fn publish_to_repo(
     }
     let removed = sync_managed_tree(&source_candidate, &staged_destination)?;
     if let Some(parent) = destination.parent() {
-        assert_no_symlink_path(tmp.path(), parent.strip_prefix(tmp.path())?)?;
+        assert_no_symlink_path(&tmp_path, parent.strip_prefix(&tmp_path)?)?;
         fs::create_dir_all(parent)?;
     }
     let mut replacement =
         replace_dir_bound(&destination, &staged_destination, &publication_parent)?;
     for (path, _, _) in &source_files {
         let relative = format!("{destination_rel}/{}", path.to_string_lossy());
-        run_git(Some(tmp.path()), &["add", "--", &relative])?;
+        run_git(Some(&tmp_path), &["add", "--", &relative])?;
     }
     for path in &removed {
         let relative = format!("{destination_rel}/{}", path.to_string_lossy());
-        run_git(Some(tmp.path()), &["add", "-u", "--", &relative])?;
+        run_git(Some(&tmp_path), &["add", "-u", "--", &relative])?;
     }
     if hash_dir(&source)? != current_hash {
         return Err(anyhow!("source changed during publication; retry"));
     }
-    let changed = cached_changes(tmp.path())?;
+    let changed = cached_changes(&tmp_path)?;
     let key = publication_key(skill, url, &branch_name, &destination_rel);
     if changed {
         run_git(
-            Some(tmp.path()),
+            Some(&tmp_path),
             &["commit", "-m", &format!("Update skill {skill}")],
         )?;
         if hash_dir(&source)? != current_hash {
@@ -704,7 +708,7 @@ pub(crate) fn publish_to_repo(
             },
         );
         a.save().context("persist publication intent before push")?;
-        run_git(Some(tmp.path()), &["push", "origin", &branch_name])?;
+        run_git(Some(&tmp_path), &["push", "origin", &branch_name])?;
     }
     if hash_dir(&destination)? != current_hash {
         return Err(anyhow!("published destination did not match source scope"));
@@ -717,7 +721,7 @@ pub(crate) fn publish_to_repo(
         .split_whitespace()
         .next()
         .ok_or_else(|| anyhow!("published branch was not visible on the remote"))?;
-    let local_hash = run_git(Some(tmp.path()), &["rev-parse", "HEAD"])?;
+    let local_hash = run_git(Some(&tmp_path), &["rev-parse", "HEAD"])?;
     if remote_hash != local_hash {
         return Err(anyhow!("remote readback did not match published commit"));
     }

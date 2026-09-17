@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdtemp, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { childEnv, commandBinary } from "./test_harness";
 
 type Env = Record<string, string>;
@@ -38,8 +38,11 @@ function shellQuote(value: string): string {
 
 function runInPty(args: string[], env: Env): Result {
   const command = [commandBinary(env), ...args].map(shellQuote).join(" ");
+  const scriptCommand = process.platform === "darwin"
+    ? ["python3", resolve(import.meta.dir, "pty_runner.py"), commandBinary(env), ...args]
+    : ["script", "-qefc", command, "/dev/null"];
   const result = Bun.spawnSync({
-    cmd: ["script", "-qefc", command, "/dev/null"],
+    cmd: scriptCommand,
     env: childEnv(env),
     stdout: "pipe",
     stderr: "pipe",
@@ -150,7 +153,7 @@ test("config edit creates the file and invokes VISUAL with one config path", asy
   expect(result.stdout).toContain("editor-stdout");
   expect(result.stdout).toContain("ok");
   const editedPath = (await readFile(log, "utf8")).split("\n")[1];
-  expect(editedPath.startsWith(`${f.config}/`)).toBe(true);
+  expect(editedPath.startsWith(`${await realpath(f.config)}/`)).toBe(true);
   expect(editedPath).not.toBe(join(f.config, "config.toml"));
   expect(await readFile(join(f.config, "config.toml"), "utf8")).toBe(
     `library = "${f.library}"\n`,
@@ -229,7 +232,7 @@ test("config edit reports editor failure without shell fallback", async () => {
     EDITOR: "/bin/true",
   });
   expect(result.code).toBe(1);
-  expect(result.stdout).toContain("editor exited unsuccessfully");
+  expect(result.stdout).toContain(process.platform === "darwin" ? "launch editor /bin/false" : "editor exited unsuccessfully");
 });
 
 test("config edit reports a missing editor without mutating through a command string", async () => {

@@ -9,7 +9,8 @@ use std::{
 #[cfg(unix)]
 use crate::filesystem::open_directory_fd;
 use crate::filesystem::{
-    assert_no_symlink_path, canonicalize_path, checked_regular_path, manifest_name, strict_component,
+    assert_no_symlink_path, canonicalize_path, checked_regular_path, manifest_name,
+    strict_component,
 };
 use crate::recovery::{directory_identity, DirectoryIdentity};
 use crate::{set_member_name, App, HarnessLink, HarnessSetEnablement, State};
@@ -299,8 +300,9 @@ fn existing_harness_root(root: &Path) -> Result<PathBuf> {
             "harness root must be an absolute existing directory"
         ));
     }
-    assert_no_symlink_path(root, Path::new("."))?;
-    let metadata = fs::symlink_metadata(root)
+    let root = crate::filesystem::canonicalize_path_with_missing(root)?;
+    assert_no_symlink_path(&root, Path::new("."))?;
+    let metadata = fs::symlink_metadata(&root)
         .map_err(|_| anyhow!("harness root does not exist: {}", root.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(anyhow!(
@@ -308,18 +310,19 @@ fn existing_harness_root(root: &Path) -> Result<PathBuf> {
             root.display()
         ));
     }
-    Ok(canonicalize_path(root)?)
+    canonicalize_path(&root)
 }
 
 fn persisted_harness_root(root: &Path) -> Result<PathBuf> {
     if !root.is_absolute() {
         return Err(anyhow!("harness root must be absolute"));
     }
-    assert_no_symlink_path(root, Path::new("."))?;
+    let root = crate::filesystem::canonicalize_path_with_missing(root)?;
+    assert_no_symlink_path(&root, Path::new("."))?;
     if root.exists() {
-        existing_harness_root(root)
+        existing_harness_root(&root)
     } else {
-        Ok(root.to_path_buf())
+        Ok(root)
     }
 }
 

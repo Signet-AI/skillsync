@@ -1,10 +1,12 @@
 use crate::filesystem::StateLock;
 use crate::{config_dir, inventory, App};
 use anyhow::{Context, Result};
+#[cfg(not(target_os = "macos"))]
+use crossterm::terminal::disable_raw_mode;
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -18,15 +20,28 @@ struct TerminalSession<'a, B: ratatui::backend::Backend + io::Write> {
     terminal: &'a mut Terminal<B>,
     raw_mode: bool,
     alternate_screen: bool,
+    #[cfg(unix)]
+    original_termios: Option<libc::termios>,
 }
 
 impl<'a, B: ratatui::backend::Backend + io::Write> TerminalSession<'a, B> {
     fn enter(terminal: &'a mut Terminal<B>) -> Result<Self> {
+        #[cfg(unix)]
+        let original_termios = {
+            let mut termios = std::mem::MaybeUninit::uninit();
+            let result = unsafe { libc::tcgetattr(libc::STDIN_FILENO, termios.as_mut_ptr()) };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Some(unsafe { termios.assume_init() })
+        };
         enable_raw_mode().context("enable terminal raw mode")?;
         let mut session = Self {
             terminal,
             raw_mode: true,
             alternate_screen: false,
+            #[cfg(unix)]
+            original_termios,
         };
         execute!(session.terminal.backend_mut(), EnterAlternateScreen)
             .context("enter terminal alternate screen")?;
@@ -41,7 +56,19 @@ impl<B: ratatui::backend::Backend + io::Write> Drop for TerminalSession<'_, B> {
             let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         }
         if self.raw_mode {
+            #[cfg(not(target_os = "macos"))]
             let _ = disable_raw_mode();
+        }
+        #[cfg(unix)]
+        if let Some(termios) = self.original_termios.as_ref() {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                libc::ioctl(libc::STDIN_FILENO, libc::TIOCSETAF, termios);
+            }
+            #[cfg(not(target_os = "macos"))]
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, termios);
+            }
         }
         let _ = self.terminal.show_cursor();
     }

@@ -13,17 +13,27 @@ use std::{
 };
 
 pub(crate) fn lock_is_contended(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::WouldBlock
-        || {
-            #[cfg(windows)]
-            {
-                error.raw_os_error() == Some(33)
-            }
-            #[cfg(not(windows))]
-            {
-                false
-            }
+    error.kind() == std::io::ErrorKind::WouldBlock || {
+        #[cfg(windows)]
+        {
+            error.raw_os_error() == Some(33)
         }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn renameatx_np(
+        from_dirfd: libc::c_int,
+        from: *const libc::c_char,
+        to_dirfd: libc::c_int,
+        to: *const libc::c_char,
+        flags: libc::c_uint,
+    ) -> libc::c_int;
 }
 
 pub(crate) fn effective_library_path(configured: Option<PathBuf>) -> PathBuf {
@@ -125,11 +135,7 @@ fn open_directory_file_no_create(path: &Path) -> Result<fs::File> {
         ffi::CString,
         os::fd::{AsRawFd, FromRawFd},
     };
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
+    let absolute = canonicalize_path_with_missing(path)?;
     let root = CString::new("/")?;
     let root_fd = unsafe {
         libc::open(
@@ -171,8 +177,8 @@ pub(crate) fn open_directory_file_bound(path: &Path) -> Result<fs::File> {
     use std::{iter, os::windows::ffi::OsStrExt, os::windows::io::FromRawHandle};
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     const GENERIC_READ_ACCESS: u32 = 0x8000_0000;
 
@@ -216,7 +222,8 @@ pub(crate) fn open_directory_file_bound(path: &Path) -> Result<fs::File> {
         return Err(anyhow!("regular directory required: {}", path.display()));
     }
     let expected = (expected.dev(), expected.ino());
-    let opened = open_directory_file_no_create(path)?;
+    let opened = open_directory_file_no_create(path)
+        .with_context(|| format!("open directory without symlinks: {}", path.display()))?;
     let actual = opened.metadata()?;
     if !actual.is_dir()
         || actual.file_type().is_symlink()
@@ -273,7 +280,11 @@ pub(crate) fn open_regular_file_bound(
         .chain(iter::once(0))
         .collect::<Vec<_>>();
     let access = GENERIC_READ_ACCESS | if write { GENERIC_WRITE_ACCESS } else { 0 };
-    let disposition = if create_new { CREATE_NEW } else { OPEN_EXISTING };
+    let disposition = if create_new {
+        CREATE_NEW
+    } else {
+        OPEN_EXISTING
+    };
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
@@ -837,6 +848,52 @@ pub(crate) fn open_directory_file(path: &Path) -> Result<fs::File> {
 }
 
 #[cfg(unix)]
+pub(crate) fn read_directory_entries(fd: std::os::fd::RawFd) -> Result<Vec<std::ffi::OsString>> {
+    use std::{ffi::CStr, os::unix::ffi::OsStringExt};
+
+    let duplicate = unsafe { libc::dup(fd) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let directory = unsafe { libc::fdopendir(duplicate) };
+    if directory.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::close(duplicate) };
+        return Err(error.into());
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        *libc::__error() = 0;
+    }
+
+    let mut entries = Vec::new();
+    loop {
+        let entry = unsafe { libc::readdir(directory) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            entries.push(std::ffi::OsString::from_vec(name.to_vec()));
+        }
+    }
+    let read_error = std::io::Error::last_os_error();
+    let closed = unsafe { libc::closedir(directory) };
+    if read_error.raw_os_error().is_some_and(|code| code != 0) {
+        return Err(read_error.into());
+    }
+    if closed < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(entries)
+}
+
+#[cfg(unix)]
 pub(crate) fn read_relative_file(directory: &fs::File, name: &str) -> Result<Vec<u8>> {
     use std::{
         ffi::CString,
@@ -926,13 +983,75 @@ impl Drop for WorkerLease {
     }
 }
 
+pub(crate) fn canonicalize_path_with_missing(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut existing = absolute.clone();
+    let mut missing = Vec::new();
+    loop {
+        match fs::symlink_metadata(&existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing
+                    .file_name()
+                    .ok_or_else(|| {
+                        anyhow!("path has no canonicalizable parent: {}", path.display())
+                    })?
+                    .to_os_string();
+                missing.push(name);
+                existing.pop();
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut component_path = PathBuf::from("/");
+    for component in existing.components() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        component_path.push(name);
+        if fs::symlink_metadata(&component_path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            let canonical_component = fs::canonicalize(&component_path)?;
+            let allowed_macos_alias = cfg!(target_os = "macos")
+                && ((component_path == Path::new("/var")
+                    && canonical_component == Path::new("/private/var"))
+                    || (component_path == Path::new("/tmp")
+                        && canonical_component == Path::new("/private/tmp"))
+                    || (component_path == Path::new("/etc")
+                        && canonical_component == Path::new("/private/etc")));
+            if !allowed_macos_alias {
+                return Err(anyhow!(
+                    "symlink path component rejected: {}",
+                    component_path.display()
+                ));
+            }
+        }
+    }
+    let mut canonical = fs::canonicalize(existing)?;
+    for name in missing.iter().rev() {
+        canonical.push(name);
+    }
+    Ok(canonical)
+}
+
 pub(crate) fn resolve_library_path(path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()?.join(path)
     };
-    assert_no_symlink_path(&absolute, Path::new("."))?;
+    if fs::symlink_metadata(&absolute)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(anyhow!("symlink library root rejected: {}", path.display()));
+    }
     if absolute.exists() {
         Ok(canonicalize_path(&absolute)?)
     } else {
@@ -1221,10 +1340,8 @@ pub(crate) fn files(root: &Path) -> Result<Vec<(PathBuf, Vec<u8>, u32)>> {
         out: &mut Vec<(PathBuf, Vec<u8>, u32)>,
     ) -> Result<()> {
         use std::{ffi::CString, os::fd::AsRawFd};
-        let entries = fs::read_dir(format!("/proc/self/fd/{fd}"))?;
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
+        let entries = read_directory_entries(fd)?;
+        for name in entries {
             let child_rel = rel.join(&name);
             if operational(&child_rel) {
                 continue;
@@ -1577,7 +1694,7 @@ fn write_relative_file_at(root: &fs::File, relative: &Path, bytes: &[u8], mode: 
                 directory.as_raw_fd(),
                 temp_name.as_ptr(),
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                mode as libc::mode_t,
+                mode as libc::c_uint,
             )
         };
         if child < 0 {
@@ -1623,7 +1740,8 @@ fn write_relative_file_at(root: &fs::File, relative: &Path, bytes: &[u8], mode: 
 fn write_relative_file(root: &Path, relative: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
-        let root = open_directory_file_bound(root)?;
+        let root = canonicalize_path_with_missing(root)?;
+        let root = open_directory_file_bound(&root)?;
         write_relative_file_at(&root, relative, bytes, mode)
     }
     #[cfg(windows)]
@@ -1645,14 +1763,15 @@ fn write_relative_file(root: &Path, relative: &Path, bytes: &[u8], mode: u32) ->
 }
 
 pub(crate) fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
-    assert_no_symlink_path(dst, Path::new("."))?;
-    fs::create_dir_all(dst)?;
+    let dst = canonicalize_path_with_missing(dst)?;
+    assert_no_symlink_path(&dst, Path::new("."))?;
+    fs::create_dir_all(&dst)?;
     for (r, b, m) in files(src)? {
         if !safe(&r) {
             return Err(anyhow!("unsafe path"));
         }
-        assert_no_symlink_path(dst, &r)?;
-        write_relative_file(dst, &r, &b, m)?;
+        assert_no_symlink_path(&dst, &r)?;
+        write_relative_file(&dst, &r, &b, m)?;
     }
     Ok(())
 }
@@ -1686,7 +1805,10 @@ fn copy_tree_windows(src: &Path, dst: &Path, complete: bool) -> Result<()> {
             reject_reparse_point(&source, "tree entry")?;
             let metadata = fs::symlink_metadata(&source)?;
             if metadata.file_type().is_symlink() {
-                return Err(anyhow!("symlink tree entry rejected: {}", child_rel.display()));
+                return Err(anyhow!(
+                    "symlink tree entry rejected: {}",
+                    child_rel.display()
+                ));
             }
             let destination = dst.join(&child_rel);
             if metadata.is_dir() {
@@ -1715,53 +1837,55 @@ pub(crate) fn copy_complete_tree(src: &Path, dst: &Path) -> Result<()> {
     }
     #[cfg(not(windows))]
     {
-    reject_reparse_point(src, "delete snapshot source")?;
-    let root = open_directory_file_bound(src)?;
-    assert_no_symlink_path(dst, Path::new("."))?;
-    fs::create_dir_all(dst)?;
-    #[cfg(unix)]
-    fn walk(dir: &fs::File, rel: &Path, dst: &Path) -> Result<()> {
-        use std::{ffi::CString, os::fd::AsRawFd};
-        let mut ns = fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?
-            .map(|e| e.map(|x| x.file_name()))
-            .collect::<std::io::Result<Vec<_>>>()?;
-        ns.sort();
-        for n in ns {
-            let r = rel.join(&n);
-            if !safe(&r) {
-                return Err(anyhow!("unsafe delete snapshot path: {}", r.display()));
+        reject_reparse_point(src, "delete snapshot source")?;
+        let root = open_directory_file_bound(src)?;
+        let dst = canonicalize_path_with_missing(dst)?;
+        assert_no_symlink_path(&dst, Path::new("."))?;
+        fs::create_dir_all(&dst)?;
+        #[cfg(unix)]
+        fn walk(dir: &fs::File, rel: &Path, dst: &Path) -> Result<()> {
+            use std::{ffi::CString, os::fd::AsRawFd};
+            let mut ns = read_directory_entries(dir.as_raw_fd())?;
+            ns.sort();
+            for n in ns {
+                let r = rel.join(&n);
+                if !safe(&r) {
+                    return Err(anyhow!("unsafe delete snapshot path: {}", r.display()));
+                }
+                let c = CString::new(n.as_encoded_bytes())?;
+                let ch = open_entry_checked(dir.as_raw_fd(), &c, &r)?;
+                let m = ch.metadata()?;
+                if m.is_dir() {
+                    fs::create_dir_all(dst.join(&r))?;
+                    walk(&ch, &r, dst)?;
+                    fs::set_permissions(
+                        dst.join(&r),
+                        fs::Permissions::from_mode(metadata_mode(&m)),
+                    )?
+                } else if m.is_file() {
+                    let mut b = Vec::new();
+                    (&ch).read_to_end(&mut b)?;
+                    write_relative_file(dst, &r, &b, metadata_mode(&m))?
+                } else {
+                    return Err(anyhow!(
+                        "unsupported delete snapshot entry: {}",
+                        r.display()
+                    ));
+                }
             }
-            let c = CString::new(n.as_encoded_bytes())?;
-            let ch = open_entry_checked(dir.as_raw_fd(), &c, &r)?;
-            let m = ch.metadata()?;
-            if m.is_dir() {
-                fs::create_dir_all(dst.join(&r))?;
-                walk(&ch, &r, dst)?;
-                fs::set_permissions(dst.join(&r), fs::Permissions::from_mode(metadata_mode(&m)))?
-            } else if m.is_file() {
-                let mut b = Vec::new();
-                (&ch).read_to_end(&mut b)?;
-                write_relative_file(dst, &r, &b, metadata_mode(&m))?
-            } else {
-                return Err(anyhow!(
-                    "unsupported delete snapshot entry: {}",
-                    r.display()
-                ));
-            }
+            Ok(())
         }
-        Ok(())
-    }
-    #[cfg(unix)]
-    {
-        walk(&root, Path::new(""), dst)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (root, src, dst);
-        Err(anyhow!(
-            "safe descriptor-relative copy unavailable on this platform"
-        ))
-    }
+        #[cfg(unix)]
+        {
+            walk(&root, Path::new(""), &dst)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (root, src, dst);
+            Err(anyhow!(
+                "safe descriptor-relative copy unavailable on this platform"
+            ))
+        }
     }
 }
 pub(crate) fn copy_existing_tree(src: &Path, dst: &Path) -> Result<()> {
@@ -1771,52 +1895,51 @@ pub(crate) fn copy_existing_tree(src: &Path, dst: &Path) -> Result<()> {
     }
     #[cfg(not(windows))]
     {
-    reject_reparse_point(src, "destination tree root")?;
-    let root = open_directory_file_bound(src)?;
-    assert_no_symlink_path(dst, Path::new("."))?;
-    fs::create_dir_all(dst)?;
-    #[cfg(unix)]
-    fn walk(dir: &fs::File, rel: &Path, dst: &Path) -> Result<()> {
-        use std::{ffi::CString, os::fd::AsRawFd};
-        let mut ns = fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?
-            .map(|e| e.map(|x| x.file_name()))
-            .collect::<std::io::Result<Vec<_>>>()?;
-        ns.sort();
-        for n in ns {
-            let r = rel.join(&n);
-            if operational(&r)
-                && r.components()
-                    .any(|c| matches!(c,Component::Normal(x) if x==".git"))
-            {
-                continue;
+        reject_reparse_point(src, "destination tree root")?;
+        let root = open_directory_file_bound(src)?;
+        let dst = canonicalize_path_with_missing(dst)?;
+        assert_no_symlink_path(&dst, Path::new("."))?;
+        fs::create_dir_all(&dst)?;
+        #[cfg(unix)]
+        fn walk(dir: &fs::File, rel: &Path, dst: &Path) -> Result<()> {
+            use std::{ffi::CString, os::fd::AsRawFd};
+            let mut ns = read_directory_entries(dir.as_raw_fd())?;
+            ns.sort();
+            for n in ns {
+                let r = rel.join(&n);
+                if operational(&r)
+                    && r.components()
+                        .any(|c| matches!(c,Component::Normal(x) if x==".git"))
+                {
+                    continue;
+                }
+                let c = CString::new(n.as_encoded_bytes())?;
+                let ch = open_entry_checked(dir.as_raw_fd(), &c, &r)?;
+                let m = ch.metadata()?;
+                if m.is_dir() {
+                    fs::create_dir_all(dst.join(&r))?;
+                    walk(&ch, &r, dst)?
+                } else if m.is_file() {
+                    let mut b = Vec::new();
+                    (&ch).read_to_end(&mut b)?;
+                    write_relative_file(dst, &r, &b, metadata_mode(&m))?
+                } else {
+                    return Err(anyhow!("unsupported tree entry: {}", r.display()));
+                }
             }
-            let c = CString::new(n.as_encoded_bytes())?;
-            let ch = open_entry_checked(dir.as_raw_fd(), &c, &r)?;
-            let m = ch.metadata()?;
-            if m.is_dir() {
-                fs::create_dir_all(dst.join(&r))?;
-                walk(&ch, &r, dst)?
-            } else if m.is_file() {
-                let mut b = Vec::new();
-                (&ch).read_to_end(&mut b)?;
-                write_relative_file(dst, &r, &b, metadata_mode(&m))?
-            } else {
-                return Err(anyhow!("unsupported tree entry: {}", r.display()));
-            }
+            Ok(())
         }
-        Ok(())
-    }
-    #[cfg(unix)]
-    {
-        walk(&root, Path::new(""), dst)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (root, src, dst);
-        Err(anyhow!(
-            "safe descriptor-relative copy unavailable on this platform"
-        ))
-    }
+        #[cfg(unix)]
+        {
+            walk(&root, Path::new(""), &dst)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (root, src, dst);
+            Err(anyhow!(
+                "safe descriptor-relative copy unavailable on this platform"
+            ))
+        }
     }
 }
 #[allow(dead_code)]
@@ -1890,7 +2013,47 @@ pub(crate) fn install_dir_noreplace(src: &Path, dst: &Path) -> Result<()> {
     result
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+pub(crate) fn install_dir_noreplace(src: &Path, dst: &Path) -> Result<()> {
+    use std::{
+        ffi::CString,
+        os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    };
+
+    let source_parent = open_directory_file_bound(
+        src.parent()
+            .ok_or_else(|| anyhow!("source has no parent"))?,
+    )?;
+    let destination_parent = open_directory_file_bound(
+        dst.parent()
+            .ok_or_else(|| anyhow!("destination has no parent"))?,
+    )?;
+    let source = CString::new(
+        src.file_name()
+            .ok_or_else(|| anyhow!("source has no name"))?
+            .as_bytes(),
+    )?;
+    let destination = CString::new(
+        dst.file_name()
+            .ok_or_else(|| anyhow!("destination has no name"))?
+            .as_bytes(),
+    )?;
+    let status = unsafe {
+        renameatx_np(
+            source_parent.as_raw_fd(),
+            source.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if status < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub(crate) fn install_dir_noreplace(_src: &Path, _dst: &Path) -> Result<()> {
     Err(anyhow!(
         "safe no-replace directory installation is unavailable on this Unix platform"
@@ -1999,19 +2162,66 @@ fn rename_staged_dir_at(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn rename_exchange(
+    from_parent: std::os::fd::RawFd,
+    from: &std::ffi::CStr,
+    to_parent: std::os::fd::RawFd,
+    to: &std::ffi::CStr,
+) -> Result<()> {
+    let status = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            from_parent,
+            from.as_ptr(),
+            to_parent,
+            to.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if status < 0 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_exchange(
+    from_parent: std::os::fd::RawFd,
+    from: &std::ffi::CStr,
+    to_parent: std::os::fd::RawFd,
+    to: &std::ffi::CStr,
+) -> Result<()> {
+    let status = unsafe {
+        renameatx_np(
+            from_parent,
+            from.as_ptr(),
+            to_parent,
+            to.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
+    if status < 0 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) struct Replacement {
     committed: bool,
     #[cfg(unix)]
     installed_identity: Option<(u64, u64)>,
     #[cfg(unix)]
     backup_identity: Option<(u64, u64)>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     installed_parent: Option<fs::File>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     installed_name: Option<std::ffi::OsString>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     backup_parent: Option<fs::File>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     backup_name: Option<std::ffi::OsString>,
     #[cfg(windows)]
     installed_path: Option<PathBuf>,
@@ -2043,7 +2253,7 @@ impl Replacement {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn remove_owned_dir(
     parent: &fs::File,
     name: &std::ffi::OsStr,
@@ -2076,9 +2286,7 @@ fn remove_owned_dir(
 
     fn empty(dir: &fs::File) -> Result<()> {
         use std::os::fd::AsRawFd;
-        for entry in fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
-            let entry = entry?;
-            let name = entry.file_name();
+        for name in read_directory_entries(dir.as_raw_fd())? {
             let c = CString::new(name.as_encoded_bytes())?;
             let child_fd = unsafe {
                 libc::openat(
@@ -2231,7 +2439,7 @@ impl Drop for Replacement {
         if self.committed {
             return;
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         if let (Some(parent), Some(live_name), Some(backup_name)) =
             (&self.backup_parent, &self.installed_name, &self.backup_name)
         {
@@ -2281,22 +2489,12 @@ impl Drop for Replacement {
             if !identities_match {
                 return;
             }
-            let status = unsafe {
-                libc::syscall(
-                    libc::SYS_renameat2,
-                    parent.as_raw_fd(),
-                    live.as_ptr(),
-                    parent.as_raw_fd(),
-                    backup.as_ptr(),
-                    libc::RENAME_EXCHANGE,
-                )
-            };
-            if status < 0 {
+            if rename_exchange(parent.as_raw_fd(), &live, parent.as_raw_fd(), &backup).is_err() {
                 return;
             }
             return;
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         if self.backup_name.is_none() {
             if let (Some(parent), Some(name)) = (&self.installed_parent, &self.installed_name) {
                 let _ = remove_owned_dir(parent, name, self.installed_identity);
@@ -2318,10 +2516,7 @@ impl Drop for Replacement {
                 let Some(parent) = installed.parent() else {
                     return;
                 };
-                let temporary = parent.join(format!(
-                    ".skillsync-rollback-{}",
-                    unique_stamp()
-                ));
+                let temporary = parent.join(format!(".skillsync-rollback-{}", unique_stamp()));
                 if install_dir_noreplace(installed, &temporary).is_err() {
                     return;
                 }
@@ -2392,19 +2587,19 @@ pub(crate) fn replace_dir_bound(
             installed_identity: Some(installed_identity),
             #[cfg(unix)]
             backup_identity: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             installed_parent: Some(destination_parent.try_clone()?),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             installed_name: Some(destination_name.clone()),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             backup_parent: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             backup_name: None,
         };
         verify_bound_parent(dst, destination_parent)?;
         return Ok(replacement);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use std::os::fd::AsRawFd;
         let dp = destination_parent.try_clone()?;
@@ -2421,18 +2616,8 @@ pub(crate) fn replace_dir_bound(
                 .ok_or_else(|| anyhow!("source has no name"))?
                 .as_bytes(),
         )?;
-        let status = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                dp_fd,
-                dn.as_ptr(),
-                sp_fd,
-                sn.as_ptr(),
-                libc::RENAME_EXCHANGE,
-            )
-        };
-        let result = if status < 0 {
-            Err(std::io::Error::last_os_error().into())
+        let result = if let Err(error) = rename_exchange(dp_fd, &dn, sp_fd, &sn) {
+            Err(error)
         } else {
             let backup_name = format!(".skillsync-replaced-{}", unique_stamp());
             let backup = dst.parent().unwrap().join(&backup_name);
@@ -2440,17 +2625,7 @@ pub(crate) fn replace_dir_bound(
             let moved = unsafe { libc::renameat(sp_fd, sn.as_ptr(), dp_fd, backup_c.as_ptr()) };
             if moved < 0 {
                 let backup_error = std::io::Error::last_os_error();
-                let restored = unsafe {
-                    libc::syscall(
-                        libc::SYS_renameat2,
-                        dp_fd,
-                        dn.as_ptr(),
-                        sp_fd,
-                        sn.as_ptr(),
-                        libc::RENAME_EXCHANGE,
-                    )
-                };
-                if restored < 0 {
+                if rename_exchange(dp_fd, &dn, sp_fd, &sn).is_err() {
                     // The exchange left the old object at `src`.  It must not
                     // remain owned solely by a caller's TempDir.  First move
                     // it to a durable sibling; copying is the last resort and
@@ -2493,11 +2668,12 @@ pub(crate) fn replace_dir_bound(
                 installed_identity: Some(installed_identity),
                 #[cfg(unix)]
                 backup_identity: Some(backup_identity),
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 installed_parent: Some(dp.try_clone()?),
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 installed_name: Some(destination_name.clone()),
                 backup_parent: Some(dp.try_clone()?),
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 backup_name: Some(backup_name.into()),
             };
             verify_bound_parent(dst, destination_parent)?;
@@ -2505,7 +2681,7 @@ pub(crate) fn replace_dir_bound(
         };
         result
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     {
         let _ = src;
         Err(anyhow!(
