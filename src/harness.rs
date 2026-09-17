@@ -321,6 +321,83 @@ fn persisted_harness_root(root: &Path) -> Result<PathBuf> {
     }
 }
 
+pub(crate) fn inventory_harness_health(
+    state: &State,
+    _library: &Path,
+) -> Result<Vec<serde_json::Value>> {
+    let mut result = Vec::new();
+    for (key, record) in &state.harness_sets {
+        let root = Path::new(&record.harness_root);
+        let (status, message) = if !root.exists() {
+            (
+                "missing_root",
+                Some("harness root is unavailable; relationship is degraded".to_owned()),
+            )
+        } else if !root.is_dir() {
+            (
+                "unreadable",
+                Some("harness root is not a directory".to_owned()),
+            )
+        } else {
+            let mut status = "healthy";
+            let mut message = None;
+            for member in &record.members {
+                let Ok(skill) = set_member_name(member) else {
+                    status = "unreadable";
+                    message = Some("invalid set member".into());
+                    break;
+                };
+                let link_key = harness_key(&skill, root);
+                let Some(link) = state.harness_links.get(&link_key) else {
+                    status = "missing";
+                    message = Some("recorded harness member link is missing".into());
+                    break;
+                };
+                if link.status != "linked" {
+                    status = "unreadable";
+                    message = Some("recorded harness member link is invalid".into());
+                    break;
+                }
+                let path = Path::new(&link.link_path);
+                match fs::symlink_metadata(path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        status = "missing";
+                        message = Some("recorded harness member link is missing".into());
+                        break;
+                    }
+                    Err(error) => {
+                        status = "unreadable";
+                        message = Some(error.to_string());
+                        break;
+                    }
+                    Ok(metadata) if !metadata.file_type().is_symlink() => {
+                        status = "collision";
+                        message = Some("recorded harness path is not a symlink".into());
+                        break;
+                    }
+                    Ok(_) => match resolve_link_target(path).and_then(|target| {
+                        link_targets_match(&target, Path::new(&link.canonical_path))
+                    }) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            status = "wrong_target";
+                            message = Some("link target does not match".into());
+                            break;
+                        }
+                        Err(error) => {
+                            status = "unreadable";
+                            message = Some(error.to_string());
+                            break;
+                        }
+                    },
+                }
+            }
+            (status, message)
+        };
+        result.push(serde_json::json!({"relationship": key, "set": record.set, "harness_root": record.harness_root, "status": status, "message": message}));
+    }
+    Ok(result)
+}
 pub(crate) fn list(a: &App) -> Result<serde_json::Value> {
     Ok(serde_json::json!({"links": a.state.harness_links}))
 }

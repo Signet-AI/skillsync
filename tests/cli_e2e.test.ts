@@ -87,6 +87,65 @@ function countPublications(status: any): number {
   return Object.keys(status.publications ?? {}).length;
 }
 
+test("inventory discovers an effective library before initialization without mutation", async () => {
+  const fixture = await makeFixture();
+  await put(join(fixture.library, "SKILL.md"), "name: root\n");
+  await put(join(fixture.library, "references/child/SKILL.md"), "name: child\n");
+  const before = await readdir(fixture.library, { recursive: true });
+  const result = skillsync(fixture, ["--json", "inventory"]).json;
+  expect(result.library).toBe(fixture.library);
+  expect(result.packages.map((item: any) => [item.name, item.path])).toEqual([
+    ["root", "."],
+    ["child", "references/child"],
+  ]);
+  expect(await readdir(fixture.library, { recursive: true })).toEqual(before);
+  expect(await Bun.file(join(fixture.config, "config.toml")).exists()).toBe(false);
+  expect(await Bun.file(join(fixture.config, "state.json")).exists()).toBe(false);
+  expect(await Bun.file(join(fixture.config, "state.lock")).exists()).toBe(false);
+});
+
+test("inventory is deterministic for root and nested packages without mutation", async () => {
+  const fixture = await makeFixture();
+  await put(join(fixture.library, "SKILL.md"), "name: root\n");
+  await put(join(fixture.library, "references/child/SKILL.md"), "name: child\n");
+  skillsync(fixture, ["--json", "init"]);
+  const statePath = join(fixture.config, "state.json");
+  const lockPath = join(fixture.config, "state.lock");
+  const beforeState = await stat(statePath);
+  const beforeLock = await stat(lockPath);
+  const first = skillsync(fixture, ["--json", "inventory"]).json;
+  const second = skillsync(fixture, ["--json", "inventory"]).json;
+  expect(first).toEqual(second);
+  expect(first.packages.map((item: any) => [item.name, item.path])).toEqual([
+    ["root", "."],
+    ["child", "references/child"],
+  ]);
+  expect(first.packages[0].sources[0].kind).toBe("local");
+  expect(first.capabilities.hermes_autonomous_curation).toBe("unsupported");
+  expect((await stat(statePath)).mtimeMs).toBe(beforeState.mtimeMs);
+  expect((await stat(lockPath)).mtimeMs).toBe(beforeLock.mtimeMs);
+});
+
+test("inventory attributes publication only to the canonical same-named package", async () => {
+  const fixture = await makeFixture();
+  const destination = join(fixture.root, "publication-destination.git");
+  await put(join(fixture.library, "canonical/SKILL.md"), `name: canonical
+canonical
+`);
+  await put(join(fixture.library, "nested/canonical/SKILL.md"), `name: canonical
+nested
+`);
+  checked(run("git", ["init", "--bare", destination], undefined, fixture.env), "init publication destination");
+  skillsync(fixture, ["--json", "init"]);
+  skillsync(fixture, ["--json", "publish", "canonical", "--repo", destination, "--yes"]);
+
+  const inventory = skillsync(fixture, ["--json", "inventory"]).json;
+  const packages = inventory.packages.filter((item: any) => item.name === "canonical");
+  expect(packages.map((item: any) => item.path)).toEqual(["canonical", "nested/canonical"]);
+  expect(packages[0].relationship.publications).toHaveLength(1);
+  expect(packages[1].relationship.publications).toEqual([]);
+});
+
 test("does not replace a destination that appears after the absence check", async () => {
   if (process.platform !== "linux") return;
   const fixture = await makeFixture();

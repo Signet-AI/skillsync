@@ -12,7 +12,7 @@ skillsync subscribe REPOSITORY [--skill NAME]
 # Without --skill, a TTY offers a line-oriented single-select picker.
 # With neither argument, the TTY asks for the repository first.
 skillsync import --from PATH --skill NAME
-skillsync update | sync | status | diff | doctor
+skillsync update | sync | status | inventory | diff | doctor
 skillsync worker --once
 skillsync worker --interval 300
 skillsync publish NAME --repo REPOSITORY --yes   # --dry-run previews

@@ -21,6 +21,7 @@ mod config_editor;
 mod conflicts;
 mod filesystem;
 mod harness;
+mod inventory;
 mod recovery;
 mod repository;
 
@@ -82,6 +83,7 @@ enum Cmd {
         interval: u64,
     },
     Status,
+    Inventory,
     Diff,
     Doctor,
     Unsubscribe {
@@ -757,6 +759,7 @@ fn requires_lock(command: &Cmd) -> bool {
             command: ConfigCmd::Path,
         }
         | Cmd::Status
+        | Cmd::Inventory
         | Cmd::Diff
         | Cmd::Doctor
         | Cmd::Harness {
@@ -894,7 +897,8 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             command: ConflictCmd::List
         }
     );
-    let needs_lock = requires_lock(&command) && !conflicts_read_lock;
+    let inventory_read = matches!(command, Cmd::Inventory);
+    let needs_lock = requires_lock(&command) && !conflicts_read_lock && !inventory_read;
     let _state_lock = if needs_lock {
         Some(StateLock::acquire(&config_dir())?)
     } else {
@@ -905,17 +909,28 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
     } else {
         None
     };
+    let inventory_read_lock = if inventory_read {
+        StateLock::acquire_read_only_if_present(&config_dir())?
+    } else {
+        None
+    };
     if let Some(lock) = &conflicts_read_lock {
         lock.verify_config_identity(&config_dir())?;
     }
-    let operation_lock = _state_lock.as_ref().or(conflicts_read_lock.as_ref());
+    if let Some(lock) = &inventory_read_lock {
+        lock.verify_config_identity(&config_dir())?;
+    }
+    let operation_lock = _state_lock
+        .as_ref()
+        .or(conflicts_read_lock.as_ref())
+        .or(inventory_read_lock.as_ref());
     if operation_lock.is_none()
-        && matches!(
+        && (matches!(
             command,
             Cmd::Conflicts {
                 command: ConflictCmd::List
             }
-        )
+        ) || matches!(command, Cmd::Inventory))
     {
         let config_path = config_dir();
         let state_path = config_path.join("state.json");
@@ -925,6 +940,9 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             return Err(anyhow!(
                 "cannot inventory initialized Skillsync state without the shared lock"
             ));
+        }
+        if matches!(command, Cmd::Inventory) {
+            return Ok(serde_json::to_value(inventory::query_uninitialized()?)?);
         }
         if matches!(
             command,
@@ -937,6 +955,9 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
     }
     let mut a = App::load(operation_lock)?;
     if let Some(lock) = &conflicts_read_lock {
+        lock.verify_config_identity(&a.config)?;
+    }
+    if let Some(lock) = &inventory_read_lock {
         lock.verify_config_identity(&a.config)?;
     }
     let result: Result<serde_json::Value> = match command {
@@ -1145,6 +1166,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Cmd::Status => Ok(
             serde_json::json!({"subscriptions":a.state.subscriptions,"local_adoptions":a.state.local_adoptions,"publications":a.state.publications,"pending_publications":a.state.pending_publications,"harness_links":a.state.harness_links,"harness_sets":a.state.harness_sets,"harness_health":harness::harness_link_health(&a)?,"worker":worker_status(&a.config)?}),
         ),
+        Cmd::Inventory => Ok(serde_json::to_value(inventory::query(&a)?)?),
         Cmd::Doctor => Ok(
             serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":worker_status(&a.config)?,"startup":"unsupported","subscribe_picker":"supported: TTY line-oriented single-select; unattended onboarding unsupported; full TUI: unsupported","harness_write_back":"explicit_directory_links_only","harness_discovery":"unsupported","harness_filtering":"unsupported","harness_reload":"unsupported","harness_links":harness::harness_link_health(&a)?,"hermes_autonomous_curation":"unsupported","registries":"unsupported","set_publication":"unsupported","set_subscription_metadata":"unsupported","harness_enablement":"supported: explicit one-time set expansion into native directory links","personal_library_sync":"unsupported","membership_change_propagation":"unsupported","local_import":"supported: explicit --from PATH --skill NAME; canonical write-back only; no subscription"}),
         ),
