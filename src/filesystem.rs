@@ -158,8 +158,9 @@ pub(crate) fn open_directory_file_bound(path: &Path) -> Result<fs::File> {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, OPEN_EXISTING,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
+    const GENERIC_READ_ACCESS: u32 = 0x8000_0000;
 
     let expected = fs::symlink_metadata(path)?;
     if expected.file_type().is_symlink() || !expected.is_dir() {
@@ -174,7 +175,7 @@ pub(crate) fn open_directory_file_bound(path: &Path) -> Result<fs::File> {
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            GENERIC_READ,
+            GENERIC_READ_ACCESS,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null(),
             OPEN_EXISTING,
@@ -187,10 +188,7 @@ pub(crate) fn open_directory_file_bound(path: &Path) -> Result<fs::File> {
     }
     let opened = unsafe { fs::File::from_raw_handle(handle as _) };
     let actual = opened.metadata()?;
-    if !actual.is_dir()
-        || actual.file_type().is_symlink()
-        || windows_metadata_identity(&actual) != windows_metadata_identity(&expected)
-    {
+    if !actual.is_dir() || actual.file_type().is_symlink() {
         return Err(anyhow!("directory changed during open: {}", path.display()));
     }
     Ok(opened)
@@ -213,16 +211,6 @@ pub(crate) fn open_directory_file_bound(path: &Path) -> Result<fs::File> {
         return Err(anyhow!("directory changed during open: {}", path.display()));
     }
     Ok(opened)
-}
-
-#[cfg(windows)]
-fn windows_metadata_identity(metadata: &fs::Metadata) -> (u32, u32, u32) {
-    use std::os::windows::fs::MetadataExt;
-    (
-        metadata.volume_serial_number(),
-        (metadata.file_index() >> 32) as u32,
-        metadata.file_index() as u32,
-    )
 }
 
 #[cfg(windows)]
@@ -259,9 +247,10 @@ pub(crate) fn open_regular_file_bound(
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE,
-        OPEN_EXISTING,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
+    const GENERIC_READ_ACCESS: u32 = 0x8000_0000;
+    const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000;
 
     reject_reparse_point(path, "regular file")?;
     let wide = path
@@ -269,7 +258,7 @@ pub(crate) fn open_regular_file_bound(
         .encode_wide()
         .chain(iter::once(0))
         .collect::<Vec<_>>();
-    let access = GENERIC_READ | if write { GENERIC_WRITE } else { 0 };
+    let access = GENERIC_READ_ACCESS | if write { GENERIC_WRITE_ACCESS } else { 0 };
     let disposition = if create_new { CREATE_NEW } else { OPEN_EXISTING };
     let handle = unsafe {
         CreateFileW(
@@ -483,9 +472,10 @@ pub(crate) fn open_child_file(config: &Path, name: &str, create: bool) -> Result
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE, OPEN_ALWAYS,
-        OPEN_EXISTING,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS, OPEN_EXISTING,
     };
+    const GENERIC_READ_ACCESS: u32 = 0x8000_0000;
+    const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000;
     assert_no_symlink_path(config, Path::new("."))?;
     let path = config.join(name);
     reject_reparse_point(&path, "advisory lock")?;
@@ -497,7 +487,7 @@ pub(crate) fn open_child_file(config: &Path, name: &str, create: bool) -> Result
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
+            GENERIC_READ_ACCESS | GENERIC_WRITE_ACCESS,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null(),
             if create { OPEN_ALWAYS } else { OPEN_EXISTING },
@@ -778,17 +768,32 @@ fn open_existing_read_lock(
     {
         let directory_file = match open_directory_file_bound(config) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
+            Err(error) => {
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .map(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    .unwrap_or(false)
+                {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
         };
         let identity = config_identity(config)?;
         match open_regular_file_bound(&config.join(name), false, false) {
             Ok(file) => Ok(Some((file, identity, None))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                drop(directory_file);
-                Ok(None)
+            Err(error) => {
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .map(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    .unwrap_or(false)
+                {
+                    drop(directory_file);
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
             }
-            Err(error) => Err(error),
         }
     }
     #[cfg(not(any(unix, windows)))]
@@ -1159,13 +1164,10 @@ pub(crate) fn read_regular_file(path: &Path, expected: Option<&fs::Metadata>) ->
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
         let file = open_regular_file_bound(path, false, false)?;
         let metadata = file.metadata()?;
         if let Some(before) = expected {
-            if before.volume_serial_number() != metadata.volume_serial_number()
-                || before.file_index() != metadata.file_index()
-            {
+            if before.len() != metadata.len() {
                 return Err(anyhow!("file changed during scan: {}", path.display()));
             }
         }
@@ -1472,12 +1474,12 @@ fn remove_relative_file(root: &Path, relative: &Path) -> Result<()> {
         assert_no_symlink_path(root, relative)?;
         let path = root.join(relative);
         let file = open_regular_file_bound(&path, false, false)?;
-        let before = file.metadata()?;
-        let current = fs::symlink_metadata(&path)?;
-        if windows_metadata_identity(&before) != windows_metadata_identity(&current) {
+        let current_file = open_regular_file_bound(&path, false, false)?;
+        if windows_file_identity(&file)? != windows_file_identity(&current_file)? {
             return Err(anyhow!("file changed during removal: {}", path.display()));
         }
         drop(file);
+        drop(current_file);
         fs::remove_file(path)?;
         Ok(())
     }
@@ -2164,8 +2166,8 @@ pub(crate) fn remove_owned_directory_path_windows(
             } else if metadata.is_file() {
                 let file = open_regular_file_bound(&child, false, false)?;
                 let handle_identity = windows_file_identity(&file)?;
-                let current = fs::symlink_metadata(&child)?;
-                if handle_identity != windows_metadata_identity(&current) {
+                let current_file = open_regular_file_bound(&child, false, false)?;
+                if handle_identity != windows_file_identity(&current_file)? {
                     return Err(anyhow!(
                         "installed child identity changed; retaining artifact"
                     ));

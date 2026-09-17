@@ -41,13 +41,7 @@ fn same_object(a: &fs::Metadata, b: &fs::Metadata) -> bool {
         use std::os::unix::fs::MetadataExt;
         a.dev() == b.dev() && a.ino() == b.ino()
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        a.volume_serial_number() == b.volume_serial_number()
-            && a.file_index() == b.file_index()
-    }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         a.len() == b.len() && a.modified().ok() == b.modified().ok()
     }
@@ -169,7 +163,7 @@ pub(crate) fn edit_config(a: &super::App, json: bool) -> Result<serde_json::Valu
     super::assert_no_symlink_path(&a.config, Path::new("."))?;
     let config_identity = fs::metadata(&a.config)?;
     #[cfg(windows)]
-    let config_directory_identity = super::windows_path_identity(&a.config)?;
+    let config_directory_identity = super::filesystem::windows_path_identity(&a.config)?;
     #[cfg(unix)]
     let directory = {
         use std::os::fd::FromRawFd;
@@ -285,7 +279,7 @@ pub(crate) fn edit_config(a: &super::App, json: bool) -> Result<serde_json::Valu
         }
         #[cfg(windows)]
         {
-            if super::windows_path_identity(&a.config)? != config_directory_identity {
+            if super::filesystem::windows_path_identity(&a.config)? != config_directory_identity {
                 return Err(anyhow!(
                     "config directory changed while it was being edited"
                 ));
@@ -295,7 +289,7 @@ pub(crate) fn edit_config(a: &super::App, json: bool) -> Result<serde_json::Valu
                     &path,
                     &(original_metadata.clone(), original_bytes.clone()),
                 )?;
-                let mut target = super::open_regular_file_bound(&path, true, false)?;
+                let mut target = super::filesystem::open_regular_file_bound(&path, true, false)?;
                 let mut current = Vec::new();
                 target.read_to_end(&mut current)?;
                 if current != *original_bytes {
@@ -328,7 +322,7 @@ pub(crate) fn edit_config(a: &super::App, json: bool) -> Result<serde_json::Valu
                 verify_original_unchanged(&path, &(original_metadata.clone(), edited.clone()))
                     .map_err(|error| anyhow!("config publication target changed: {error}"))?;
             } else {
-                let mut target = super::open_regular_file_bound(&path, true, true)?;
+                let mut target = super::filesystem::open_regular_file_bound(&path, true, true)?;
                 let publication = (|| -> Result<()> {
                     target.write_all(&edited)?;
                     target.sync_all()?;
