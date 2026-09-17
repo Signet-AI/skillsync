@@ -22,7 +22,9 @@ skillsync delete NAME --yes
 skillsync restore --from /ABSOLUTE/CONFIG/recovery/delete-NAME-STAMP [--skill NAME]
 skillsync conflicts list
 skillsync conflicts show RELATIONSHIP
-# Manual side selection/resume and isolated workspace editing are deferred.
+skillsync conflicts resolve RELATIONSHIP --local|--incoming
+skillsync conflicts resume RELATIONSHIP
+# Resolution is explicit side selection; semantic/workspace editing remains deferred.
 skillsync set create NAME | list | show NAME | add NAME SKILL | remove NAME SKILL
 skillsync harness link --root PATH --skill NAME
 skillsync harness unlink --root PATH --skill NAME

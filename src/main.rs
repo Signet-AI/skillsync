@@ -122,7 +122,19 @@ enum Cmd {
 #[derive(Subcommand)]
 enum ConflictCmd {
     List,
-    Show { relationship: String },
+    Show {
+        relationship: String,
+    },
+    Resolve {
+        relationship: String,
+        #[arg(long, conflicts_with = "incoming", required = true)]
+        local: bool,
+        #[arg(long, conflicts_with = "local", required = true)]
+        incoming: bool,
+    },
+    Resume {
+        relationship: String,
+    },
 }
 #[derive(Subcommand)]
 enum HarnessCmd {
@@ -225,6 +237,8 @@ struct Subscription {
     local_path: String,
     status: String,
     recovery_path: Option<String>,
+    #[serde(default)]
+    conflict_selection: Option<String>,
     last_sync: u64,
     update_count: u64,
 }
@@ -392,6 +406,14 @@ impl App {
             state.version = 4;
         }
         if state.version < 5 {
+            for subscription in state.subscriptions.values_mut() {
+                if subscription.baseline_source.is_empty() {
+                    subscription.baseline_source = subscription.source.clone();
+                }
+                if subscription.baseline_source_path.is_empty() {
+                    subscription.baseline_source_path = subscription.source_path.clone();
+                }
+            }
             state.version = 5;
         }
         validate_set_state(&state)?;
@@ -1075,6 +1097,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                     local_path: dst.display().to_string(),
                     status: "synced".into(),
                     recovery_path: None,
+                    conflict_selection: None,
                     last_sync: now(),
                     update_count: 0,
                 },
@@ -1102,6 +1125,17 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Cmd::Conflicts {
             command: ConflictCmd::List,
         } => conflicts::list(&a),
+        Cmd::Conflicts {
+            command:
+                ConflictCmd::Resolve {
+                    relationship,
+                    local,
+                    incoming,
+                },
+        } => conflicts::resolve(&mut a, &relationship, local, incoming),
+        Cmd::Conflicts {
+            command: ConflictCmd::Resume { relationship },
+        } => conflicts::resume(&mut a, &relationship),
         Cmd::Update | Cmd::Sync => sync_all(&mut a, false),
         Cmd::Worker { once, interval } => run_worker_locked(&mut a, once, interval),
         Cmd::Harness { command } => match command {
