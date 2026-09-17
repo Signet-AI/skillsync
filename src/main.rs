@@ -18,6 +18,7 @@ use std::{
 };
 
 mod config_editor;
+mod conflicts;
 mod filesystem;
 mod harness;
 mod recovery;
@@ -26,15 +27,13 @@ mod repository;
 use filesystem::{
     assert_no_symlink_path, atomic, checked_regular_path, copy_tree, discover,
     effective_library_path, files, hash_dir, manifest_name, open_advisory_lock, read_regular_file,
-    replace_dir, resolve_library_path, safe, snapshot, source_rel, strict_component,
-    validate_state_path, FileData, StateLock, WorkerLease,
+    replace_dir_bound, resolve_library_path, safe, snapshot_transaction, source_rel,
+    strict_component, validate_state_path, FileData, StateLock, WorkerLease,
 };
 #[cfg(unix)]
 use filesystem::{open_child_file, open_directory_fd};
 
-pub(crate) use recovery::{
-    delete_skill, directory_identity, import_local, remove_owned_directory, restore_skill,
-};
+pub(crate) use recovery::{delete_skill, import_local, restore_skill};
 
 #[derive(Parser)]
 #[command(name = "skillsync", version)]
@@ -104,6 +103,10 @@ enum Cmd {
         #[arg(long)]
         skill: Option<String>,
     },
+    Conflicts {
+        #[command(subcommand)]
+        command: ConflictCmd,
+    },
     Set {
         #[command(subcommand)]
         command: SetCmd,
@@ -112,6 +115,10 @@ enum Cmd {
         #[command(subcommand)]
         command: HarnessCmd,
     },
+}
+#[derive(Subcommand)]
+enum ConflictCmd {
+    List,
 }
 #[derive(Subcommand)]
 enum HarnessCmd {
@@ -239,6 +246,8 @@ struct App {
     baselines: PathBuf,
     recovery: PathBuf,
     state: State,
+    #[cfg(unix)]
+    config_directory: fs::File,
 }
 
 static WORKER_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -293,15 +302,40 @@ fn config_dir() -> PathBuf {
     }
 }
 impl App {
-    fn load() -> Result<Self> {
+    fn load(anchor: Option<&StateLock>) -> Result<Self> {
         let c = config_dir();
+        if let Some(anchor) = anchor {
+            // The lock is anchored to the directory inode, not merely its
+            // pathname. Refuse to consume config/state through a replacement
+            // pathname before and after every load phase.
+            anchor.verify_config_identity(&c)?;
+        }
+        #[cfg(unix)]
+        if anchor.is_none() {
+            assert_no_symlink_path(&c, Path::new("."))?;
+        }
+        #[cfg(not(unix))]
         assert_no_symlink_path(&c, Path::new("."))?;
         let sp = c.join("state.json");
         let cfg_path = c.join("config.toml");
+        #[cfg(unix)]
+        let config_directory = match anchor {
+            Some(lock) => lock.directory_try_clone()?,
+            None => filesystem::open_directory_file(&c)?,
+        };
         let config_exists = checked_regular_path(&cfg_path, "config")?;
         let file_cfg = if config_exists {
-            let contents = String::from_utf8(read_regular_file(&cfg_path, None)?)
-                .context("config.toml is not valid UTF-8")?;
+            let contents = String::from_utf8({
+                #[cfg(unix)]
+                {
+                    filesystem::read_relative_file(&config_directory, "config.toml")?
+                }
+                #[cfg(not(unix))]
+                {
+                    read_regular_file(&cfg_path, None)?
+                }
+            })
+            .context("config.toml is not valid UTF-8")?;
             toml::from_str::<FileConfig>(&contents).context("invalid config.toml")?
         } else {
             FileConfig::default()
@@ -310,7 +344,16 @@ impl App {
         let expected_library = resolve_library_path(&requested_library)?;
         let state_exists = checked_regular_path(&sp, "state")?;
         let mut state: State = if state_exists {
-            serde_json::from_slice(&read_regular_file(&sp, None)?)?
+            serde_json::from_slice(&{
+                #[cfg(unix)]
+                {
+                    filesystem::read_relative_file(&config_directory, "state.json")?
+                }
+                #[cfg(not(unix))]
+                {
+                    read_regular_file(&sp, None)?
+                }
+            })?
         } else {
             State {
                 version: 5,
@@ -368,13 +411,26 @@ impl App {
             baselines,
             recovery,
             state,
+            #[cfg(unix)]
+            config_directory,
         })
     }
     fn save(&self) -> Result<()> {
         if std::env::var("SKILLSYNC_TEST_FAIL_STATE_SAVE").as_deref() == Ok("1") {
             return Err(anyhow!("injected state-save failure (test-only)"));
         }
-        atomic(&self.state_path, &serde_json::to_vec_pretty(&self.state)?)
+        #[cfg(unix)]
+        {
+            filesystem::write_relative_file_fd(
+                &self.config_directory,
+                "state.json",
+                &serde_json::to_vec_pretty(&self.state)?,
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            atomic(&self.state_path, &serde_json::to_vec_pretty(&self.state)?)
+        }
     }
 }
 fn set_member_id(skill: &str) -> Result<String> {
@@ -471,7 +527,7 @@ fn validate_local_adoptions(state: &State, library: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn relationship_key(source: &str, source_path: &str) -> String {
+pub(crate) fn relationship_key(source: &str, source_path: &str) -> String {
     let mut h = Sha256::new();
     h.update(source.as_bytes());
     h.update([0]);
@@ -708,6 +764,9 @@ fn requires_lock(command: &Cmd) -> bool {
         } => false,
         Cmd::Publish { dry_run, .. } => !dry_run,
         Cmd::Restore { .. } => true,
+        Cmd::Conflicts {
+            command: ConflictCmd::List,
+        } => true,
         _ => true,
     }
 }
@@ -807,10 +866,10 @@ fn set_change(
 }
 
 fn run(cli: Cli) -> Result<serde_json::Value> {
-    let mut a = App::load()?;
     let command = match cli.command {
         Some(command) => command,
         None => {
+            let a = App::load(None)?;
             return Ok(serde_json::json!({
                 "status": if a.state_path.exists() { "ready" } else { "setup_required" },
                 "library": a.library,
@@ -829,14 +888,56 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             return Err(anyhow!("repository and --skill are required in noninteractive mode; picker requires interactive stdin and stdout"));
         }
     }
-    let needs_lock = requires_lock(&command);
+    let conflicts_read_lock = matches!(
+        command,
+        Cmd::Conflicts {
+            command: ConflictCmd::List
+        }
+    );
+    let needs_lock = requires_lock(&command) && !conflicts_read_lock;
     let _state_lock = if needs_lock {
-        Some(StateLock::acquire(&a.config)?)
+        Some(StateLock::acquire(&config_dir())?)
     } else {
         None
     };
-    if needs_lock {
-        a = App::load()?;
+    let conflicts_read_lock = if conflicts_read_lock {
+        StateLock::acquire_read_only_if_present(&config_dir())?
+    } else {
+        None
+    };
+    if let Some(lock) = &conflicts_read_lock {
+        lock.verify_config_identity(&config_dir())?;
+    }
+    let operation_lock = _state_lock.as_ref().or(conflicts_read_lock.as_ref());
+    if operation_lock.is_none()
+        && matches!(
+            command,
+            Cmd::Conflicts {
+                command: ConflictCmd::List
+            }
+        )
+    {
+        let config_path = config_dir();
+        let state_path = config_path.join("state.json");
+        let config_exists = config_path.is_dir() && config_path.join("config.toml").is_file();
+        let state_exists = config_path.is_dir() && state_path.is_file();
+        if state_exists || config_exists {
+            return Err(anyhow!(
+                "cannot inventory initialized Skillsync state without the shared lock"
+            ));
+        }
+        if matches!(
+            command,
+            Cmd::Conflicts {
+                command: ConflictCmd::List
+            }
+        ) {
+            return Ok(serde_json::json!({"conflicts": [], "count": 0}));
+        }
+    }
+    let mut a = App::load(operation_lock)?;
+    if let Some(lock) = &conflicts_read_lock {
+        lock.verify_config_identity(&a.config)?;
     }
     let result: Result<serde_json::Value> = match command {
         Cmd::Init { library } => {
@@ -919,14 +1020,12 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             assert_no_symlink_path(&a.library, Path::new("."))?;
             fs::create_dir_all(&a.library)?;
             assert_no_symlink_path(&a.library, Path::new("."))?;
+            let library_parent = filesystem::open_directory_file_bound(&a.library)?;
             let staging_parent = tempfile::tempdir_in(&a.library)?;
             let staged = staging_parent.path().join("package");
             copy_tree(src, &staged)?;
-            let (bp, h) = snapshot(&a, &key, src)?;
-            let baseline_identity = directory_identity(&bp)?;
-            replace_dir(&dst, &staged)?;
-            let installed_identity = directory_identity(&dst)?;
-            let installed_hash = hash_dir(&dst)?;
+            let (bp, h, baseline_replacement) = snapshot_transaction(&a, &key, src)?;
+            let live_replacement = replace_dir_bound(&dst, &staged, &library_parent)?;
             let previous_state = a.state.clone();
             a.state.subscriptions.insert(
                 key.clone(),
@@ -946,30 +1045,13 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             );
             if let Err(error) = a.save() {
                 a.state = previous_state;
-                let mut cleanup_errors = Vec::new();
-                if let Err(cleanup_error) = remove_owned_directory(
-                    &a.library,
-                    &dst,
-                    Some(installed_identity),
-                    &installed_hash,
-                ) {
-                    cleanup_errors.push(cleanup_error.to_string());
-                }
-                if let Err(cleanup_error) =
-                    remove_owned_directory(&a.baselines, &bp, Some(baseline_identity), &h)
-                {
-                    cleanup_errors.push(cleanup_error.to_string());
-                }
-                return if cleanup_errors.is_empty() {
-                    Err(error)
-                        .context("persist subscription state; package and baseline rolled back")
-                } else {
-                    Err(anyhow!(
-                        "persist subscription state failed: {error}; {}",
-                        cleanup_errors.join("; ")
-                    ))
-                };
+                drop(live_replacement);
+                drop(baseline_replacement);
+                return Err(error)
+                    .context("persist subscription state; package and baseline rolled back");
             }
+            live_replacement.commit()?;
+            baseline_replacement.commit()?;
             Ok(serde_json::json!({"skill":name}))
         }
         Cmd::Import { source, skill } => import_local(&mut a, &source, skill.as_deref()),
@@ -978,6 +1060,9 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             recovery_path,
             skill,
         } => restore_skill(&a, &recovery_path, skill.as_deref()),
+        Cmd::Conflicts {
+            command: ConflictCmd::List,
+        } => conflicts::list(&a),
         Cmd::Update | Cmd::Sync => sync_all(&mut a, false),
         Cmd::Worker { once, interval } => run_worker_locked(&mut a, once, interval),
         Cmd::Harness { command } => match command {

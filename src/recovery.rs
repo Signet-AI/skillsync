@@ -4,6 +4,8 @@ use std::{
     path::{Component, Path},
 };
 
+#[cfg(unix)]
+use crate::filesystem::open_entry_checked;
 use crate::filesystem::{
     assert_no_symlink_path, checked_regular_path, copy_complete_tree, copy_tree, discover,
     hash_dir, install_dir_noreplace, manifest_name, reject_reparse_point, strict_component,
@@ -82,6 +84,7 @@ pub(crate) fn directory_identity(path: &Path) -> Result<DirectoryIdentity> {
     }
 }
 
+#[allow(unreachable_code)]
 pub(crate) fn remove_owned_directory(
     root: &Path,
     path: &Path,
@@ -111,7 +114,13 @@ pub(crate) fn remove_owned_directory(
             relative.display()
         ));
     }
-    fs::remove_dir_all(path)?;
+    #[cfg(unix)]
+    remove_owned_directory_at(root, relative, current)?;
+    #[cfg(not(unix))]
+    return Err(anyhow!(
+        "safe descriptor-relative removal unavailable on this platform"
+    ));
+    #[cfg(unix)]
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             return Err(anyhow!(
@@ -127,6 +136,98 @@ pub(crate) fn remove_owned_directory(
         }
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
         Err(_) => {}
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_owned_directory_at(
+    root: &Path,
+    relative: &Path,
+    expected: DirectoryIdentity,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::{
+        ffi::CString,
+        os::fd::{AsRawFd, FromRawFd},
+        os::unix::ffi::OsStrExt,
+    };
+    let parts: Vec<_> = relative.components().collect();
+    let Some(Component::Normal(last)) = parts.last() else {
+        return Err(anyhow!("unsafe cleanup path"));
+    };
+    let mut parent = crate::filesystem::open_directory_file_bound(root)?;
+    for component in &parts[..parts.len() - 1] {
+        let Component::Normal(name) = component else {
+            return Err(anyhow!("unsafe cleanup path"));
+        };
+        let name = CString::new(name.as_bytes())?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        parent = unsafe { fs::File::from_raw_fd(fd) };
+    }
+    let name = CString::new(last.as_bytes())?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let target = unsafe { fs::File::from_raw_fd(fd) };
+    let meta = target.metadata()?;
+    if (meta.dev(), meta.ino()) != expected {
+        return Err(anyhow!(
+            "cleanup ownership changed; recovery required: {}",
+            relative.display()
+        ));
+    }
+    fn recurse(dir: &fs::File) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        for entry in fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
+            let name = entry?.file_name();
+            let c = CString::new(name.as_encoded_bytes())?;
+            let child = open_entry_checked(dir.as_raw_fd(), &c, Path::new("cleanup child"))?;
+            let m = child.metadata()?;
+            let expected = (m.dev(), m.ino());
+            if m.is_dir() {
+                recurse(&child)?;
+            } else if !m.is_file() {
+                return Err(anyhow!("cleanup target contains unsupported entry"));
+            }
+            // unlinkat has no unlink-by-handle form. Re-open immediately before
+            // removal and require the same object; a race retains the artifact.
+            let check = open_entry_checked(dir.as_raw_fd(), &c, Path::new("cleanup child"))?;
+            let check_meta = check.metadata()?;
+            if (check_meta.dev(), check_meta.ino()) != expected
+                || check_meta.is_dir() != m.is_dir()
+                || (!m.is_dir() && !check_meta.is_file())
+            {
+                return Err(anyhow!(
+                    "cleanup child identity changed; retaining artifact"
+                ));
+            }
+            let flags = if m.is_dir() { libc::AT_REMOVEDIR } else { 0 };
+            if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), flags) } < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        Ok(())
+    }
+    recurse(&target)?;
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
     Ok(())
 }

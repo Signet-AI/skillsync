@@ -1,7 +1,7 @@
 use crate::filesystem::{
-    assert_no_symlink_path, copy_existing_tree, copy_tree, discover, files, hash_dir, replace_dir,
-    safe, snapshot, source_rel, strict_component, sync_managed_tree, validate_state_path,
-    write_file_data,
+    assert_no_symlink_path, copy_existing_tree, copy_tree, discover, files, hash_dir,
+    replace_dir_bound, safe, snapshot_transaction, source_rel, strict_component, sync_managed_tree,
+    validate_state_path, write_file_data,
 };
 use crate::publication_key;
 use crate::{
@@ -65,7 +65,7 @@ pub(crate) fn normalize(s: &str) -> Result<String> {
     }
     Err(anyhow!("unsupported repository: {s}"))
 }
-fn validate_branch(branch: &str) -> Result<()> {
+pub(crate) fn validate_branch(branch: &str) -> Result<()> {
     if branch.is_empty()
         || branch.chars().any(|character| character.is_control())
         || branch.contains('\\')
@@ -482,12 +482,20 @@ pub(crate) fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
         a.save()?;
         return Ok(serde_json::json!({"skill":s.skill,"relationship":key,"status":s.status}));
     }
+    let live_parent = crate::filesystem::open_directory_file_bound(
+        local
+            .parent()
+            .ok_or_else(|| anyhow!("subscription path has no parent"))?,
+    )?;
     let stage_parent = local
         .parent()
         .ok_or_else(|| anyhow!("subscription path has no parent"))?;
     fs::create_dir_all(stage_parent)?;
     let stage = tempfile::tempdir_in(stage_parent)?;
     let conflict = merge_tree(&base, &local, &up, stage.path())?;
+    let mut replacement = None;
+    let mut baseline_replacement = None;
+    let previous_state = a.state.clone();
     if conflict {
         assert_no_symlink_path(&a.recovery, Path::new("."))?;
         fs::create_dir_all(&a.recovery)?;
@@ -502,8 +510,9 @@ pub(crate) fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
     } else if hash_dir(&local)? != lh {
         s.status = "changed_during_update".into()
     } else {
-        replace_dir(&local, stage.path())?;
-        let (bp, h) = snapshot(a, key, &up)?;
+        replacement = Some(replace_dir_bound(&local, stage.path(), &live_parent)?);
+        let (bp, h, baseline) = snapshot_transaction(a, key, &up)?;
+        baseline_replacement = Some(baseline);
         s.baseline_path = bp.display().to_string();
         s.baseline_hash = h;
         s.status = "synced".into();
@@ -511,7 +520,18 @@ pub(crate) fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
         s.last_sync = now()
     }
     a.state.subscriptions.insert(key.into(), s.clone());
-    a.save()?;
+    if let Err(error) = a.save() {
+        // Restore the in-memory record before both owning guards roll back.
+        // Neither replacement is committed until state persistence succeeds.
+        a.state = previous_state;
+        return Err(error).context("persist update state; live and baseline rolled back");
+    }
+    if let Some(replacement) = replacement {
+        replacement.commit()?;
+    }
+    if let Some(baseline) = baseline_replacement {
+        baseline.commit()?;
+    }
     Ok(serde_json::json!({"skill":s.skill,"relationship":key,"status":s.status}))
 }
 pub(crate) fn publish_to_repo(
@@ -575,6 +595,9 @@ pub(crate) fn publish_to_repo(
     {
         return Err(anyhow!("destination has unexplained modifications"));
     }
+    let destination_parent_dir = tmp.path().join("skills");
+    fs::create_dir_all(&destination_parent_dir)?;
+    let publication_parent = crate::filesystem::open_directory_file_bound(&destination_parent_dir)?;
     let destination_stage_parent = tempfile::tempdir_in(tmp.path())?;
     let staged_destination = destination_stage_parent.path().join("skill");
     if destination_exists {
@@ -587,7 +610,7 @@ pub(crate) fn publish_to_repo(
         assert_no_symlink_path(tmp.path(), parent.strip_prefix(tmp.path())?)?;
         fs::create_dir_all(parent)?;
     }
-    replace_dir(&destination, &staged_destination)?;
+    let replacement = replace_dir_bound(&destination, &staged_destination, &publication_parent)?;
     for (path, _, _) in &source_files {
         let relative = format!("{destination_rel}/{}", path.to_string_lossy());
         run_git(Some(tmp.path()), &["add", "--", &relative])?;
@@ -656,5 +679,6 @@ pub(crate) fn publish_to_repo(
     a.state.pending_publications.remove(&key);
     a.state.publications.insert(key, publication);
     a.save()?;
+    replacement.commit()?;
     Ok(serde_json::json!({"skill":skill,"status":"published"}))
 }

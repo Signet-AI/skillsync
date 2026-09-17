@@ -166,6 +166,20 @@ test("imports a root package with nested resources and preserves Unix modes", as
   expect((await stat(join(fixture.library, "root-demo/scripts/run.sh"))).mode & 0o111).toBe(0o111);
 });
 
+test("rejects unsupported special files before reading them", async () => {
+  if (process.platform !== "linux") return;
+  const fixture = await makeFixture();
+  const source = join(fixture.root, "special-file");
+  await put(join(source, "SKILL.md"), "name: special\n");
+  const fifo = join(source, "blocked.fifo");
+  const created = Bun.spawnSync({ cmd: ["mkfifo", fifo], stdout: "pipe", stderr: "pipe" });
+  expect(created.exitCode).toBe(0);
+  skillsync(fixture, ["--json", "init"]);
+  const rejected = skillsync(fixture, ["--json", "import", "--from", source, "--skill", "special"], false);
+  expect(rejected.json.ok).toBe(false);
+  expect(await Bun.file(join(fixture.library, "special/SKILL.md")).exists()).toBe(false);
+});
+
 test("imports one selected package and fails missing selection", async () => {
   const fixture = await makeFixture();
   const source = join(fixture.root, "many");
@@ -323,6 +337,18 @@ test("local Git subscribe, merge, conflict recovery, and scoped publication", as
   expect(live).not.toContain("<<<<<<<");
   expect((await readdir(join(fixture.config, "recovery"))).length).toBe(1);
 
+  const conflictsBefore = skillsync(fixture, ["--json", "conflicts", "list"]).json;
+  expect(conflictsBefore.count).toBe(1);
+  const statePath = join(fixture.config, "state.json");
+  const stateBefore = await readFile(statePath, "utf8");
+  const state = JSON.parse(stateBefore);
+  const relationship = Object.keys(state.subscriptions)[0]!;
+  await put(join(fixture.config, "baselines", relationship, "tampered.txt"), "tampered\n");
+  const rejectedInventory = skillsync(fixture, ["--json", "conflicts", "list"], false);
+  expect(rejectedInventory.json.ok).toBe(false);
+  expect(rejectedInventory.json.message).toContain("baseline content");
+  expect(await readFile(statePath, "utf8")).toBe(stateBefore);
+
   const destination = join(fixture.root, "destination.git");
   const seed = join(fixture.root, "destination-seed");
   checked(run("git", ["init", "--bare", destination], undefined, fixture.env), "init destination remote");
@@ -471,6 +497,22 @@ test("rejects symlinked package content without copying it", async () => {
   expect(failed.json.ok).toBe(false);
   expect(await Bun.file(join(fixture.library, "unsafe/SKILL.md")).exists()).toBe(false);
   expect(await readFile(outside, "utf8")).toBe("must not be copied\n");
+});
+
+test("rejects special state locks for mutating and read-only paths", async () => {
+  if (process.platform !== "linux") return;
+  const fixture = await makeFixture();
+  skillsync(fixture, ["--json", "init"]);
+  const lock = join(fixture.config, "state.lock");
+  await rm(lock);
+  const created = Bun.spawnSync({ cmd: ["mkfifo", lock], stdout: "pipe", stderr: "pipe" });
+  expect(created.exitCode).toBe(0);
+
+  const mutating = skillsync(fixture, ["--json", "unsubscribe", "missing"], false);
+  expect(mutating.json.ok).toBe(false);
+
+  const readOnly = skillsync(fixture, ["--json", "conflicts", "list"], false);
+  expect(readOnly.json.ok).toBe(false);
 });
 
 test("foreground worker owns the state lock and status reflects live ownership", async () => {
