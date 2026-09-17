@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { childEnv, commandBinary } from "./test_harness";
@@ -57,7 +57,7 @@ async function makeFixture(): Promise<Fixture> {
   const gitConfig = join(root, "gitconfig");
   await writeFile(
     gitConfig,
-    "[user]\n\tname = Skillsync Bun Test\n\temail = skillsync@example.invalid\n",
+    "[user]\n\tname = Skillsync Bun Test\n\temail = skillsync@example.invalid\n[core]\n\tautocrlf = false\n",
   );
   return {
     root,
@@ -94,7 +94,7 @@ test("inventory discovers an effective library before initialization without mut
   await put(join(fixture.library, "references/child/SKILL.md"), "name: child\n");
   const before = await readdir(fixture.library, { recursive: true });
   const result = skillsync(fixture, ["--json", "inventory"]).json;
-  expect(result.library).toBe(fixture.library);
+  expect(result.library).toBe(process.platform === "win32" ? await realpath(fixture.library) : fixture.library);
   expect(result.packages.map((item: any) => [item.name, item.path])).toEqual([
     ["root", "."],
     ["child", "references/child"],
@@ -208,7 +208,7 @@ test("rejects a symlinked existing destination without adopting external content
     false,
   );
   expect(rejected.json.ok).toBe(false);
-  expect(rejected.json.message).toContain("symlink");
+  expect(rejected.json.message).toMatch(/symlink|reparse point/);
   expect(await readFile(join(external, "SKILL.md"), "utf8")).toBe("name: adopted\nexternal\n");
   expect(skillsync(fixture, ["--json", "status"]).json.local_adoptions).toEqual({});
 });
@@ -842,7 +842,7 @@ test("rejects symlinked library directories as set members", async () => {
   skillsync(fixture, ["--json", "set", "create", "core"]);
   const rejected = skillsync(fixture, ["--json", "set", "add", "core", "link"], false);
   expect(rejected.json.ok).toBe(false);
-  expect(rejected.json.message).toContain("symlink");
+  expect(rejected.json.message).toMatch(/symlink|reparse point/);
 });
 
 test("rejects malformed persisted set members before listing or mutating", async () => {

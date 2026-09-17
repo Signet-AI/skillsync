@@ -311,7 +311,18 @@ pub(crate) fn config_dir() -> PathBuf {
 }
 impl App {
     pub(crate) fn load(anchor: Option<&StateLock>) -> Result<Self> {
-        let c = config_dir();
+        let configured_config = config_dir();
+        if configured_config.exists() {
+            assert_no_symlink_path(&configured_config, Path::new("."))?;
+        }
+        let c = if configured_config.exists() {
+            #[cfg(windows)]
+            canonicalize_path(&configured_config)?
+            #[cfg(not(windows))]
+            configured_config.clone()
+        } else {
+            configured_config
+        };
         if let Some(anchor) = anchor {
             // The lock is anchored to the directory inode, not merely its
             // pathname. Refuse to consume config/state through a replacement
