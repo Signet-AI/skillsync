@@ -78,6 +78,20 @@ test("ordinary commands do not register a worker", async () => {
   expect(await Bun.file(join(f.data, "skillsync/bin/skillsync")).exists()).toBe(false);
 });
 
+test("worker subcommands reject legacy worker flags", async () => {
+  const f = await fixture();
+  for (const args of [
+    ["worker", "--once", "enable"],
+    ["worker", "--interval", "9", "status"],
+    ["worker", "--once", "uninstall"],
+  ]) {
+    const result = run(f, args, false, { SKILLSYNC_TEST_WORKER_PROVIDER: "ok" });
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("cannot be combined");
+  }
+  expect(await Bun.file(join(f.config, "worker-registration.json")).exists()).toBe(false);
+});
+
 test("worker registration commands honor the shared state lock", async () => {
   const f = await fixture();
   run(f, ["init"]);

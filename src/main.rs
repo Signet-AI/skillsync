@@ -79,8 +79,8 @@ enum Cmd {
         command: Option<WorkerCmd>,
         #[arg(long)]
         once: bool,
-        #[arg(long, default_value_t = 300)]
-        interval: u64,
+        #[arg(long)]
+        interval: Option<u64>,
     },
     Status,
     Inventory,
@@ -759,6 +759,18 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             }));
         }
     };
+    if let Cmd::Worker {
+        command: Some(_),
+        once,
+        interval,
+    } = &command
+    {
+        if *once || interval.is_some() {
+            return Err(anyhow!(
+                "worker subcommands cannot be combined with --once or --interval"
+            ));
+        }
+    }
     if let Cmd::Subscribe { repository, skill } = &command {
         use std::io::IsTerminal;
         let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -997,7 +1009,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             command: None,
             once,
             interval,
-        } => worker::run_worker_locked(&mut a, once, interval),
+        } => worker::run_worker_locked(&mut a, once, interval.unwrap_or(300)),
         Cmd::Harness { command } => match command {
             HarnessCmd::Enable { root, set } => harness::harness_set(&mut a, &root, &set, true),
             HarnessCmd::Disable { root, set } => harness::harness_set(&mut a, &root, &set, false),
