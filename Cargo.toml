@@ -3,6 +3,10 @@ name = "skillsync"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+test-hooks = []
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -16,6 +20,8 @@ tempfile = "3"
 libc = "0.2"
 fs2 = "0.4"
 ctrlc = "3"
+ratatui = "0.29.0"
+crossterm = "0.28.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

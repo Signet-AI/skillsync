@@ -24,6 +24,7 @@ mod harness;
 mod inventory;
 mod recovery;
 mod repository;
+mod tui;
 
 use filesystem::{
     assert_no_symlink_path, atomic, checked_regular_path, copy_tree, discover,
@@ -242,9 +243,9 @@ struct FileConfig {
     library: Option<String>,
 }
 struct App {
-    config: PathBuf,
-    library: PathBuf,
-    state_path: PathBuf,
+    pub(crate) config: PathBuf,
+    pub(crate) library: PathBuf,
+    pub(crate) state_path: PathBuf,
     baselines: PathBuf,
     recovery: PathBuf,
     state: State,
@@ -282,7 +283,7 @@ fn unique_stamp() -> u128 {
         .unwrap_or_default()
         .as_nanos()
 }
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     if let Some(x) = std::env::var_os("SKILLSYNC_CONFIG_DIR") {
         return x.into();
     }
@@ -304,7 +305,7 @@ fn config_dir() -> PathBuf {
     }
 }
 impl App {
-    fn load(anchor: Option<&StateLock>) -> Result<Self> {
+    pub(crate) fn load(anchor: Option<&StateLock>) -> Result<Self> {
         let c = config_dir();
         if let Some(anchor) = anchor {
             // The lock is anchored to the directory inode, not merely its
@@ -790,6 +791,12 @@ fn main() -> Result<()> {
         }
     };
     let json = cli.json;
+    if cli.command.is_none() && !json {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            return tui::run();
+        }
+    }
     let result = run(cli);
     match result {
         Ok(v) => envelope(json, true, "ok", v),
