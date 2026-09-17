@@ -23,10 +23,10 @@ mod worker;
 pub(crate) use worker::{worker_status, WORKER_STOP_REQUESTED};
 
 use filesystem::{
-    assert_no_symlink_path, atomic, checked_regular_path, copy_tree, discover,
-    effective_library_path, files, hash_dir, manifest_name, read_regular_file, replace_dir_bound,
-    resolve_library_path, safe, snapshot_transaction, source_rel, strict_component,
-    validate_state_path, FileData, StateLock,
+    assert_no_symlink_path, atomic, canonicalize_path, checked_regular_path, copy_tree, discover,
+    effective_library_path, files, hash_dir, manifest_name, read_regular_file,
+    replace_dir_bound, resolve_library_path, safe, snapshot_transaction, source_rel,
+    strict_component, validate_state_path, FileData, StateLock,
 };
 #[cfg(unix)]
 use filesystem::{open_child_file, open_directory_fd};
@@ -303,7 +303,22 @@ pub(crate) fn config_dir() -> PathBuf {
 }
 impl App {
     pub(crate) fn load(anchor: Option<&StateLock>) -> Result<Self> {
-        let c = config_dir();
+        let configured_config = config_dir();
+        if configured_config.exists() {
+            assert_no_symlink_path(&configured_config, Path::new("."))?;
+        }
+        let c = if configured_config.exists() {
+            #[cfg(windows)]
+            {
+                canonicalize_path(&configured_config)?
+            }
+            #[cfg(not(windows))]
+            {
+                configured_config.clone()
+            }
+        } else {
+            configured_config
+        };
         if let Some(anchor) = anchor {
             // The lock is anchored to the directory inode, not merely its
             // pathname. Refuse to consume config/state through a replacement
@@ -482,7 +497,7 @@ fn validate_local_adoption(key: &str, record: &LocalAdoption, library: &Path) ->
     assert_no_symlink_path(&source, Path::new("."))?;
     let source_available = source.is_dir();
     if source_available {
-        if fs::canonicalize(&source)? != source {
+        if canonicalize_path(&source)? != source {
             return Err(anyhow!("local adoption source path is not canonical"));
         }
     } else if source.exists() {
@@ -506,7 +521,7 @@ fn validate_local_adoption(key: &str, record: &LocalAdoption, library: &Path) ->
         .strip_prefix(library)
         .map_err(|_| anyhow!("local adoption escaped library"))?;
     assert_no_symlink_path(library, relative)?;
-    if !local.is_dir() || fs::canonicalize(&local)? != local {
+    if !local.is_dir() || canonicalize_path(&local)? != local {
         return Err(anyhow!(
             "local adoption canonical path is not a regular directory"
         ));
@@ -519,7 +534,7 @@ fn validate_local_adoption(key: &str, record: &LocalAdoption, library: &Path) ->
     if source_available {
         let package = source.join(&source_package);
         if !package.is_dir()
-            || fs::canonicalize(&package)? != package
+            || canonicalize_path(&package)? != package
             || manifest_name(&package)? != skill
             || hash_dir(&package)? != record.content_hash
         {
@@ -810,13 +825,13 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                     assert_no_symlink_path(&l, Path::new("."))?;
                     fs::create_dir_all(&l)?;
                     assert_no_symlink_path(&l, Path::new("."))?;
-                    a.library = fs::canonicalize(l)?;
+                    a.library = canonicalize_path(&l)?;
                     a.state.library = a.library.display().to_string()
                 }
                 assert_no_symlink_path(&a.library, Path::new("."))?;
                 fs::create_dir_all(&a.library)?;
                 assert_no_symlink_path(&a.library, Path::new("."))?;
-                a.library = fs::canonicalize(&a.library)?;
+                a.library = canonicalize_path(&a.library)?;
                 a.state.library = a.library.display().to_string();
                 a.save()?
             }

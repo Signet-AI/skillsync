@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::filesystem::{
-    assert_no_symlink_path, copy_tree, hash_dir, manifest_name, replace_dir_bound, safe,
-    snapshot_transaction, strict_component, validate_state_path,
+    assert_no_symlink_path, canonicalize_path, copy_tree, hash_dir, manifest_name,
+    replace_dir_bound, safe, snapshot_transaction, strict_component, validate_state_path,
 };
 use crate::{relationship_key, App};
 
@@ -78,7 +78,7 @@ fn validate_subscription(
         .map_err(|_| anyhow!("subscription local package is missing"))?;
     if !meta.is_dir()
         || meta.file_type().is_symlink()
-        || fs::canonicalize(&local)? != local
+        || canonicalize_path(&local)? != local
         || manifest_name(&local)? != subscription.skill
     {
         return Err(anyhow!(
@@ -130,7 +130,7 @@ fn validate_baseline_integrity(
         .map_err(|_| anyhow!("subscription baseline package is missing"))?;
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
-        || fs::canonicalize(&baseline)? != baseline
+        || canonicalize_path(&baseline)? != baseline
         || manifest_name(&baseline)? != subscription.skill
     {
         return Err(anyhow!(
@@ -208,7 +208,7 @@ fn validate_evidence_package(
     validate_state_path(root, path, label)?;
     let meta =
         fs::symlink_metadata(path).map_err(|_| anyhow!("conflict evidence is missing {label}"))?;
-    if !meta.is_dir() || meta.file_type().is_symlink() || fs::canonicalize(path)? != *path {
+    if !meta.is_dir() || meta.file_type().is_symlink() || canonicalize_path(path)? != *path {
         return Err(anyhow!(
             "conflict evidence {label} must be a canonical regular directory"
         ));
@@ -245,7 +245,7 @@ pub(crate) fn show(a: &App, relationship: &str) -> Result<serde_json::Value> {
     );
     validate_state_path(&a.recovery, &recovery, "recovery")?;
     let meta = fs::symlink_metadata(&recovery)?;
-    if !meta.is_dir() || meta.file_type().is_symlink() || fs::canonicalize(&recovery)? != recovery {
+    if !meta.is_dir() || meta.file_type().is_symlink() || canonicalize_path(&recovery)? != recovery {
         return Err(anyhow!("conflict recovery is not a canonical directory"));
     }
     let raw = fs::read(recovery.join("manifest.json"))

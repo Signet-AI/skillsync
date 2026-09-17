@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::{
-    filesystem::{checked_regular_path, open_advisory_lock, WorkerLease},
+    filesystem::{checked_regular_path, lock_is_contended, open_advisory_lock, WorkerLease},
     repository, App,
 };
 
@@ -28,7 +28,7 @@ pub(crate) fn worker_status(config: &Path) -> Result<&'static str> {
             file.unlock()?;
             Ok("stopped")
         }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok("running"),
+        Err(error) if lock_is_contended(&error) => Ok("running"),
         Err(error) => Err(error).context("inspect worker status"),
     }
 }

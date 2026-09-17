@@ -2,7 +2,7 @@ use crate::{unique_stamp, App};
 use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -11,6 +11,20 @@ use std::{
     io::Write,
     path::{Component, Path, PathBuf},
 };
+
+pub(crate) fn lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || {
+            #[cfg(windows)]
+            {
+                error.raw_os_error() == Some(33)
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        }
+}
 
 pub(crate) fn effective_library_path(configured: Option<PathBuf>) -> PathBuf {
     std::env::var_os("SKILLSYNC_LIBRARY")
@@ -152,12 +166,46 @@ fn open_directory_file_no_create(path: &Path) -> Result<fs::File> {
 
 /// Bind a pathname lookup to the directory identity observed immediately before it.
 /// The retained descriptor is used after the comparison; replacements fail closed.
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub(crate) fn open_directory_file_bound(path: &Path) -> Result<fs::File> {
-    Err(anyhow!(
-        "safe descriptor-relative traversal unavailable on this platform: {}",
-        path.display()
-    ))
+    use std::{iter, os::windows::ffi::OsStrExt, os::windows::io::FromRawHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    const GENERIC_READ_ACCESS: u32 = 0x8000_0000;
+
+    let expected = fs::symlink_metadata(path)?;
+    if expected.file_type().is_symlink() || !expected.is_dir() {
+        return Err(anyhow!("regular directory required: {}", path.display()));
+    }
+    reject_reparse_point(path, "directory")?;
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let opened = unsafe { fs::File::from_raw_handle(handle as _) };
+    let actual = opened.metadata()?;
+    if !actual.is_dir() || actual.file_type().is_symlink() {
+        return Err(anyhow!("directory changed during open: {}", path.display()));
+    }
+    Ok(opened)
 }
 
 #[cfg(unix)]
@@ -177,6 +225,75 @@ pub(crate) fn open_directory_file_bound(path: &Path) -> Result<fs::File> {
         return Err(anyhow!("directory changed during open: {}", path.display()));
     }
     Ok(opened)
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &fs::File) -> Result<(u32, u32, u32)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) != 0 };
+    if !ok {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok((
+        info.dwVolumeSerialNumber,
+        info.nFileIndexHigh,
+        info.nFileIndexLow,
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_path_identity(path: &Path) -> Result<(u32, u32, u32)> {
+    let file = open_directory_file_bound(path)?;
+    windows_file_identity(&file)
+}
+
+#[cfg(windows)]
+pub(crate) fn open_regular_file_bound(
+    path: &Path,
+    write: bool,
+    create_new: bool,
+) -> Result<fs::File> {
+    use std::{iter, os::windows::ffi::OsStrExt, os::windows::io::FromRawHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    const GENERIC_READ_ACCESS: u32 = 0x8000_0000;
+    const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000;
+
+    reject_reparse_point(path, "regular file")?;
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let access = GENERIC_READ_ACCESS | if write { GENERIC_WRITE_ACCESS } else { 0 };
+    let disposition = if create_new { CREATE_NEW } else { OPEN_EXISTING };
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            disposition,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let file = unsafe { fs::File::from_raw_handle(handle as _) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(anyhow!("regular file required: {}", path.display()));
+    }
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -225,6 +342,29 @@ fn verify_bound_parent(path: &Path, expected: &fs::File) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn verify_bound_parent(path: &Path, expected: &fs::File) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("destination has no parent"))?;
+    let actual = open_directory_file_bound(parent)?;
+    if windows_file_identity(expected)? != windows_file_identity(&actual)? {
+        return Err(anyhow!(
+            "destination parent changed during replacement: {}",
+            parent.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn open_directory_file_bound(path: &Path) -> Result<fs::File> {
+    Err(anyhow!(
+        "safe descriptor-relative traversal unavailable on this platform: {}",
+        path.display()
+    ))
 }
 
 #[cfg(unix)]
@@ -340,7 +480,44 @@ pub(crate) fn open_child_file(config: &Path, name: &str, create: bool) -> Result
     Ok(unsafe { fs::File::from_raw_fd(fd) })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn open_child_file(config: &Path, name: &str, create: bool) -> Result<fs::File> {
+    use std::{iter, os::windows::ffi::OsStrExt, os::windows::io::FromRawHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS, OPEN_EXISTING,
+    };
+    const GENERIC_READ_ACCESS: u32 = 0x8000_0000;
+    const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000;
+    assert_no_symlink_path(config, Path::new("."))?;
+    let path = config.join(name);
+    reject_reparse_point(&path, "advisory lock")?;
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ_ACCESS | GENERIC_WRITE_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            if create { OPEN_ALWAYS } else { OPEN_EXISTING },
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let file = unsafe { fs::File::from_raw_handle(handle as _) };
+    ensure_regular_file(&file, name)?;
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn open_child_file(config: &Path, name: &str, create: bool) -> Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true).create(create);
@@ -370,7 +547,7 @@ pub(crate) fn acquire_named_lock(
         open_advisory_lock(config, name, true).with_context(|| format!("open lock: {name}"))?;
     ensure_regular_file(&file, name)?;
     if let Err(error) = file.try_lock_exclusive() {
-        if error.kind() == std::io::ErrorKind::WouldBlock {
+        if lock_is_contended(&error) {
             return Err(anyhow!("{busy_message}"));
         }
         return Err(error).context("lock Skillsync state");
@@ -412,9 +589,15 @@ struct ConfigIdentity {
     dev: u64,
     #[cfg(unix)]
     ino: u64,
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    volume: u32,
+    #[cfg(windows)]
+    file_index_high: u32,
+    #[cfg(windows)]
+    file_index_low: u32,
+    #[cfg(not(any(unix, windows)))]
     len: u64,
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     modified: Option<std::time::SystemTime>,
 }
 
@@ -431,7 +614,16 @@ fn config_identity(config: &Path) -> Result<ConfigIdentity> {
             ino: metadata.ino(),
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let (volume, file_index_high, file_index_low) = windows_path_identity(config)?;
+        Ok(ConfigIdentity {
+            volume,
+            file_index_high,
+            file_index_low,
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Ok(ConfigIdentity {
             len: metadata.len(),
@@ -446,7 +638,13 @@ impl ConfigIdentity {
         {
             self.dev == current.dev && self.ino == current.ino
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            self.volume == current.volume
+                && self.file_index_high == current.file_index_high
+                && self.file_index_low == current.file_index_low
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             self.len == current.len && self.modified == current.modified
         }
@@ -478,8 +676,9 @@ impl StateLock {
             )?,
             config_identity(config)?,
         );
+        #[cfg(unix)]
         if let Err(error) = file.try_lock_exclusive() {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
+            if lock_is_contended(&error) {
                 return Err(anyhow!(
                     "skillsync state is busy (worker or another mutating command holds the lock)"
                 ));
@@ -504,6 +703,9 @@ impl StateLock {
         };
         file.try_lock_shared().map_err(|error| match error {
             std::fs::TryLockError::WouldBlock => anyhow!(
+                "skillsync state is busy (worker or another mutating command holds the lock)"
+            ),
+            std::fs::TryLockError::Error(error) if lock_is_contended(&error) => anyhow!(
                 "skillsync state is busy (worker or another mutating command holds the lock)"
             ),
             std::fs::TryLockError::Error(error) => {
@@ -579,7 +781,39 @@ fn open_existing_read_lock(
         ensure_regular_file(&file, "state.lock")?;
         Ok(Some((file, identity, Some(directory_file))))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let directory_file = match open_directory_file_bound(config) {
+            Ok(file) => file,
+            Err(error) => {
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .map(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    .unwrap_or(false)
+                {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+        };
+        let identity = config_identity(config)?;
+        match open_regular_file_bound(&config.join(name), false, false) {
+            Ok(file) => Ok(Some((file, identity, None))),
+            Err(error) => {
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .map(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    .unwrap_or(false)
+                {
+                    drop(directory_file);
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         match fs::OpenOptions::new().read(true).open(config.join(name)) {
             Ok(file) => Ok(Some((file, config_identity(config)?, None))),
@@ -700,7 +934,7 @@ pub(crate) fn resolve_library_path(path: &Path) -> Result<PathBuf> {
     };
     assert_no_symlink_path(&absolute, Path::new("."))?;
     if absolute.exists() {
-        Ok(fs::canonicalize(absolute)?)
+        Ok(canonicalize_path(&absolute)?)
     } else {
         Ok(absolute)
     }
@@ -805,6 +1039,7 @@ pub(crate) fn atomic_portable(p: &Path, b: &[u8]) -> Result<()> {
     assert_no_symlink_path(parent, Path::new("."))?;
     fs::create_dir_all(parent)?;
     assert_no_symlink_path(parent, Path::new("."))?;
+    reject_reparse_point(p, "atomic target")?;
     let temp = parent.join(format!(
         ".{}.tmp-{}-{}",
         p.file_name().unwrap().to_string_lossy(),
@@ -944,7 +1179,21 @@ pub(crate) fn read_regular_file(path: &Path, expected: Option<&fs::Metadata>) ->
         reader.read_to_end(&mut bytes)?;
         Ok(bytes)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let file = open_regular_file_bound(path, false, false)?;
+        let metadata = file.metadata()?;
+        if let Some(before) = expected {
+            if before.len() != metadata.len() {
+                return Err(anyhow!("file changed during scan: {}", path.display()));
+            }
+        }
+        let mut reader = file;
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let metadata = fs::symlink_metadata(path)?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -1234,13 +1483,45 @@ fn remove_relative_file(root: &Path, relative: &Path) -> Result<()> {
         unsafe { libc::close(directory) };
         error.map_or(Ok(()), |error| Err(error.into()))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        if !safe(relative) || relative == Path::new(".") {
+            return Err(anyhow!("empty unsafe path"));
+        }
+        assert_no_symlink_path(root, relative)?;
+        let path = root.join(relative);
+        let file = open_regular_file_bound(&path, false, false)?;
+        let current_file = open_regular_file_bound(&path, false, false)?;
+        if windows_file_identity(&file)? != windows_file_identity(&current_file)? {
+            return Err(anyhow!("file changed during removal: {}", path.display()));
+        }
+        drop(file);
+        drop(current_file);
+        fs::remove_file(path)?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (root, relative);
         Err(anyhow!(
             "safe descriptor-relative removal unavailable on this platform"
         ))
     }
+}
+
+pub(crate) fn canonicalize_path(path: &Path) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(path)?;
+    #[cfg(windows)]
+    {
+        let value = canonical.to_string_lossy();
+        if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+            return Ok(PathBuf::from(format!(r"\\{}", rest)));
+        }
+        if let Some(rest) = value.strip_prefix(r"\\?\") {
+            return Ok(PathBuf::from(rest));
+        }
+    }
+    Ok(canonical)
 }
 
 #[cfg(unix)]
@@ -1345,7 +1626,16 @@ fn write_relative_file(root: &Path, relative: &Path, bytes: &[u8], mode: u32) ->
         let root = open_directory_file_bound(root)?;
         write_relative_file_at(&root, relative, bytes, mode)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let _ = mode;
+        if !safe(relative) || relative == Path::new(".") {
+            return Err(anyhow!("empty unsafe path"));
+        }
+        assert_no_symlink_path(root, relative)?;
+        atomic_portable(&root.join(relative), bytes)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (root, relative, bytes, mode);
         Err(anyhow!(
@@ -1366,8 +1656,65 @@ pub(crate) fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(windows)]
+fn copy_tree_windows(src: &Path, dst: &Path, complete: bool) -> Result<()> {
+    reject_reparse_point(src, "tree source")?;
+    assert_no_symlink_path(dst, Path::new("."))?;
+    fs::create_dir_all(dst)?;
+
+    fn walk(src_root: &Path, current: &Path, dst: &Path, rel: &Path, complete: bool) -> Result<()> {
+        let mut entries = fs::read_dir(current)
+            .with_context(|| format!("read tree source: {}", current.display()))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            let child_rel = rel.join(&name);
+            if !safe(&child_rel) {
+                return Err(anyhow!("unsafe tree path: {}", child_rel.display()));
+            }
+            if !complete
+                && operational(&child_rel)
+                && child_rel
+                    .components()
+                    .any(|component| matches!(component, Component::Normal(name) if name == ".git"))
+            {
+                continue;
+            }
+            let source = entry.path();
+            reject_reparse_point(&source, "tree entry")?;
+            let metadata = fs::symlink_metadata(&source)?;
+            if metadata.file_type().is_symlink() {
+                return Err(anyhow!("symlink tree entry rejected: {}", child_rel.display()));
+            }
+            let destination = dst.join(&child_rel);
+            if metadata.is_dir() {
+                assert_no_symlink_path(dst, &child_rel)?;
+                fs::create_dir_all(&destination)?;
+                walk(src_root, &source, dst, &child_rel, complete)?;
+            } else if metadata.is_file() {
+                let bytes = read_regular_file(&source, Some(&metadata))?;
+                write_relative_file(dst, &child_rel, &bytes, metadata_mode(&metadata))?;
+            } else {
+                return Err(anyhow!("unsupported tree entry: {}", child_rel.display()));
+            }
+        }
+        let _ = src_root;
+        Ok(())
+    }
+
+    walk(src, src, dst, Path::new(""), complete)
+}
+
 /// Complete copy used only for deletion recovery; operational names are data.
 pub(crate) fn copy_complete_tree(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        return copy_tree_windows(src, dst, true);
+    }
+    #[cfg(not(windows))]
+    {
     reject_reparse_point(src, "delete snapshot source")?;
     let root = open_directory_file_bound(src)?;
     assert_no_symlink_path(dst, Path::new("."))?;
@@ -1408,15 +1755,22 @@ pub(crate) fn copy_complete_tree(src: &Path, dst: &Path) -> Result<()> {
     {
         walk(&root, Path::new(""), dst)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (root, src, dst);
         Err(anyhow!(
             "safe descriptor-relative copy unavailable on this platform"
         ))
     }
+    }
 }
 pub(crate) fn copy_existing_tree(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        return copy_tree_windows(src, dst, false);
+    }
+    #[cfg(not(windows))]
+    {
     reject_reparse_point(src, "destination tree root")?;
     let root = open_directory_file_bound(src)?;
     assert_no_symlink_path(dst, Path::new("."))?;
@@ -1456,12 +1810,13 @@ pub(crate) fn copy_existing_tree(src: &Path, dst: &Path) -> Result<()> {
     {
         walk(&root, Path::new(""), dst)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (root, src, dst);
         Err(anyhow!(
             "safe descriptor-relative copy unavailable on this platform"
         ))
+    }
     }
 }
 #[allow(dead_code)]
@@ -1540,6 +1895,32 @@ pub(crate) fn install_dir_noreplace(_src: &Path, _dst: &Path) -> Result<()> {
     Err(anyhow!(
         "safe no-replace directory installation is unavailable on this Unix platform"
     ))
+}
+
+#[cfg(windows)]
+fn move_path_windows(src: &Path, dst: &Path, replace: bool) -> Result<()> {
+    use std::{iter, os::windows::ffi::OsStrExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let source = src
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = dst
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let mut flags = MOVEFILE_WRITE_THROUGH;
+    if replace {
+        flags |= MOVEFILE_REPLACE_EXISTING;
+    }
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1632,6 +2013,14 @@ pub(crate) struct Replacement {
     backup_parent: Option<fs::File>,
     #[cfg(target_os = "linux")]
     backup_name: Option<std::ffi::OsString>,
+    #[cfg(windows)]
+    installed_path: Option<PathBuf>,
+    #[cfg(windows)]
+    backup_path: Option<PathBuf>,
+    #[cfg(windows)]
+    installed_windows_identity: Option<(u32, u32, u32)>,
+    #[cfg(windows)]
+    backup_windows_identity: Option<(u32, u32, u32)>,
 }
 
 impl Replacement {
@@ -1776,6 +2165,66 @@ fn remove_owned_dir(
     Ok(())
 }
 
+#[cfg(windows)]
+pub(crate) fn remove_owned_directory_path_windows(
+    path: &Path,
+    expected: (u32, u32, u32),
+) -> Result<()> {
+    if windows_path_identity(path)? != expected {
+        return Err(anyhow!(
+            "installed directory identity changed; retaining artifact"
+        ));
+    }
+
+    fn recurse(path: &Path) -> Result<()> {
+        let mut entries = fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let child = entry.path();
+            reject_reparse_point(&child, "installed child")?;
+            let metadata = fs::symlink_metadata(&child)?;
+            if metadata.file_type().is_symlink() {
+                return Err(anyhow!("installed child is a symlink; retaining artifact"));
+            }
+            if metadata.is_dir() {
+                let child_identity = windows_path_identity(&child)?;
+                recurse(&child)?;
+                if windows_path_identity(&child)? != child_identity {
+                    return Err(anyhow!(
+                        "installed child identity changed; retaining artifact"
+                    ));
+                }
+                fs::remove_dir(&child)?;
+            } else if metadata.is_file() {
+                let file = open_regular_file_bound(&child, false, false)?;
+                let handle_identity = windows_file_identity(&file)?;
+                let current_file = open_regular_file_bound(&child, false, false)?;
+                if handle_identity != windows_file_identity(&current_file)? {
+                    return Err(anyhow!(
+                        "installed child identity changed; retaining artifact"
+                    ));
+                }
+                drop(file);
+                fs::remove_file(&child)?;
+            } else {
+                return Err(anyhow!(
+                    "installed directory contains unsupported entry; retaining artifact"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    recurse(path)?;
+    if windows_path_identity(path)? != expected {
+        return Err(anyhow!(
+            "installed directory identity changed; retaining artifact"
+        ));
+    }
+    fs::remove_dir(path)?;
+    Ok(())
+}
+
 #[allow(clippy::needless_return)]
 impl Drop for Replacement {
     fn drop(&mut self) {
@@ -1853,7 +2302,39 @@ impl Drop for Replacement {
                 let _ = remove_owned_dir(parent, name, self.installed_identity);
             }
         }
-        // Non-Linux replacement is rejected before a guard can be created.
+        #[cfg(windows)]
+        if let (Some(installed), Some(installed_identity)) =
+            (&self.installed_path, self.installed_windows_identity)
+        {
+            if let Some(backup) = &self.backup_path {
+                let Some(backup_identity) = self.backup_windows_identity else {
+                    return;
+                };
+                if windows_path_identity(installed).ok() != Some(installed_identity)
+                    || windows_path_identity(backup).ok() != Some(backup_identity)
+                {
+                    return;
+                }
+                let Some(parent) = installed.parent() else {
+                    return;
+                };
+                let temporary = parent.join(format!(
+                    ".skillsync-rollback-{}",
+                    unique_stamp()
+                ));
+                if install_dir_noreplace(installed, &temporary).is_err() {
+                    return;
+                }
+                if install_dir_noreplace(backup, installed).is_err() {
+                    let _ = install_dir_noreplace(&temporary, installed);
+                    return;
+                }
+                let _ = remove_owned_directory_path_windows(&temporary, installed_identity);
+            } else if windows_path_identity(installed).ok() == Some(installed_identity) {
+                let _ = remove_owned_directory_path_windows(installed, installed_identity);
+            }
+        }
+        // Other platforms are rejected before a guard can be created.
     }
 }
 
@@ -1867,7 +2348,15 @@ pub(crate) fn replace_dir(dst: &Path, src: &Path) -> Result<Replacement> {
     let parent_file = open_directory_file_bound(parent)?;
     #[cfg(unix)]
     return replace_dir_bound(dst, src, &parent_file);
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let parent = dst
+        .parent()
+        .ok_or_else(|| anyhow!("destination has no parent"))?;
+    #[cfg(windows)]
+    let parent_file = open_directory_file_bound(parent)?;
+    #[cfg(windows)]
+    return replace_dir_bound(dst, src, &parent_file);
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (dst, src);
         Err(anyhow!(
@@ -2024,7 +2513,79 @@ pub(crate) fn replace_dir_bound(
         ))
     }
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn replace_dir_bound(
+    dst: &Path,
+    src: &Path,
+    destination_parent: &fs::File,
+) -> Result<Replacement> {
+    verify_bound_parent(dst, destination_parent)?;
+    reject_reparse_point(src, "replacement source")?;
+    reject_reparse_point(dst, "replacement destination")?;
+    let source_metadata = fs::symlink_metadata(src)?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+        return Err(anyhow!("replacement source is not a regular directory"));
+    }
+    let destination_name = dst
+        .file_name()
+        .ok_or_else(|| anyhow!("destination has no name"))?;
+    let existing = match fs::symlink_metadata(dst) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(anyhow!("destination is not a regular directory"));
+        }
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+
+    if !existing {
+        install_dir_noreplace(src, dst)?;
+        let installed_identity = windows_path_identity(dst)?;
+        verify_bound_parent(dst, destination_parent)?;
+        return Ok(Replacement {
+            committed: false,
+            installed_path: Some(dst.to_path_buf()),
+            backup_path: None,
+            installed_windows_identity: Some(installed_identity),
+            backup_windows_identity: None,
+        });
+    }
+
+    let parent = dst
+        .parent()
+        .ok_or_else(|| anyhow!("destination has no parent"))?;
+    let backup = parent.join(format!(".skillsync-replaced-{}", unique_stamp()));
+    install_dir_noreplace(dst, &backup).with_context(|| {
+        format!(
+            "retain existing destination before replacement: {}",
+            destination_name.to_string_lossy()
+        )
+    })?;
+    if let Err(error) = install_dir_noreplace(src, dst) {
+        let restored = install_dir_noreplace(&backup, dst);
+        return Err(match restored {
+            Ok(()) => anyhow!(
+                "directory replacement failed; original destination restored: {error}"
+            ),
+            Err(recovery) => anyhow!(
+                "directory replacement failed; restoring original destination failed: {error}; recovery required: {recovery}; retained at {}",
+                backup.display()
+            ),
+        });
+    }
+    let installed_identity = windows_path_identity(dst)?;
+    let backup_identity = windows_path_identity(&backup)?;
+    verify_bound_parent(dst, destination_parent)?;
+    Ok(Replacement {
+        committed: false,
+        installed_path: Some(dst.to_path_buf()),
+        backup_path: Some(backup),
+        installed_windows_identity: Some(installed_identity),
+        backup_windows_identity: Some(backup_identity),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn replace_dir_bound(
     _dst: &Path,
     _src: &Path,
