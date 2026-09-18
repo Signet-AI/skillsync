@@ -64,6 +64,28 @@ fn safe_canonical(path: &Path) -> anyhow::Result<PathBuf> {
     crate::filesystem::reject_reparse_point(path, "persisted path")?;
     Ok(fs::canonicalize(path)?)
 }
+fn explicit_root(path: &Path) -> anyhow::Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(anyhow::anyhow!(
+            "explicit discovery root must be absolute: {}",
+            path.display()
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        anyhow::anyhow!(
+            "explicit discovery root must be an existing directory: {}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(anyhow::anyhow!(
+            "explicit discovery root must be an existing directory: {}",
+            path.display()
+        ));
+    }
+    let canonical = safe_canonical(path)?;
+    Ok(canonical)
+}
 fn package_name(path: &Path) -> Result<Option<String>> {
     let Ok(meta) = fs::symlink_metadata(path.join("SKILL.md")) else {
         return Ok(None);
@@ -248,7 +270,16 @@ fn walk(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn discover(library: &Path, state: &crate::State) -> Result<DiscoverReport> {
+    discover_with_roots(library, state, &[])
+}
+
+pub(crate) fn discover_with_roots(
+    library: &Path,
+    state: &crate::State,
+    explicit: &[PathBuf],
+) -> Result<DiscoverReport> {
     let mut roots = vec![RootReport {
         kind: "canonical_library".into(),
         path: library.display().to_string(),
@@ -313,6 +344,17 @@ pub(crate) fn discover(library: &Path, state: &crate::State) -> Result<DiscoverR
             ));
         }
     }
+    let mut explicit_roots = BTreeSet::new();
+    for raw in explicit {
+        explicit_roots.insert(explicit_root(raw)?);
+    }
+    for root in &explicit_roots {
+        roots.push(RootReport {
+            kind: "explicit_root".into(),
+            path: root.display().to_string(),
+            status: "present".into(),
+        });
+    }
     let mut packages = Vec::new();
     let mut occurrences = Vec::new();
     if root_status(library) == "present" {
@@ -349,6 +391,19 @@ pub(crate) fn discover(library: &Path, state: &crate::State) -> Result<DiscoverR
             &mut diagnostics,
             &mut BTreeSet::new(),
             Some(&root.path),
+        );
+    }
+    for root in &explicit_roots {
+        let id = root.display().to_string();
+        walk(
+            root,
+            root,
+            &managed,
+            &mut Vec::new(),
+            &mut occurrences,
+            &mut diagnostics,
+            &mut BTreeSet::new(),
+            Some(&id),
         );
     }
     roots.sort_by(|a, b| (&a.kind, &a.path).cmp(&(&b.kind, &b.path)));

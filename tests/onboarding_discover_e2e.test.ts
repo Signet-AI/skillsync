@@ -22,6 +22,14 @@ function run(f: F, args: string[]) {
 async function pkg(path: string) { await mkdir(path, { recursive: true }); await writeFile(join(path, "SKILL.md"), `name: ${path.split("/").pop()}\n`); }
 async function invalidPkg(path: string) { await mkdir(path, { recursive: true }); await writeFile(join(path, "SKILL.md"), "# fixture\n"); }
 
+ test("explicit roots discover occurrences without adoption proposals", async () => {
+  const f = await fixture(); const explicit = join(f.root, "explicit", "nested"); await pkg(join(explicit, "found"));
+  const report = run(f, ["onboarding", "discover", "--root", join(f.root, "explicit"), "--root", join(f.root, "explicit")]);
+  expect(report.roots.filter((r:any)=>r.kind === "explicit_root")).toHaveLength(1);
+  expect(report.occurrences.map((o:any)=>[o.name,o.root,o.path])).toEqual([["found", join(f.root,"explicit"), "nested/found"]]);
+  expect(report.proposals).toEqual([]);
+ });
+
  test("uninitialized discovery finds root and nested packages without creating state", async () => {
   const f = await fixture(); await pkg(f.library); await pkg(join(f.library, "nested", "same"));
   const before = (await readdir(f.root, { recursive: true })).sort(); const report = run(f, ["onboarding", "discover"]);

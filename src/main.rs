@@ -137,7 +137,10 @@ enum Cmd {
 }
 #[derive(Subcommand)]
 enum OnboardingCmd {
-    Discover,
+    Discover {
+        #[arg(long = "root", action = clap::ArgAction::Append)]
+        root: Vec<PathBuf>,
+    },
 }
 #[derive(Subcommand)]
 enum StateCmd {
@@ -885,7 +888,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
     if matches!(
         command,
         Cmd::Onboarding {
-            command: OnboardingCmd::Discover
+            command: OnboardingCmd::Discover { .. }
         }
     ) {
         let config = config_dir();
@@ -895,14 +898,27 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             lock.verify_config_identity(&config)?;
             let app = App::load(Some(&lock))?;
             lock.verify_config_identity(&app.config)?;
-            let report = onboarding::discover(&app.library, &app.state)?;
+            let roots = match &command {
+                Cmd::Onboarding {
+                    command: OnboardingCmd::Discover { root },
+                } => root,
+                _ => unreachable!("onboarding command checked"),
+            };
+            let report = onboarding::discover_with_roots(&app.library, &app.state, roots)?;
             lock.verify_config_identity(&app.config)?;
             return Ok(serde_json::to_value(report)?);
         }
         let library = resolve_library_path(&effective_library_path(None))?;
-        return Ok(serde_json::to_value(onboarding::discover(
+        let roots = match &command {
+            Cmd::Onboarding {
+                command: OnboardingCmd::Discover { root },
+            } => root,
+            _ => unreachable!("onboarding command checked"),
+        };
+        return Ok(serde_json::to_value(onboarding::discover_with_roots(
             &library,
             &State::default(),
+            roots,
         )?)?);
     }
     if let Cmd::Worker {
