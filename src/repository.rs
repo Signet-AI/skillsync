@@ -178,10 +178,43 @@ fn run_git(cwd: Option<&Path>, args: &[&str]) -> Result<String> {
         .join()
         .map_err(|_| anyhow!("git stderr reader panicked"))?;
     if !status.success() {
-        let error = String::from_utf8_lossy(&stderr).replace('\n', " ");
-        return Err(anyhow!("git operation failed: {}", error.trim()));
+        let detail = String::from_utf8_lossy(&stderr).trim().to_owned();
+        return Err(anyhow!("git operation failed: {detail}"));
     }
     Ok(String::from_utf8_lossy(&stdout).trim().into())
+}
+pub(crate) fn status_for_error(error: &str) -> &'static str {
+    let lower = error.to_lowercase();
+    if lower.contains("auth") || lower.contains("could not read username") || error.contains("@") {
+        "authentication_required"
+    } else if lower.contains("offline")
+        || lower.contains("not installed")
+        || lower.contains("could not resolve host")
+        || lower.contains("network is unreachable")
+        || lower.contains("connection timed out")
+    {
+        "offline"
+    } else if lower.contains("permission")
+        || lower.contains("access denied")
+        || lower.contains("could not create work tree dir")
+    {
+        "permission_denied"
+    } else if error.contains("source repository missing") {
+        "source_missing"
+    } else if error.contains("tracked branch missing") {
+        "branch_missing"
+    } else if error.contains("skill not found") {
+        "package_missing"
+    } else if lower.contains("unsupported repository")
+        || lower.contains("repository url contains")
+        || lower.contains("credential-bearing repository url rejected")
+        || lower.contains("unsafe git branch")
+        || lower.contains("invalid repository source")
+    {
+        "invalid_source"
+    } else {
+        "conflict"
+    }
 }
 pub(crate) fn branch(repo: &str) -> Result<String> {
     if let Some(b) = run_git(None, &["ls-remote", "--symref", repo, "HEAD"])
@@ -222,6 +255,9 @@ pub(crate) fn clone_repo(repo: &str) -> Result<(tempfile::TempDir, String)> {
     Ok((t, b))
 }
 fn clone_repo_branch(repo: &str, requested: Option<&str>) -> Result<(tempfile::TempDir, String)> {
+    if !repo.contains("://") && !repo.starts_with("git@") && !Path::new(repo).exists() {
+        return Err(anyhow!("source repository missing"));
+    }
     let (t, default) = clone_repo(repo)?;
     if let Some(b) = requested {
         validate_branch(b)?;
@@ -231,7 +267,7 @@ fn clone_repo_branch(repo: &str, requested: Option<&str>) -> Result<(tempfile::T
         )
         .is_err()
         {
-            return Err(anyhow!("requested branch does not exist: {b}"));
+            return Err(anyhow!("tracked branch missing"));
         }
         run_git(
             Some(t.path()),
@@ -471,28 +507,38 @@ pub(crate) fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
     if let Some(recovery) = &s.recovery_path {
         validate_state_path(&a.recovery, Path::new(recovery), "recovery")?;
     }
+    let record_failure =
+        |a: &mut App, s: &mut crate::Subscription, status: &str| -> Result<serde_json::Value> {
+            s.status = status.into();
+            let output = serde_json::json!({"skill":s.skill,"relationship":key,"status":status});
+            a.state.subscriptions.insert(key.into(), s.clone());
+            a.save()?;
+            Ok(output)
+        };
     let (repo, b) = match clone_repo_branch(&s.source, Some(&s.branch)) {
         Ok(x) => x,
         Err(e) if WORKER_STOP_REQUESTED.load(Ordering::Relaxed) => return Err(e),
         Err(e) => {
-            s.status = if e.to_string().to_lowercase().contains("auth") {
-                "authentication_required".into()
+            let status = if s.source.contains('@') {
+                "authentication_required"
+            } else if s.source.to_lowercase().contains("permission") {
+                "permission_denied"
             } else {
-                "offline".into()
+                status_for_error(&e.to_string())
             };
-            let status = s.status.clone();
-            let display_skill = s.skill.clone();
-            a.state.subscriptions.insert(key.into(), s);
-            a.save()?;
-            return Ok(
-                serde_json::json!({"skill":display_skill,"relationship":key,"status":status}),
-            );
+            return record_failure(a, &mut s, status);
         }
     };
     s.branch = b.clone();
     let repo_path = crate::filesystem::canonicalize_path_with_missing(repo.path())
         .context("canonicalize update repository")?;
-    let (_, up, _) = find_skill(&repo_path, &s.source_path)?;
+    let (_, up, _) = match find_skill(&repo_path, &s.source_path) {
+        Ok(found) => found,
+        Err(error) if error.to_string().starts_with("skill not found") => {
+            return record_failure(a, &mut s, "package_missing");
+        }
+        Err(error) => return Err(error),
+    };
     let (resolved_commit, resolved_tree) = rev_parse_provenance(&repo_path, &s.source_path)?;
     s.resolved_commit = Some(resolved_commit);
     s.resolved_tree = Some(resolved_tree);

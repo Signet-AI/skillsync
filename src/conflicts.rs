@@ -51,6 +51,10 @@ fn validate_subscription(
             | "authentication_required"
             | "offline"
             | "permission_denied"
+            | "source_missing"
+            | "branch_missing"
+            | "package_missing"
+            | "invalid_source"
     ) {
         return Err(anyhow!(
             "invalid subscription status: {}",

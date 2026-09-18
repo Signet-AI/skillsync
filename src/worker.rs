@@ -40,16 +40,16 @@ fn now() -> u64 {
         .as_secs()
 }
 
-fn status_for_error(error: &str) -> &'static str {
-    let lower = error.to_lowercase();
-    if lower.contains("auth") {
-        "authentication_required"
-    } else if lower.contains("offline") || lower.contains("not installed") {
-        "offline"
-    } else if lower.contains("permission") || lower.contains("access denied") {
-        "permission_denied"
-    } else {
-        "conflict"
+fn safe_error(status: &str) -> &'static str {
+    match status {
+        "authentication_required" => "repository authentication required",
+        "offline" => "repository unavailable offline",
+        "permission_denied" => "repository access denied",
+        "source_missing" => "source repository missing",
+        "branch_missing" => "tracked branch missing",
+        "package_missing" => "skill package missing",
+        "invalid_source" => "invalid repository source",
+        _ => "repository operation failed",
     }
 }
 
@@ -63,14 +63,14 @@ pub(crate) fn sync_all(a: &mut App, continue_on_error: bool) -> Result<serde_jso
             Err(error) if !continue_on_error => return Err(error),
             Err(error) => {
                 let error_text = error.to_string();
-                let status = status_for_error(&error_text);
+                let status = repository::status_for_error(&error_text);
                 if let Some(subscription) = a.state.subscriptions.get_mut(&key) {
                     subscription.status = status.into();
                     subscription.last_sync = now();
                 }
                 a.save()?;
                 results.push(
-                    serde_json::json!({"relationship": key, "status": status, "error": error_text}),
+                    serde_json::json!({"relationship": key, "status": status, "error": safe_error(status)}),
                 );
             }
         }
@@ -94,7 +94,7 @@ pub(crate) fn sync_all(a: &mut App, continue_on_error: bool) -> Result<serde_jso
             Err(error) if !continue_on_error => return Err(error),
             Err(error) => {
                 let error_text = error.to_string();
-                let status = status_for_error(&error_text);
+                let status = repository::status_for_error(&error_text);
                 if let Some(pending) = a.state.pending_publications.get_mut(&key) {
                     pending.publication.status = status.into();
                     pending.publication.last_sync = now();
@@ -104,7 +104,7 @@ pub(crate) fn sync_all(a: &mut App, continue_on_error: bool) -> Result<serde_jso
                     publication.last_sync = now();
                 }
                 a.save()?;
-                results.push(serde_json::json!({"skill": intent.skill, "relationship": key, "status": status, "error": error_text}));
+                results.push(serde_json::json!({"skill": intent.skill, "relationship": key, "status": status, "error": safe_error(status)}));
             }
         }
     }
@@ -128,14 +128,14 @@ pub(crate) fn sync_all(a: &mut App, continue_on_error: bool) -> Result<serde_jso
             Err(error) if WORKER_STOP_REQUESTED.load(Ordering::Relaxed) => return Err(error),
             Err(error) => {
                 let error_text = error.to_string();
-                let status = status_for_error(&error_text);
+                let status = repository::status_for_error(&error_text);
                 if let Some(publication) = a.state.publications.get_mut(&key) {
                     publication.status = status.into();
                     publication.last_sync = now();
                 }
                 a.save()?;
                 results.push(
-                    serde_json::json!({"skill": skill, "status": status, "error": error_text}),
+                    serde_json::json!({"skill": skill, "status": status, "error": safe_error(status)}),
                 );
             }
         }

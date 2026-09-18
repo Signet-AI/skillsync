@@ -255,6 +255,10 @@ fn validate_subscription_status(s: &str) -> Result<()> {
             | "authentication_required"
             | "offline"
             | "permission_denied"
+            | "source_missing"
+            | "branch_missing"
+            | "package_missing"
+            | "invalid_source"
     ) {
         Ok(())
     } else {
