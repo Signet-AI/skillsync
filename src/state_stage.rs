@@ -186,7 +186,7 @@ fn bundle_records(bundle: &Bundle, app: &App) -> Vec<StageRecord> {
     let mut out = Vec::new();
     for (key, s) in &bundle.subscriptions {
         let incoming = serde_json::to_value(s).unwrap();
-        let current = app.state.subscriptions.get(key).map(|x| json!({"skill":x.skill,"source":x.source,"branch":x.branch,"source_path":x.source_path,"baseline_hash":x.baseline_hash,"baseline_source":x.baseline_source,"baseline_source_path":x.baseline_source_path,"status":x.status,"conflict_selection":x.conflict_selection,"last_sync":x.last_sync,"update_count":x.update_count,"resolved_commit":x.resolved_commit,"resolved_tree":x.resolved_tree}));
+        let current = app.state.subscriptions.get(key).map(|x| json!({"branch_policy":x.branch_policy,"skill":x.skill,"source":x.source,"branch":x.branch,"source_path":x.source_path,"baseline_hash":x.baseline_hash,"baseline_source":x.baseline_source,"baseline_source_path":x.baseline_source_path,"status":x.status,"conflict_selection":x.conflict_selection,"last_sync":x.last_sync,"update_count":x.update_count,"resolved_commit":x.resolved_commit,"resolved_tree":x.resolved_tree}));
         out.push(record(
             RecordKind::Subscription,
             key,
@@ -253,7 +253,7 @@ fn bundle_records(bundle: &Bundle, app: &App) -> Vec<StageRecord> {
 }
 fn current_record(app: &App, record: &StageRecord) -> Option<Value> {
     match &record.kind {
-        RecordKind::Subscription => app.state.subscriptions.get(&record.key).map(|x| json!({"skill":x.skill,"source":x.source,"branch":x.branch,"source_path":x.source_path,"baseline_hash":x.baseline_hash,"baseline_source":x.baseline_source,"baseline_source_path":x.baseline_source_path,"status":x.status,"conflict_selection":x.conflict_selection,"last_sync":x.last_sync,"update_count":x.update_count,"resolved_commit":x.resolved_commit,"resolved_tree":x.resolved_tree})),
+        RecordKind::Subscription => app.state.subscriptions.get(&record.key).map(|x| json!({"branch_policy":x.branch_policy,"skill":x.skill,"source":x.source,"branch":x.branch,"source_path":x.source_path,"baseline_hash":x.baseline_hash,"baseline_source":x.baseline_source,"baseline_source_path":x.baseline_source_path,"status":x.status,"conflict_selection":x.conflict_selection,"last_sync":x.last_sync,"update_count":x.update_count,"resolved_commit":x.resolved_commit,"resolved_tree":x.resolved_tree})),
         RecordKind::Publication => app.state.publications.get(&record.key).map(|x| serde_json::to_value(x).unwrap()),
         RecordKind::PendingPublication => app.state.pending_publications.get(&record.key).map(|x| serde_json::to_value(&x.publication).unwrap()),
         RecordKind::Set => app.state.sets.get(&record.key).map(|x| serde_json::to_value(x).unwrap()),

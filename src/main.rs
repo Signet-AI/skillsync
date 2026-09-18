@@ -11,6 +11,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+mod branch_policy;
 mod capabilities;
 mod config_editor;
 mod conflicts;
@@ -25,6 +26,8 @@ mod tui;
 mod worker;
 mod worker_registration;
 pub(crate) use worker::{worker_status, WORKER_STOP_REQUESTED};
+
+use branch_policy::BranchPolicy;
 
 use filesystem::{
     assert_no_symlink_path, atomic, canonicalize_path, checked_regular_path, copy_tree, discover,
@@ -63,6 +66,8 @@ enum Cmd {
         repository: Option<String>,
         #[arg(long)]
         skill: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
     },
     Import {
         #[arg(long = "from")]
@@ -274,6 +279,8 @@ struct HarnessSetEnablement {
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Subscription {
+    #[serde(default)]
+    pub(crate) branch_policy: Option<BranchPolicy>,
     pub(crate) skill: String,
     pub(crate) source: String,
     pub(crate) branch: String,
@@ -470,6 +477,17 @@ impl App {
         if state.version < 6 {
             // Additive provenance migration: never contact repositories while loading.
             state.version = 6;
+        }
+        for subscription in state.subscriptions.values_mut() {
+            if subscription.branch_policy.is_none() {
+                subscription.branch_policy =
+                    Some(BranchPolicy::migrate_legacy(&subscription.branch)?);
+            }
+            subscription
+                .branch_policy
+                .as_ref()
+                .unwrap()
+                .validate_effective_branch(&subscription.branch)?;
         }
         validate_set_state(&state)?;
         let library = if state_exists && !state.library.is_empty() {
@@ -867,7 +885,10 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             ));
         }
     }
-    if let Cmd::Subscribe { repository, skill } = &command {
+    if let Cmd::Subscribe {
+        repository, skill, ..
+    } = &command
+    {
         use std::io::IsTerminal;
         let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
         if (!interactive || cli.json) && (repository.is_none() || skill.is_none()) {
@@ -991,7 +1012,11 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Cmd::Config {
             command: ConfigCmd::Edit,
         } => config_editor::edit_config(&a, cli.json),
-        Cmd::Subscribe { repository, skill } => {
+        Cmd::Subscribe {
+            repository,
+            skill,
+            branch,
+        } => {
             use std::io::IsTerminal;
             let interactive =
                 std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && !cli.json;
@@ -1010,7 +1035,12 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 None => return Err(anyhow!("repository required in noninteractive mode")),
             };
             let url = repository::normalize(&r)?;
-            let (repo, b) = repository::clone_repo(&url)?;
+            let requested_policy = match branch.as_deref() {
+                Some(name) => Some(BranchPolicy::explicit(name)?),
+                None => None,
+            };
+            let (repo, b) =
+                repository::clone_repo_branch_for_subscribe(&url, requested_policy.as_ref())?;
             let repo_path = filesystem::canonicalize_path_with_missing(repo.path())?;
             let found = discover(&repo_path)?;
             let selected = match skill {
@@ -1053,6 +1083,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             a.state.subscriptions.insert(
                 key.clone(),
                 Subscription {
+                    branch_policy: Some(requested_policy.unwrap_or(BranchPolicy::RemoteDefault)),
                     skill: name.clone(),
                     source: url.clone(),
                     branch: b,

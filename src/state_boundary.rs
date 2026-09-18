@@ -1,4 +1,5 @@
 use crate::{
+    branch_policy::BranchPolicy,
     filesystem::{assert_no_symlink_path, atomic, checked_regular_path, source_rel},
     App,
 };
@@ -41,6 +42,8 @@ pub(crate) struct Bundle {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Subscription {
+    #[serde(default)]
+    pub(crate) branch_policy: Option<BranchPolicy>,
     pub(crate) skill: String,
     pub(crate) source: String,
     pub(crate) branch: String,
@@ -90,6 +93,9 @@ fn portable_state(app: &App) -> Result<Bundle> {
         validate_remote(&s.source, "source")?;
         crate::strict_component(&s.skill, "subscription skill name")?;
         crate::repository::validate_branch(&s.branch)?;
+        if let Some(policy) = &s.branch_policy {
+            policy.validate_effective_branch(&s.branch)?;
+        }
         validate_hash(&s.baseline_hash, "baseline hash")?;
         validate_object_id(s.resolved_commit.as_deref(), "resolved commit")?;
         validate_object_id(s.resolved_tree.as_deref(), "resolved tree")?;
@@ -110,6 +116,10 @@ fn portable_state(app: &App) -> Result<Bundle> {
         subscriptions.insert(
             key.clone(),
             Subscription {
+                branch_policy: s
+                    .branch_policy
+                    .clone()
+                    .or_else(|| BranchPolicy::migrate_legacy(&s.branch).ok()),
                 skill: s.skill.clone(),
                 source: s.source.clone(),
                 branch: s.branch.clone(),
@@ -285,6 +295,11 @@ pub(crate) fn validate_bundle_bytes(bytes: &[u8]) -> Result<Bundle> {
         validate_text(&s.skill, "skill")?;
         validate_remote(&s.source, "source")?;
         crate::repository::validate_branch(&s.branch)?;
+        if let Some(policy) = &s.branch_policy {
+            policy.validate_effective_branch(&s.branch)?;
+        } else {
+            s.branch_policy = Some(BranchPolicy::migrate_legacy(&s.branch)?);
+        }
         canonical_source_rel(&s.source_path)?;
         if key != &crate::relationship_key(&s.source, &canonical_source_rel(&s.source_path)?) {
             return Err(anyhow!("subscription key does not match relationship"));

@@ -6,7 +6,8 @@ use crate::filesystem::{
 use crate::publication_key;
 use crate::recovery::{directory_identity, remove_owned_directory};
 use crate::{
-    now, unique_stamp, App, FileData, PendingPublication, Publication, WORKER_STOP_REQUESTED,
+    branch_policy::BranchPolicy, now, unique_stamp, App, FileData, PendingPublication, Publication,
+    WORKER_STOP_REQUESTED,
 };
 use anyhow::{anyhow, Context, Result};
 use std::{
@@ -254,7 +255,11 @@ pub(crate) fn clone_repo(repo: &str) -> Result<(tempfile::TempDir, String)> {
     )?;
     Ok((t, b))
 }
-fn clone_repo_branch(repo: &str, requested: Option<&str>) -> Result<(tempfile::TempDir, String)> {
+pub(crate) fn clone_repo_branch_for_subscribe(
+    repo: &str,
+    policy: Option<&BranchPolicy>,
+) -> Result<(tempfile::TempDir, String)> {
+    let requested = policy.and_then(BranchPolicy::requested_branch);
     if !repo.contains("://") && !repo.starts_with("git@") && !Path::new(repo).exists() {
         return Err(anyhow!("source repository missing"));
     }
@@ -276,6 +281,12 @@ fn clone_repo_branch(repo: &str, requested: Option<&str>) -> Result<(tempfile::T
         return Ok((t, b.to_owned()));
     }
     Ok((t, default))
+}
+fn clone_repo_branch(repo: &str, requested: Option<&str>) -> Result<(tempfile::TempDir, String)> {
+    clone_repo_branch_for_subscribe(
+        repo,
+        requested.map(BranchPolicy::explicit).transpose()?.as_ref(),
+    )
 }
 fn find_skill(root: &Path, q: &str) -> Result<(String, PathBuf, String)> {
     let all = discover(root)?;
@@ -515,7 +526,13 @@ pub(crate) fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
             a.save()?;
             Ok(output)
         };
-    let (repo, b) = match clone_repo_branch(&s.source, Some(&s.branch)) {
+    let stored_policy = s
+        .branch_policy
+        .as_ref()
+        .ok_or_else(|| anyhow!("subscription branch policy missing"))?;
+    stored_policy.validate_effective_branch(&s.branch)?;
+    let policy = stored_policy.clone();
+    let (repo, b) = match clone_repo_branch_for_subscribe(&s.source, Some(&policy)) {
         Ok(x) => x,
         Err(e) if WORKER_STOP_REQUESTED.load(Ordering::Relaxed) => return Err(e),
         Err(e) => {
@@ -529,7 +546,7 @@ pub(crate) fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
             return record_failure(a, &mut s, status);
         }
     };
-    s.branch = b.clone();
+    let previous_branch = s.branch.clone();
     let repo_path = crate::filesystem::canonicalize_path_with_missing(repo.path())
         .context("canonicalize update repository")?;
     let (_, up, _) = match find_skill(&repo_path, &s.source_path) {
@@ -540,6 +557,7 @@ pub(crate) fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
         Err(error) => return Err(error),
     };
     let (resolved_commit, resolved_tree) = rev_parse_provenance(&repo_path, &s.source_path)?;
+    s.branch = b.clone();
     s.resolved_commit = Some(resolved_commit);
     s.resolved_tree = Some(resolved_tree);
     let base = PathBuf::from(&s.baseline_path);
@@ -556,7 +574,14 @@ pub(crate) fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
         };
         a.state.subscriptions.insert(key.into(), s.clone());
         a.save()?;
-        return Ok(serde_json::json!({"skill":s.skill,"relationship":key,"status":s.status}));
+        let result = if b != previous_branch {
+            "no_change"
+        } else {
+            s.status.as_str()
+        };
+        return Ok(
+            serde_json::json!({"skill":s.skill,"relationship":key,"status":s.status,"result":result}),
+        );
     }
     let live_parent = crate::filesystem::open_directory_file_bound(
         local

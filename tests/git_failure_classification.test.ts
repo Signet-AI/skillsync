@@ -34,11 +34,21 @@ test("worker classifies a missing repository without mutating live package or ba
   expect(await readFile(join(root, "library", "demo", "SKILL.md"), "utf8")).toBe(live);
 });
 
+test("explicit policy mismatch fails closed before update and never follows mutable branch", async () => {
+  const { root, source } = await fixture(); const statePath = join(root, "config", "state.json"); const before = JSON.parse(await readFile(statePath, "utf8")); const key = Object.keys(before.subscriptions)[0];
+  git(source, ["checkout", "-qb", "release"]); await writeFile(join(source, "nested", "demo", "SKILL.md"), "name: demo\nrelease\n"); git(source, ["add", "."]); git(source, ["commit", "-qm", "release change"]);
+  const state = { ...before, subscriptions: { ...before.subscriptions, [key]: { ...before.subscriptions[key], branch: "main", branch_policy: { kind: "explicit", name: "release" } } } };
+  await writeFile(statePath, JSON.stringify(state));
+  const result = run(root, ["worker", "--once"], false); expect(JSON.stringify(result)).toContain("branch policy");
+  const after = JSON.parse(await readFile(statePath, "utf8")); expect(after.subscriptions[key]).toEqual(state.subscriptions[key]);
+  expect(await readFile(join(root, "library", "demo", "SKILL.md"), "utf8")).toBe("name: demo\noriginal\n");
+});
+
 test("worker distinguishes missing tracked branch and missing nested package", async () => {
   const { root, source } = await fixture(); const statePath = join(root, "config", "state.json"); const state = JSON.parse(await readFile(statePath, "utf8")); const key = Object.keys(state.subscriptions)[0];
-  state.subscriptions[key].branch = "does-not-exist"; await writeFile(statePath, JSON.stringify(state));
+  state.subscriptions[key].branch = "does-not-exist"; state.subscriptions[key].branch_policy = { kind: "explicit", name: "does-not-exist" }; await writeFile(statePath, JSON.stringify(state));
   expect(run(root, ["worker", "--once"]).results[0].status).toBe("branch_missing");
-  state.subscriptions[key].branch = "main"; await writeFile(statePath, JSON.stringify(state)); await rm(join(source, "nested", "demo"), { recursive: true, force: true }); git(source, ["add", "-A"]); git(source, ["commit", "-qm", "remove package"]);
+  state.subscriptions[key].branch = "main"; state.subscriptions[key].branch_policy = { kind: "explicit", name: "main" }; await writeFile(statePath, JSON.stringify(state)); await rm(join(source, "nested", "demo"), { recursive: true, force: true }); git(source, ["add", "-A"]); git(source, ["commit", "-qm", "remove package"]);
   const result = run(root, ["worker", "--once"]); expect(result.results[0].status).toBe("package_missing");
 });
 
