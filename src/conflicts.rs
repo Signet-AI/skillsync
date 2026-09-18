@@ -472,6 +472,44 @@ fn validate_workspace_spelling(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_workspace_tree(root: &Path, label: &str) -> Result<()> {
+    fn walk(root: &Path, current: &Path, rel: &Path, label: &str) -> Result<()> {
+        let mut entries = fs::read_dir(current)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let child_rel = rel.join(entry.file_name());
+            if !safe(&child_rel) {
+                return Err(anyhow!("workspace {label} contains an unsafe path"));
+            }
+            crate::filesystem::reject_reparse_point(&path, "workspace descendant")?;
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(anyhow!("workspace {label} contains a symlink"));
+            }
+            if metadata.is_dir() {
+                if canonicalize_path(&path)? != path {
+                    return Err(anyhow!("workspace {label} contains an unsafe directory"));
+                }
+                walk(root, &path, &child_rel, label)?;
+            } else if metadata.is_file() {
+                if canonicalize_path(&path)? != path {
+                    return Err(anyhow!("workspace {label} contains an unsafe file"));
+                }
+            } else {
+                return Err(anyhow!("workspace {label} contains an unsupported entry"));
+            }
+        }
+        let _ = root;
+        Ok(())
+    }
+    let metadata = fs::symlink_metadata(root)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || canonicalize_path(root)? != root {
+        return Err(anyhow!("workspace {label} is not a canonical directory"));
+    }
+    walk(root, root, Path::new(""), label)
+}
+
 pub(crate) fn inspect_workspace(workspace: &Path) -> Result<serde_json::Value> {
     validate_workspace_spelling(workspace)?;
     let absolute = if workspace.is_absolute() {
@@ -570,6 +608,7 @@ pub(crate) fn inspect_workspace(workspace: &Path) -> Result<serde_json::Value> {
         ("incoming", &manifest.incoming_hash),
     ] {
         let path = workspace.join(side);
+        validate_workspace_tree(&path, side)?;
         let m = fs::symlink_metadata(&path)?;
         if !m.is_dir()
             || m.file_type().is_symlink()

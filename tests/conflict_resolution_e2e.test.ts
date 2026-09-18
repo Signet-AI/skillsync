@@ -314,3 +314,25 @@ test("rejects unsafe workspace spellings before following or mutating them", asy
     expect(await readFile(statePath, "utf8")).toBe(beforeState);
   }
 }, { timeout: 30000 });
+
+test("rejects nested symlinks on every conflict side without mutation", async () => {
+  const { f, relationship, statePath } = await conflictFixture();
+  const workspace = join(f.root, "nested-links-workspace");
+  const stateBefore = await readFile(statePath, "utf8");
+  const state = JSON.parse(stateBefore);
+  const recovery = state.subscriptions[relationship].recovery_path as string;
+  const shown = run(f, ["--json", "conflicts", "show", relationship]).json;
+  const source = "owner/repo", sourcePath = "skills/demo";
+  const portableRelationship = `rel-${createHash("sha256").update(source).update(new Uint8Array([0])).update(sourcePath).digest("hex")}`;
+  for (const victim of ["base", "local", "incoming"]) {
+    await rm(workspace, { recursive: true, force: true });
+    await mkdir(workspace, { recursive: true });
+    for (const side of ["base", "local", "incoming"]) await cp(join(recovery, side), join(workspace, side), { recursive: true });
+    await mkdir(dirname(join(workspace, victim, "references/nested-link")), { recursive: true });
+    await symlink(join(f.root, "outside-missing"), join(workspace, victim, "references/nested-link"), "dir");
+    await writeFile(join(workspace, "manifest.json"), JSON.stringify({ manifest_version: 1, workspace_kind: "conflict-resolution", status: "immutable", relationship: portableRelationship, source, source_path: sourcePath, skill: "demo", base_hash: shown.base_hash, local_hash: shown.local_hash, incoming_hash: shown.incoming_hash, live_hash_at_export: shown.live_hash_at_detection }));
+    const rejected = run(f, ["--json", "conflicts", "inspect-workspace", "--workspace", workspace], false);
+    expect(rejected.json.ok).toBe(false);
+    expect(await readFile(statePath, "utf8")).toBe(stateBefore);
+  }
+}, { timeout: 30000 });
