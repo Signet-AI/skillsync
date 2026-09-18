@@ -25,6 +25,44 @@ test("state stage writes a deterministic non-activating evidence plan", async ()
   expect(value.non_activating).toBe(true); expect(value.target.library).toBe(join(root, "library"));
 });
 
+test("state inspect-plan validates a staged plan and reports target availability", async () => {
+  const root = await fixture(); const bundle = join(root, "bundle.json"); const plan = join(root, "plan.json");
+  run(root, ["state", "export", "--out", bundle]);
+  run(root, ["state", "stage", "--from", bundle, "--plan", plan]);
+  const before = await readFile(join(root, "config", "state.json"), "utf8");
+  const result = run(root, ["state", "inspect-plan", "--plan", plan, "--from", bundle]);
+  expect(result.format).toBe("skillsync-state-stage-plan"); expect(result.status).toBe("fresh");
+  expect(result.record_count).toBeGreaterThan(0); expect(await readFile(join(root, "config", "state.json"), "utf8")).toBe(before);
+});
+
+test("state inspect-plan rejects forged derived paths and duplicate records", async () => {
+  const root = await fixture(); const bundle = join(root, "bundle.json"); const plan = join(root, "plan.json");
+  run(root, ["state", "export", "--out", bundle]); run(root, ["state", "stage", "--from", bundle, "--plan", plan]);
+  const value = JSON.parse(await readFile(plan, "utf8")); value.records[0].derived_local_path = "/forged"; await writeFile(plan, JSON.stringify(value));
+  expect(run(root, ["state", "inspect-plan", "--plan", plan], false).ok).toBe(false);
+  value.records[0].derived_local_path = join(root, "library", value.records[0].skill); value.records.push(value.records[0]); await writeFile(plan, JSON.stringify(value));
+  expect(run(root, ["state", "inspect-plan", "--plan", plan], false).ok).toBe(false);
+});
+
+test("state inspect-plan rejects forged semantic record data without --from", async () => {
+  const root = await fixture(); const bundle = join(root, "bundle.json"); const plan = join(root, "plan.json");
+  run(root, ["state", "export", "--out", bundle]); run(root, ["state", "stage", "--from", bundle, "--plan", plan]);
+  const value = JSON.parse(await readFile(plan, "utf8"));
+  value.records[0].skill = "other";
+  value.records[0].observed.skill = "other";
+  await writeFile(plan, JSON.stringify(value));
+  expect(run(root, ["state", "inspect-plan", "--plan", plan], false).ok).toBe(false);
+});
+
+test("state inspect-plan validates pure plans without creating target state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skillsync-plan-uninitialized-")); roots.push(root);
+  const bundle = join(root, "bundle.json"); const plan = join(root, "plan.json");
+  const target = { format: "skillsync-state-stage-plan", version: 1, non_activating: true, bundle_hash: "0".repeat(64), target: { library: join(root, "library"), state_version: 5, initialized: false }, records: [], activation: "not_supported" };
+  await writeFile(plan, JSON.stringify(target));
+  const result = run(root, ["state", "inspect-plan", "--plan", plan], false);
+  expect(result.ok).toBe(false); expect(await Bun.file(join(root, "config", "state.json")).exists()).toBe(false);
+});
+
 test("state export is deterministic metadata-only and inspect is read-only", async () => {
   const root = await fixture(); const one = join(root, "one.json"); const two = join(root, "two.json");
   const before = await readFile(join(root, "config", "state.json"), "utf8");

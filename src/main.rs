@@ -130,6 +130,12 @@ enum StateCmd {
         #[arg(long = "from")]
         from: PathBuf,
     },
+    InspectPlan {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long = "from")]
+        from: Option<PathBuf>,
+    },
     Export {
         #[arg(long)]
         out: PathBuf,
@@ -645,7 +651,7 @@ fn interactive_package_selection(found: &[(String, PathBuf, String)]) -> Result<
 fn requires_lock(command: &Cmd) -> bool {
     match command {
         Cmd::State {
-            command: StateCmd::Inspect { .. },
+            command: StateCmd::InspectPlan { .. },
         } => false,
         Cmd::Worker {
             command: Some(WorkerCmd::Status),
@@ -792,6 +798,22 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
     {
         return state_boundary::inspect(from);
     }
+    if let Cmd::State {
+        command: StateCmd::InspectPlan { plan, from },
+    } = &command
+    {
+        let config = config_dir();
+        let state_exists = config.join("state.json").is_file();
+        if state_exists {
+            let lock = StateLock::acquire_read_only_if_present(&config)?
+                .ok_or_else(|| anyhow!("initialized target has no shared lock"))?;
+            lock.verify_config_identity(&config)?;
+            let app = App::load(Some(&lock))?;
+            lock.verify_config_identity(&app.config)?;
+            return state_stage::inspect_plan(Some(&app), plan, from.as_deref());
+        }
+        return state_stage::inspect_plan(None, plan, from.as_deref());
+    }
     if let Cmd::Worker {
         command: Some(_),
         once,
@@ -890,6 +912,11 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Cmd::State {
             command: StateCmd::Inspect { .. },
         } => unreachable!("state inspect handled before App load"),
+        Cmd::State {
+            command: StateCmd::InspectPlan { .. },
+        } => {
+            unreachable!("state inspect-plan handled before App load")
+        }
         Cmd::Init { library } => {
             if !a.state_path.exists() {
                 if let Some(l) = library {
