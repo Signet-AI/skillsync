@@ -179,8 +179,8 @@ pub(crate) fn open_directory_file_bound(path: &Path) -> Result<fs::File> {
     use std::{iter, os::windows::ffi::OsStrExt, os::windows::io::FromRawHandle};
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     const GENERIC_READ_ACCESS: u32 = 0x8000_0000;
 
@@ -198,7 +198,7 @@ pub(crate) fn open_directory_file_bound(path: &Path) -> Result<fs::File> {
         CreateFileW(
             wide.as_ptr(),
             GENERIC_READ_ACCESS,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             std::ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -1152,15 +1152,169 @@ pub(crate) fn atomic_unix(p: &Path, b: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_temp_file_bound(path: &Path) -> Result<fs::File> {
+    use std::{iter, os::windows::ffi::OsStrExt, os::windows::io::FromRawHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    const GENERIC_READ_ACCESS: u32 = 0x8000_0000;
+    const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000;
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ_ACCESS | GENERIC_WRITE_ACCESS | DELETE_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe { fs::File::from_raw_handle(handle as _) })
+}
+
+#[cfg(windows)]
+fn rename_file_handle_bound(
+    file: &fs::File,
+    parent: &fs::File,
+    name: &std::ffi::OsStr,
+) -> Result<()> {
+    use std::mem::{align_of, size_of, MaybeUninit};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
+    };
+
+    let name = name.encode_wide().collect::<Vec<_>>();
+    let name_bytes = name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .ok_or_else(|| anyhow!("destination name is too long"))?;
+    let header = size_of::<FILE_RENAME_INFO>() - size_of::<u16>();
+    let total = header
+        .checked_add(name_bytes)
+        .ok_or_else(|| anyhow!("destination name is too long"))?;
+    // FILE_RENAME_INFO has a flexible trailing array. Allocate whole elements so
+    // the pointer has the alignment required by the actual windows-sys type;
+    // only `total` bytes are exposed to the Windows API below.
+    let element_count = total.div_ceil(size_of::<FILE_RENAME_INFO>());
+    let mut buffer = Vec::<MaybeUninit<FILE_RENAME_INFO>>::with_capacity(element_count);
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    debug_assert_eq!(info as usize % align_of::<FILE_RENAME_INFO>(), 0);
+    unsafe {
+        std::ptr::addr_of_mut!((*info).Anonymous.ReplaceIfExists).write(true);
+        std::ptr::addr_of_mut!((*info).RootDirectory).write(parent.as_raw_handle() as _);
+        std::ptr::addr_of_mut!((*info).FileNameLength).write(name_bytes as u32);
+        let file_name = (info.cast::<u8>()).add(header).cast::<u16>();
+        std::ptr::copy_nonoverlapping(name.as_ptr(), file_name, name.len());
+        if SetFileInformationByHandle(
+            file.as_raw_handle() as _,
+            FileRenameInfo,
+            info.cast(),
+            total as u32,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn delete_file_handle_bound(file: &fs::File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    unsafe {
+        if SetFileInformationByHandle(
+            file.as_raw_handle() as _,
+            FileDispositionInfo,
+            (&info as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 pub(crate) fn atomic_portable(p: &Path, b: &[u8]) -> Result<()> {
     let parent = p
         .parent()
         .ok_or_else(|| anyhow!("atomic path has no parent: {}", p.display()))?;
     assert_no_symlink_path(parent, Path::new("."))?;
     fs::create_dir_all(parent)?;
-    assert_no_symlink_path(parent, Path::new("."))?;
+    let parent_file = open_directory_file_bound(parent)?;
+    let parent_identity = windows_file_identity(&parent_file)?;
     reject_reparse_point(p, "atomic target")?;
+    let temp = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        p.file_name().unwrap().to_string_lossy(),
+        std::process::id(),
+        unique_stamp()
+    ));
+    let mut published = false;
+    let mut file = None;
+    let result = (|| -> Result<()> {
+        let mut opened = open_temp_file_bound(&temp)?;
+        opened.write_all(b)?;
+        opened.sync_all()?;
+        file = Some(opened);
+        if windows_file_identity(&parent_file)? != parent_identity {
+            return Err(anyhow!(
+                "destination parent changed during replacement: {}",
+                parent.display()
+            ));
+        }
+        reject_reparse_point(p, "atomic target")?;
+        rename_file_handle_bound(
+            file.as_ref().unwrap(),
+            &parent_file,
+            p.file_name()
+                .ok_or_else(|| anyhow!("atomic path has no filename"))?,
+        )?;
+        published = true;
+        reject_reparse_point(p, "atomic target")?;
+        let target_file = open_regular_file_bound(p, false, false)?;
+        if !target_file.metadata()?.is_file() {
+            return Err(anyhow!(
+                "atomic target is not a regular file: {}",
+                p.display()
+            ));
+        }
+        Ok(())
+    })();
+    if result.is_err() && !published {
+        if let Some(file) = file.as_ref() {
+            let _ = delete_file_handle_bound(file);
+        }
+    }
+    result
+}
+
+#[cfg(all(not(unix), not(windows)))]
+pub(crate) fn atomic_portable(p: &Path, b: &[u8]) -> Result<()> {
+    let parent = p
+        .parent()
+        .ok_or_else(|| anyhow!("atomic path has no parent: {}", p.display()))?;
+    fs::create_dir_all(parent)?;
     let temp = parent.join(format!(
         ".{}.tmp-{}-{}",
         p.file_name().unwrap().to_string_lossy(),
@@ -1173,44 +1327,11 @@ pub(crate) fn atomic_portable(p: &Path, b: &[u8]) -> Result<()> {
         .open(&temp)?;
     file.write_all(b)?;
     file.sync_all()?;
-    #[cfg(windows)]
-    {
-        use std::{iter, os::windows::ffi::OsStrExt};
-        use windows_sys::Win32::Storage::FileSystem::{
-            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-        };
-        let source = temp
-            .as_os_str()
-            .encode_wide()
-            .chain(iter::once(0))
-            .collect::<Vec<_>>();
-        let target = p
-            .as_os_str()
-            .encode_wide()
-            .chain(iter::once(0))
-            .collect::<Vec<_>>();
-        let moved = unsafe {
-            MoveFileExW(
-                source.as_ptr(),
-                target.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        if moved == 0 {
-            let error = std::io::Error::last_os_error();
-            let _ = fs::remove_file(&temp);
-            return Err(error.into());
-        }
-        Ok(())
+    if let Err(error) = fs::rename(&temp, p) {
+        let _ = fs::remove_file(&temp);
+        return Err(error.into());
     }
-    #[cfg(not(windows))]
-    {
-        if let Err(error) = fs::rename(&temp, p) {
-            let _ = fs::remove_file(&temp);
-            return Err(error.into());
-        }
-        Ok(())
-    }
+    Ok(())
 }
 pub(crate) fn safe(p: &Path) -> bool {
     p.is_relative()
