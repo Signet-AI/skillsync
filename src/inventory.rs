@@ -1,4 +1,5 @@
 use crate::{
+    capabilities::{capability_report, legacy_capability_value, CapabilityReport},
     filesystem::{discover, effective_library_path, resolve_library_path},
     harness, worker_status, App, State,
 };
@@ -13,6 +14,17 @@ pub(crate) struct Inventory {
     pub(crate) harness_links: Vec<HarnessHealth>,
     pub(crate) worker: String,
     pub(crate) capabilities: Capabilities,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct Capabilities {
+    pub(crate) hermes_autonomous_curation: &'static str,
+    pub(crate) harness_discovery: &'static str,
+    pub(crate) harness_filtering: &'static str,
+    pub(crate) harness_reload: &'static str,
+    pub(crate) full_tui: &'static str,
+    pub(crate) registry_integration: &'static str,
+    pub(crate) typed: CapabilityReport,
 }
 
 #[derive(Debug, Serialize)]
@@ -55,16 +67,6 @@ pub(crate) struct HarnessHealth {
     pub(crate) link_path: Option<String>,
     pub(crate) status: String,
     pub(crate) message: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct Capabilities {
-    pub(crate) hermes_autonomous_curation: &'static str,
-    pub(crate) harness_discovery: &'static str,
-    pub(crate) harness_filtering: &'static str,
-    pub(crate) harness_reload: &'static str,
-    pub(crate) full_tui: &'static str,
-    pub(crate) registry_integration: &'static str,
 }
 
 pub(crate) fn query(a: &App) -> Result<Inventory> {
@@ -165,13 +167,17 @@ fn query_with(library: &Path, state: &State, config: &Path) -> Result<Inventory>
         } else {
             worker_status(config)?.into()
         },
-        capabilities: Capabilities {
-            hermes_autonomous_curation: "unsupported",
-            harness_discovery: "unsupported",
-            harness_filtering: "unsupported",
-            harness_reload: "unsupported",
-            full_tui: "unsupported",
-            registry_integration: "unsupported",
+        capabilities: {
+            let typed = capability_report(&library.display().to_string(), config != Path::new("."));
+            Capabilities {
+                hermes_autonomous_curation: legacy_capability_value("hermes_autonomous_curation"),
+                harness_discovery: legacy_capability_value("harness_discovery"),
+                harness_filtering: legacy_capability_value("harness_filtering"),
+                harness_reload: legacy_capability_value("harness_reload"),
+                full_tui: legacy_capability_value("full_tui"),
+                registry_integration: legacy_capability_value("registry_integration"),
+                typed,
+            }
         },
     })
 }

@@ -127,6 +127,39 @@ test("inventory is deterministic for root and nested packages without mutation",
   expect((await stat(lockPath)).mtimeMs).toBe(beforeLock.mtimeMs);
 });
 
+test("inventory and doctor share legacy capability projections and typed declarations", async () => {
+  const fixture = await makeFixture();
+  skillsync(fixture, ["--json", "init"]);
+  const inventory = skillsync(fixture, ["--json", "inventory"]).json;
+  const doctor = skillsync(fixture, ["--json", "doctor"]).json;
+  for (const key of ["hermes_autonomous_curation", "harness_discovery", "harness_filtering", "harness_reload", "full_tui", "registry_integration"]) {
+    expect(inventory.capabilities[key]).toBe(doctor[key]);
+  }
+  expect(inventory.capabilities.typed.capabilities.map((item: any) => [item.id, item.support, item.verification])).toEqual(
+    doctor.capabilities.map((item: any) => [item.id, item.support, item.verification]),
+  );
+  expect(inventory.capabilities.typed.boundaries).toEqual(doctor.discovery_boundaries);
+});
+
+test("platform-dependent capability verification is honest and deterministic", async () => {
+  const fixture = await makeFixture();
+  const first = skillsync(fixture, ["--json", "doctor"]).json;
+  const second = skillsync(fixture, ["--json", "doctor"]).json;
+  expect(first.capabilities).toEqual(second.capabilities);
+  const platformDependent = new Set([
+    "library.configured",
+    "git.relationships",
+    "local.adoption",
+    "harness.links",
+    "worker.startup",
+  ]);
+  const expected = process.platform === "linux" ? "runtime_tested" : "compile_checked";
+  for (const capability of first.capabilities.filter((item: any) => platformDependent.has(item.id))) {
+    expect(capability.verification).toBe(expected);
+  }
+  expect(first.capabilities.filter((item: any) => item.verification === "runtime_tested").every((item: any) => platformDependent.has(item.id))).toBe(true);
+});
+
 test("inventory attributes publication only to the canonical same-named package", async () => {
   const fixture = await makeFixture();
   const destination = join(fixture.root, "publication-destination.git");

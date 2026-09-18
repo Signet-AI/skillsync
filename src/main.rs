@@ -11,6 +11,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+mod capabilities;
 mod config_editor;
 mod conflicts;
 mod filesystem;
@@ -1163,9 +1164,12 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             serde_json::json!({"subscriptions":a.state.subscriptions,"local_adoptions":a.state.local_adoptions,"publications":a.state.publications,"pending_publications":a.state.pending_publications,"harness_links":a.state.harness_links,"harness_sets":a.state.harness_sets,"harness_health":harness::harness_link_health(&a)?,"worker":worker::worker_status(&a.config)?,"worker_registration":worker_registration::status(&a.config)?}),
         ),
         Cmd::Inventory => Ok(serde_json::to_value(inventory::query(&a)?)?),
-        Cmd::Doctor => Ok(
-            serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":worker::worker_status(&a.config)?,"startup":"unsupported","subscribe_picker":"supported: TTY line-oriented single-select; unattended onboarding unsupported; full TUI: unsupported","harness_write_back":"explicit_directory_links_only","harness_discovery":"unsupported","harness_filtering":"unsupported","harness_reload":"unsupported","harness_links":harness::harness_link_health(&a)?,"hermes_autonomous_curation":"unsupported","registries":"unsupported","set_publication":"unsupported","set_subscription_metadata":"unsupported","harness_enablement":"supported: explicit one-time set expansion into native directory links","personal_library_sync":"unsupported","membership_change_propagation":"unsupported","local_import":"supported: explicit --from PATH --skill NAME; canonical write-back only; no subscription"}),
-        ),
+        Cmd::Doctor => {
+            let report = capabilities::capability_report(&a.library.display().to_string(), true);
+            Ok(
+                serde_json::json!({"git":Command::new("git").arg("--version").output().map(|x|x.status.success()).unwrap_or(false),"config_exists":a.config.exists(),"library_exists":a.library.exists(),"worker":worker::worker_status(&a.config)?,"startup":capabilities::legacy_capability_value("startup"),"subscribe_picker":"supported: TTY line-oriented single-select; unattended onboarding unsupported; full TUI: unsupported","harness_write_back":"explicit_directory_links_only","harness_discovery":capabilities::legacy_capability_value("harness_discovery"),"harness_filtering":capabilities::legacy_capability_value("harness_filtering"),"harness_reload":capabilities::legacy_capability_value("harness_reload"),"harness_links":harness::harness_link_health(&a)?,"hermes_autonomous_curation":capabilities::legacy_capability_value("hermes_autonomous_curation"),"registries":capabilities::legacy_capability_value("registries"),"registry_integration":capabilities::legacy_capability_value("registry_integration"),"full_tui":capabilities::legacy_capability_value("full_tui"),"set_publication":"unsupported","set_subscription_metadata":"unsupported","harness_enablement":"supported: explicit one-time set expansion into native directory links","personal_library_sync":"unsupported","membership_change_propagation":"unsupported","local_import":"supported: explicit --from PATH --skill NAME; canonical write-back only; no subscription","capabilities":report.capabilities,"discovery_boundaries":report.boundaries}),
+            )
+        }
         Cmd::Set { command } => match command {
             SetCmd::Create { name } => {
                 let name = strict_component(&name, "set name")?;
