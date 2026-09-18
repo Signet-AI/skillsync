@@ -15,6 +15,16 @@ function run(root: string, args: string[], ok = true) {
 async function fixture() { const root = await mkdtemp(join(tmpdir(), "skillsync-state-meta-")); roots.push(root); await mkdir(join(root, "library", "demo"), { recursive: true }); await writeFile(join(root, "library", "demo", "SKILL.md"), "name: demo\n"); run(root, ["init"]); run(root, ["set", "create", "core"]); run(root, ["set", "add", "core", "demo"]); return root; }
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
+test("state stage writes a deterministic non-activating evidence plan", async () => {
+  const root = await fixture(); const bundle = join(root, "bundle.json"); const plan = join(root, "plan.json");
+  run(root, ["state", "export", "--out", bundle]);
+  const result = run(root, ["state", "stage", "--from", bundle, "--plan", plan]);
+  expect(result.format).toBe("skillsync-state-stage-plan");
+  const value = JSON.parse(await readFile(plan, "utf8"));
+  expect(value.version).toBe(1); expect(value.bundle_hash).toMatch(/^[0-9a-f]{64}$/);
+  expect(value.non_activating).toBe(true); expect(value.target.library).toBe(join(root, "library"));
+});
+
 test("state export is deterministic metadata-only and inspect is read-only", async () => {
   const root = await fixture(); const one = join(root, "one.json"); const two = join(root, "two.json");
   const before = await readFile(join(root, "config", "state.json"), "utf8");

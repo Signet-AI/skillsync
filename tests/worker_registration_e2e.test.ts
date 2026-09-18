@@ -23,7 +23,7 @@ function expectedArtifacts(f: F) {
     const root = join(f.env.LOCALAPPDATA ?? "", "skillsync");
     return { executable: join(root, "bin", "skillsync.exe"), registration: join(root, "worker-task.xml") };
   }
-  const root = join(f.env.HOME, ".local/share/skillsync");
+  const root = join(f.env.XDG_DATA_HOME ?? join(f.env.HOME, ".local/share"), "skillsync");
   return {
     executable: join(root, "bin", "skillsync"),
     registration: join(f.env.HOME, ".config/systemd/user/skillsync-worker.service"),

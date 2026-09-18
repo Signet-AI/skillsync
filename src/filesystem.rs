@@ -1842,7 +1842,7 @@ fn copy_tree_windows(src: &Path, dst: &Path, complete: bool) -> Result<()> {
 pub(crate) fn copy_complete_tree(src: &Path, dst: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        return copy_tree_windows(src, dst, true);
+        copy_tree_windows(src, dst, true)
     }
     #[cfg(not(windows))]
     {
@@ -1900,7 +1900,7 @@ pub(crate) fn copy_complete_tree(src: &Path, dst: &Path) -> Result<()> {
 pub(crate) fn copy_existing_tree(src: &Path, dst: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        return copy_tree_windows(src, dst, false);
+        copy_tree_windows(src, dst, false)
     }
     #[cfg(not(windows))]
     {
@@ -2067,32 +2067,6 @@ pub(crate) fn install_dir_noreplace(_src: &Path, _dst: &Path) -> Result<()> {
     Err(anyhow!(
         "safe no-replace directory installation is unavailable on this Unix platform"
     ))
-}
-
-#[cfg(windows)]
-fn move_path_windows(src: &Path, dst: &Path, replace: bool) -> Result<()> {
-    use std::{iter, os::windows::ffi::OsStrExt};
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-    let source = src
-        .as_os_str()
-        .encode_wide()
-        .chain(iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = dst
-        .as_os_str()
-        .encode_wide()
-        .chain(iter::once(0))
-        .collect::<Vec<_>>();
-    let mut flags = MOVEFILE_WRITE_THROUGH;
-    if replace {
-        flags |= MOVEFILE_REPLACE_EXISTING;
-    }
-    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
 }
 
 #[cfg(windows)]

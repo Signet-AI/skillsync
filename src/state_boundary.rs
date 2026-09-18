@@ -28,55 +28,55 @@ fn canonical_source_rel(value: &str) -> Result<String> {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Bundle {
-    format: String,
-    version: u32,
-    metadata_only: bool,
-    subscriptions: BTreeMap<String, Subscription>,
-    publications: BTreeMap<String, Publication>,
-    pending_publications: BTreeMap<String, Publication>,
-    sets: BTreeMap<String, SkillSet>,
-    local_adoptions: BTreeMap<String, LocalAdoption>,
+pub(crate) struct Bundle {
+    pub(crate) format: String,
+    pub(crate) version: u32,
+    pub(crate) metadata_only: bool,
+    pub(crate) subscriptions: BTreeMap<String, Subscription>,
+    pub(crate) publications: BTreeMap<String, Publication>,
+    pub(crate) pending_publications: BTreeMap<String, Publication>,
+    pub(crate) sets: BTreeMap<String, SkillSet>,
+    pub(crate) local_adoptions: BTreeMap<String, LocalAdoption>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Subscription {
-    skill: String,
-    source: String,
-    branch: String,
-    source_path: String,
-    baseline_hash: String,
-    baseline_source: String,
-    baseline_source_path: String,
-    status: String,
-    conflict_selection: Option<String>,
-    last_sync: u64,
-    update_count: u64,
+pub(crate) struct Subscription {
+    pub(crate) skill: String,
+    pub(crate) source: String,
+    pub(crate) branch: String,
+    pub(crate) source_path: String,
+    pub(crate) baseline_hash: String,
+    pub(crate) baseline_source: String,
+    pub(crate) baseline_source_path: String,
+    pub(crate) status: String,
+    pub(crate) conflict_selection: Option<String>,
+    pub(crate) last_sync: u64,
+    pub(crate) update_count: u64,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Publication {
-    skill: String,
-    destination: String,
-    branch: String,
-    path: String,
-    approved: bool,
-    status: String,
-    last_hash: Option<String>,
-    last_sync: u64,
+pub(crate) struct Publication {
+    pub(crate) skill: String,
+    pub(crate) destination: String,
+    pub(crate) branch: String,
+    pub(crate) path: String,
+    pub(crate) approved: bool,
+    pub(crate) status: String,
+    pub(crate) last_hash: Option<String>,
+    pub(crate) last_sync: u64,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SkillSet {
-    members: Vec<String>,
+pub(crate) struct SkillSet {
+    pub(crate) members: Vec<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LocalAdoption {
-    skill: String,
-    source_package: String,
-    content_hash: String,
-    status: String,
+pub(crate) struct LocalAdoption {
+    pub(crate) skill: String,
+    pub(crate) source_package: String,
+    pub(crate) content_hash: String,
+    pub(crate) status: String,
 }
 
 fn portable_state(app: &App) -> Result<Bundle> {
@@ -254,14 +254,9 @@ fn validate_conflict_selection(s: &str) -> Result<()> {
 fn validate_branch(s: &str) -> Result<()> {
     crate::repository::validate_branch(s)
 }
-fn validate_bundle(path: &Path) -> Result<Bundle> {
-    checked_regular_path(path, "state bundle")?;
-    assert_no_symlink_path(
-        path.parent().unwrap_or(Path::new(".")),
-        Path::new(path.file_name().unwrap()),
-    )?;
-    let mut b: Bundle = serde_json::from_slice(&fs::read(path)?)
-        .map_err(|e| anyhow!("invalid state bundle: {e}"))?;
+pub(crate) fn validate_bundle_bytes(bytes: &[u8]) -> Result<Bundle> {
+    let mut b: Bundle =
+        serde_json::from_slice(bytes).map_err(|e| anyhow!("invalid state bundle: {e}"))?;
     if b.format != "skillsync-state-metadata" || b.version != 1 || !b.metadata_only {
         return Err(anyhow!("unsupported or non-metadata state bundle"));
     }
@@ -331,6 +326,14 @@ fn validate_bundle(path: &Path) -> Result<Bundle> {
         validate_text(&a.status, "status")?;
     }
     Ok(b)
+}
+pub(crate) fn validate_bundle(path: &Path) -> Result<Bundle> {
+    checked_regular_path(path, "state bundle")?;
+    assert_no_symlink_path(
+        path.parent().unwrap_or(Path::new(".")),
+        Path::new(path.file_name().unwrap()),
+    )?;
+    validate_bundle_bytes(&fs::read(path)?)
 }
 pub(crate) fn export(app: &App, out: &Path) -> Result<Value> {
     if out.exists() {

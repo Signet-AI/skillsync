@@ -19,6 +19,7 @@ mod inventory;
 mod recovery;
 mod repository;
 mod state_boundary;
+mod state_stage;
 mod tui;
 mod worker;
 mod worker_registration;
@@ -133,6 +134,12 @@ enum StateCmd {
         #[arg(long)]
         out: PathBuf,
     },
+    Stage {
+        #[arg(long = "from")]
+        from: PathBuf,
+        #[arg(long)]
+        plan: PathBuf,
+    },
 }
 #[derive(Subcommand)]
 enum WorkerCmd {
@@ -204,29 +211,29 @@ enum ConfigCmd {
 }
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 struct State {
-    version: u32,
-    library: String,
-    subscriptions: BTreeMap<String, Subscription>,
-    publications: BTreeMap<String, Publication>,
+    pub(crate) version: u32,
+    pub(crate) library: String,
+    pub(crate) subscriptions: BTreeMap<String, Subscription>,
+    pub(crate) publications: BTreeMap<String, Publication>,
     #[serde(default)]
-    pending_publications: BTreeMap<String, PendingPublication>,
+    pub(crate) pending_publications: BTreeMap<String, PendingPublication>,
     #[serde(default)]
-    sets: BTreeMap<String, SkillSet>,
+    pub(crate) sets: BTreeMap<String, SkillSet>,
     #[serde(default)]
     harness_links: BTreeMap<String, HarnessLink>,
     #[serde(default)]
     harness_sets: BTreeMap<String, HarnessSetEnablement>,
     #[serde(default)]
-    local_adoptions: BTreeMap<String, LocalAdoption>,
+    pub(crate) local_adoptions: BTreeMap<String, LocalAdoption>,
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct LocalAdoption {
-    skill: String,
-    source_path: String,
-    source_package: String,
-    content_hash: String,
-    local_path: String,
-    status: String,
+    pub(crate) skill: String,
+    pub(crate) source_path: String,
+    pub(crate) source_package: String,
+    pub(crate) content_hash: String,
+    pub(crate) local_path: String,
+    pub(crate) status: String,
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct HarnessLink {
@@ -249,12 +256,12 @@ struct HarnessSetEnablement {
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Subscription {
-    skill: String,
-    source: String,
-    branch: String,
-    source_path: String,
-    baseline_path: String,
-    baseline_hash: String,
+    pub(crate) skill: String,
+    pub(crate) source: String,
+    pub(crate) branch: String,
+    pub(crate) source_path: String,
+    pub(crate) baseline_path: String,
+    pub(crate) baseline_hash: String,
     #[serde(default)]
     baseline_source: String,
     #[serde(default)]
@@ -269,14 +276,14 @@ struct Subscription {
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Publication {
-    skill: String,
-    destination: String,
-    branch: String,
-    path: String,
-    approved: bool,
-    status: String,
-    last_hash: Option<String>,
-    last_sync: u64,
+    pub(crate) skill: String,
+    pub(crate) destination: String,
+    pub(crate) branch: String,
+    pub(crate) path: String,
+    pub(crate) approved: bool,
+    pub(crate) status: String,
+    pub(crate) last_hash: Option<String>,
+    pub(crate) last_sync: u64,
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct PendingPublication {
@@ -877,6 +884,9 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Cmd::State {
             command: StateCmd::Export { out },
         } => state_boundary::export(&a, &out),
+        Cmd::State {
+            command: StateCmd::Stage { from, plan },
+        } => state_stage::stage(&a, &from, &plan),
         Cmd::State {
             command: StateCmd::Inspect { .. },
         } => unreachable!("state inspect handled before App load"),
