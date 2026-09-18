@@ -144,6 +144,16 @@ enum OnboardingCmd {
         #[arg(long = "root", action = clap::ArgAction::Append)]
         root: Vec<PathBuf>,
     },
+    Plan {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    Apply {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 #[derive(Subcommand)]
 enum StateCmd {
@@ -621,8 +631,13 @@ fn validate_local_adoption(key: &str, record: &LocalAdoption, library: &Path) ->
         return Err(anyhow!("invalid local adoption status"));
     }
     let local = PathBuf::from(&record.local_path);
-    let expected = library.join(&skill);
-    if local != expected || !local.is_absolute() {
+    let expected_skill_path = library.join(&skill);
+    let expected_source_path = if source_package == "." {
+        expected_skill_path.clone()
+    } else {
+        library.join(&source_package)
+    };
+    if !local.is_absolute() || (local != expected_skill_path && local != expected_source_path) {
         return Err(anyhow!("local adoption path does not match library"));
     }
     let relative = local
@@ -888,13 +903,35 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         }
         return state_stage::inspect_plan(None, plan, from.as_deref());
     }
+    if let Cmd::Onboarding {
+        command: OnboardingCmd::Plan { out },
+    } = &command
+    {
+        let config = config_dir();
+        if config.join("state.json").is_file() {
+            let lock = StateLock::acquire_read_only_if_present(&config)?
+                .ok_or_else(|| anyhow!("initialized target has no shared lock"))?;
+            let app = App::load(Some(&lock))?;
+            return onboarding::write_plan(&app.library, &app.state, out);
+        }
+        let library = resolve_library_path(&effective_library_path(None))?;
+        return onboarding::write_plan(&library, &State::default(), out);
+    }
+    if let Cmd::Onboarding {
+        command: OnboardingCmd::Apply { yes: false, .. },
+    } = &command
+    {
+        return Err(anyhow!(
+            "confirmation required: pass --yes to apply onboarding plan"
+        ));
+    }
+    let config = config_dir();
     if matches!(
         command,
         Cmd::Onboarding {
             command: OnboardingCmd::Discover { .. }
         }
     ) {
-        let config = config_dir();
         if config.join("state.json").is_file() {
             let lock = StateLock::acquire_read_only_if_present(&config)?
                 .ok_or_else(|| anyhow!("initialized target has no shared lock"))?;
@@ -1051,6 +1088,12 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         lock.verify_config_identity(&a.config)?;
     }
     let result: Result<serde_json::Value> = match command {
+        Cmd::Onboarding {
+            command: OnboardingCmd::Apply { plan, yes },
+        } => onboarding::apply_plan(&mut a, &plan, yes),
+        Cmd::Onboarding {
+            command: OnboardingCmd::Plan { .. },
+        } => unreachable!("onboarding plan handled before App load"),
         Cmd::Onboarding { .. } => unreachable!("onboarding discover handled before App load"),
         Cmd::State {
             command: StateCmd::Export { out },

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -48,6 +48,149 @@ pub(crate) struct DiagnosticReport {
     pub code: &'static str,
     pub path: String,
     pub detail: &'static str,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdoptionPlan {
+    pub format: String,
+    pub version: u32,
+    pub library: String,
+    pub operations: Vec<AdoptionOperation>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdoptionOperation {
+    pub skill: String,
+    pub source_package: String,
+    pub source_path: String,
+    pub destination: String,
+    pub content_hash: String,
+}
+
+pub(crate) fn make_plan(library: &Path, state: &crate::State) -> Result<AdoptionPlan> {
+    let report = discover(library, state)?;
+    let mut operations = Vec::new();
+    for proposal in report.proposals {
+        let package = library.join(&proposal.path);
+        operations.push(AdoptionOperation {
+            skill: crate::filesystem::manifest_name(&package)?,
+            source_package: proposal.path,
+            source_path: library.display().to_string(),
+            destination: package.display().to_string(),
+            content_hash: crate::filesystem::hash_dir(&package)?,
+        });
+    }
+    operations.sort_by(|a, b| (&a.source_package, &a.skill).cmp(&(&b.source_package, &b.skill)));
+    Ok(AdoptionPlan {
+        format: "skillsync-onboarding-adoption-plan".into(),
+        version: 1,
+        library: library.display().to_string(),
+        operations,
+    })
+}
+
+pub(crate) fn write_plan(
+    library: &Path,
+    state: &crate::State,
+    out: &Path,
+) -> Result<serde_json::Value> {
+    if out.exists() {
+        crate::filesystem::checked_regular_path(out, "plan destination")?;
+    }
+    let plan = make_plan(library, state)?;
+    crate::filesystem::atomic(out, &serde_json::to_vec_pretty(&plan)?)?;
+    Ok(
+        serde_json::json!({"format":plan.format,"version":plan.version,"operations":plan.operations.len(),"out":out}),
+    )
+}
+
+pub(crate) fn apply_plan(
+    a: &mut crate::App,
+    plan_path: &Path,
+    yes: bool,
+) -> Result<serde_json::Value> {
+    if !yes {
+        return Err(anyhow::anyhow!(
+            "confirmation required: pass --yes to apply onboarding plan"
+        ));
+    }
+    crate::filesystem::checked_regular_path(plan_path, "onboarding plan")?;
+    let plan: AdoptionPlan = serde_json::from_slice(&fs::read(plan_path)?)?;
+    if plan.format != "skillsync-onboarding-adoption-plan" || plan.version != 1 {
+        return Err(anyhow::anyhow!("unsupported onboarding plan"));
+    }
+    if plan.operations.len() != 1 {
+        return Err(anyhow::anyhow!(
+            "onboarding apply requires exactly one operation"
+        ));
+    }
+    let op = &plan.operations[0];
+    let skill = crate::filesystem::strict_component(&op.skill, "adoption skill name")?;
+    let destination = a.library.join(&op.source_package);
+    if Path::new(&plan.library) != a.library
+        || Path::new(&op.destination) != destination
+        || Path::new(&op.source_path) != a.library
+    {
+        return Err(anyhow::anyhow!(
+            "onboarding plan target does not match initialized library"
+        ));
+    }
+    crate::filesystem::source_rel(&op.source_package)?;
+    crate::filesystem::assert_no_symlink_path(&a.library, Path::new(&op.source_package))?;
+    let source_package = a.library.join(&op.source_package);
+    if !source_package.is_dir() || crate::filesystem::manifest_name(&source_package)? != skill {
+        return Err(anyhow::anyhow!(
+            "adoption source is not the canonical unmanaged package"
+        ));
+    }
+    let current_hash = crate::filesystem::hash_dir(&source_package)?;
+    if current_hash != op.content_hash {
+        return Err(anyhow::anyhow!("adoption source hash is stale"));
+    }
+    let key = format!("local:{skill}");
+    if let Some(existing) = a.state.local_adoptions.get(&key) {
+        if existing.content_hash == current_hash {
+            return Ok(serde_json::json!({"skill":skill,"status":"already_adopted"}));
+        }
+        return Err(anyhow::anyhow!(
+            "package already has a managed relationship"
+        ));
+    }
+    if discover(&a.library, &a.state)?
+        .packages
+        .iter()
+        .any(|package| package.path == op.source_package && package.status == "managed")
+    {
+        return Err(anyhow::anyhow!(
+            "package already has a managed relationship"
+        ));
+    }
+    if a.state.subscriptions.values().any(|x| x.skill == skill)
+        || a.state.publications.values().any(|x| x.skill == skill)
+    {
+        return Err(anyhow::anyhow!(
+            "package already has a managed relationship"
+        ));
+    }
+    let previous = a.state.clone();
+    a.state.local_adoptions.insert(
+        key,
+        crate::LocalAdoption {
+            skill: skill.clone(),
+            source_path: a.library.display().to_string(),
+            source_package: op.source_package.clone(),
+            content_hash: current_hash,
+            local_path: destination.display().to_string(),
+            status: "adopted".into(),
+        },
+    );
+    if let Err(error) = a.save() {
+        a.state = previous;
+        return Err(error.context("persist onboarding adoption state"));
+    }
+    Ok(serde_json::json!({"skill":skill,"status":"adopted","canonical_path":destination}))
 }
 
 fn root_status(path: &Path) -> &'static str {
