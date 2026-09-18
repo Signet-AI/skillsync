@@ -186,7 +186,7 @@ fn run_git(cwd: Option<&Path>, args: &[&str]) -> Result<String> {
 }
 pub(crate) fn status_for_error(error: &str) -> &'static str {
     let lower = error.to_lowercase();
-    if lower.contains("auth") || lower.contains("could not read username") || error.contains("@") {
+    if lower.contains("auth") || lower.contains("could not read username") {
         "authentication_required"
     } else if lower.contains("offline")
         || lower.contains("not installed")
@@ -536,7 +536,12 @@ pub(crate) fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
         Ok(x) => x,
         Err(e) if WORKER_STOP_REQUESTED.load(Ordering::Relaxed) => return Err(e),
         Err(e) => {
-            let status = if s.source.contains('@') {
+            let status = if s.source.starts_with("https://")
+                && s.source
+                    .split_once("://")
+                    .and_then(|(_, rest)| rest.split_once('@'))
+                    .is_some_and(|(user, _)| user.contains(':'))
+            {
                 "authentication_required"
             } else if s.source.to_lowercase().contains("permission") {
                 "permission_denied"
@@ -797,9 +802,18 @@ pub(crate) fn publish_to_repo(
             key.clone(),
             PendingPublication {
                 publication: pending,
+                attempt_count: 0,
+                last_attempt_at: 0,
+                next_attempt_at: 0,
+                last_error_status: None,
             },
         );
         a.save().context("persist publication intent before push")?;
+        #[cfg(feature = "test-hooks")]
+        if std::env::var("SKILLSYNC_TEST_FAIL_PUSH_ONCE").as_deref() == Ok(skill) {
+            std::env::remove_var("SKILLSYNC_TEST_FAIL_PUSH_ONCE");
+            return Err(anyhow!("injected publication push failure (test-only)"));
+        }
         run_git(Some(&tmp_path), &["push", "origin", &branch_name])?;
     }
     if hash_dir(&destination)? != current_hash {

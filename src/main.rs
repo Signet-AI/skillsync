@@ -349,6 +349,14 @@ struct Publication {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct PendingPublication {
     publication: Publication,
+    #[serde(default)]
+    pub(crate) attempt_count: u64,
+    #[serde(default)]
+    pub(crate) last_attempt_at: u64,
+    #[serde(default)]
+    pub(crate) next_attempt_at: u64,
+    #[serde(default)]
+    pub(crate) last_error_status: Option<String>,
 }
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct FileConfig {

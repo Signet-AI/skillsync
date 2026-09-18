@@ -34,10 +34,26 @@ pub(crate) fn worker_status(config: &Path) -> Result<&'static str> {
 }
 
 fn now() -> u64 {
+    #[cfg(feature = "test-hooks")]
+    if let Ok(value) = std::env::var("SKILLSYNC_TEST_NOW") {
+        if let Ok(value) = value.parse() {
+            return value;
+        }
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn retry_delay(attempt: u64) -> u64 {
+    const CAP: u64 = 86_400;
+    let exponent = attempt.saturating_sub(1).min(63);
+    60_u64.checked_shl(exponent as u32).unwrap_or(CAP).min(CAP)
+}
+
+fn pending_due(pending: &crate::PendingPublication, current: u64) -> bool {
+    pending.next_attempt_at == 0 || current >= pending.next_attempt_at
 }
 
 fn safe_error(status: &str) -> &'static str {
@@ -54,6 +70,7 @@ fn safe_error(status: &str) -> &'static str {
 }
 
 pub(crate) fn sync_all(a: &mut App, continue_on_error: bool) -> Result<serde_json::Value> {
+    let cycle_now = now();
     let keys = a.state.subscriptions.keys().cloned().collect::<Vec<_>>();
     let mut results = vec![];
     for key in keys {
@@ -66,7 +83,7 @@ pub(crate) fn sync_all(a: &mut App, continue_on_error: bool) -> Result<serde_jso
                 let status = repository::status_for_error(&error_text);
                 if let Some(subscription) = a.state.subscriptions.get_mut(&key) {
                     subscription.status = status.into();
-                    subscription.last_sync = now();
+                    subscription.last_sync = cycle_now;
                 }
                 a.save()?;
                 results.push(
@@ -86,6 +103,12 @@ pub(crate) fn sync_all(a: &mut App, continue_on_error: bool) -> Result<serde_jso
         .map(|(key, _)| key.clone())
         .collect::<std::collections::BTreeSet<_>>();
     for (key, intent) in pending {
+        if let Some(pending) = a.state.pending_publications.get(&key) {
+            if !pending_due(pending, cycle_now) {
+                results.push(serde_json::json!({"skill": intent.skill, "relationship": key, "status": "pending_push", "queue": "scheduled", "next_attempt_at": pending.next_attempt_at}));
+                continue;
+            }
+        }
         let previous = a.state.publications.get(&key).cloned();
         match repository::publish_to_repo(a, &intent.skill, &intent.destination, previous.as_ref())
         {
@@ -96,12 +119,18 @@ pub(crate) fn sync_all(a: &mut App, continue_on_error: bool) -> Result<serde_jso
                 let error_text = error.to_string();
                 let status = repository::status_for_error(&error_text);
                 if let Some(pending) = a.state.pending_publications.get_mut(&key) {
+                    let attempted_at = cycle_now;
+                    pending.attempt_count = pending.attempt_count.saturating_add(1);
+                    pending.last_attempt_at = attempted_at;
+                    pending.next_attempt_at =
+                        attempted_at.saturating_add(retry_delay(pending.attempt_count));
+                    pending.last_error_status = Some(status.into());
                     pending.publication.status = status.into();
-                    pending.publication.last_sync = now();
+                    pending.publication.last_sync = attempted_at;
                 }
                 if let Some(publication) = a.state.publications.get_mut(&key) {
                     publication.status = status.into();
-                    publication.last_sync = now();
+                    publication.last_sync = cycle_now;
                 }
                 a.save()?;
                 results.push(serde_json::json!({"skill": intent.skill, "relationship": key, "status": status, "error": safe_error(status)}));
@@ -131,7 +160,7 @@ pub(crate) fn sync_all(a: &mut App, continue_on_error: bool) -> Result<serde_jso
                 let status = repository::status_for_error(&error_text);
                 if let Some(publication) = a.state.publications.get_mut(&key) {
                     publication.status = status.into();
-                    publication.last_sync = now();
+                    publication.last_sync = cycle_now;
                 }
                 a.save()?;
                 results.push(

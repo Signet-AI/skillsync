@@ -1,12 +1,13 @@
 import { expect, test, afterEach } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 const binary = process.env.SKILLSYNC_BIN ?? join(import.meta.dir, "../target/debug/skillsync");
 const dec = new TextDecoder();
 const roots: string[] = [];
-function env(root: string) { return { ...process.env, HOME: join(root, "home"), SKILLSYNC_CONFIG_DIR: join(root, "config"), SKILLSYNC_LIBRARY: join(root, "library") }; }
+function env(root: string) { return { ...process.env, HOME: join(root, "home"), SKILLSYNC_CONFIG_DIR: join(root, "config"), SKILLSYNC_LIBRARY: join(root, "library"), GIT_AUTHOR_NAME: "Skillsync Test", GIT_AUTHOR_EMAIL: "test@example.invalid", GIT_COMMITTER_NAME: "Skillsync Test", GIT_COMMITTER_EMAIL: "test@example.invalid" }; }
 function run(root: string, args: string[], ok = true) {
   const r = Bun.spawnSync({ cmd: [binary, "--json", ...args], env: env(root), stdout: "pipe", stderr: "pipe" });
   expect(r.exitCode, dec.decode(r.stderr)).toBe(ok ? 0 : 1);
@@ -57,6 +58,7 @@ test("worker preserves authentication, offline, and permission classifications w
     ["https://user:secret@example.invalid/repo.git", "authentication_required"],
     ["https://offline.invalid/repo.git", "offline"],
     ["/root/permission-denied/repo", "permission_denied"],
+    ["/tmp/diagnostic@host/repo", "source_missing"],
   ] as const;
   for (const [source, status] of cases) {
     const { root } = await fixture();
@@ -74,4 +76,46 @@ test("failure keeps prior provenance and does not auto-adopt a reappeared packag
   expect(run(root, ["worker", "--once"]).results[0].status).toBe("package_missing");
   await mkdir(join(source, "nested", "demo"), { recursive: true }); await writeFile(join(source, "nested", "demo", "SKILL.md"), "name: demo\nreappeared\n"); git(source, ["add", "."]); git(source, ["commit", "-qm", "reappear"]);
   const after = JSON.parse(await readFile(statePath, "utf8")); expect(after.subscriptions[key].resolved_commit).toBe(before.subscriptions[key].resolved_commit); expect(after.subscriptions[key].status).toBe("package_missing");
+ });
+
+ test("failed real publication push is durably retried once when due", async () => {
+ const root = await mkdtemp(join(tmpdir(), "skillsync-real-publication-retry-")); roots.push(root);
+ const remote = join(root, "remote.git"); git(root, ["init", "--bare", remote]);
+ run(root, ["init"]);
+ await mkdir(join(root, "library", "demo"), { recursive: true });
+ await writeFile(join(root, "library", "demo", "SKILL.md"), "name: demo\ndescription: A valid multiline skill fixture.\n\n# Demo\n\nDo the thing.\n");
+ const statePath = join(root, "config", "state.json"); const state = JSON.parse(await readFile(statePath, "utf8"));
+ const publication = { skill: "demo", destination: remote, branch: "main", path: "skills/demo", approved: true, status: "pending_push", last_hash: null, last_sync: 0 };
+ const key = "pub-" + createHash("sha256").update(Buffer.from("publication\0" + "demo\0" + remote + "\0main\0skills/demo\0")).digest("hex"); state.pending_publications = { [key]: { publication } }; await writeFile(statePath, JSON.stringify(state));
+ const hookBinary = join(import.meta.dir, "../target/test-hooks/debug/skillsync");
+ const first = Bun.spawnSync({ cmd: [hookBinary, "--json", "worker", "--once"], env: { ...env(root), SKILLSYNC_TEST_FAIL_PUSH_ONCE: "demo", SKILLSYNC_TEST_NOW: "100" }, stdout: "pipe", stderr: "pipe" });
+ expect(first.exitCode).toBe(0); const firstResult = JSON.parse(dec.decode(first.stdout)); expect(firstResult.results[0].status).toBe("conflict");
+ const failed = JSON.parse(await readFile(statePath, "utf8")); expect(failed.pending_publications[key].attempt_count).toBe(1); expect(failed.pending_publications[key].next_attempt_at).toBeGreaterThan(100);
+ const immediate = Bun.spawnSync({ cmd: [hookBinary, "--json", "worker", "--once"], env: { ...env(root), SKILLSYNC_TEST_NOW: "101" }, stdout: "pipe", stderr: "pipe" });
+ expect(immediate.exitCode).toBe(0); const immediateResult = JSON.parse(dec.decode(immediate.stdout)); expect(immediateResult.results[0].queue).toBe("scheduled");
+ const unchanged = JSON.parse(await readFile(statePath, "utf8")); expect(unchanged.pending_publications[key].attempt_count).toBe(1);
+ const later = Bun.spawnSync({ cmd: [hookBinary, "--json", "worker", "--once"], env: { ...env(root), SKILLSYNC_TEST_NOW: "100000" }, stdout: "pipe", stderr: "pipe" });
+ expect(later.exitCode).toBe(0); const laterResult = JSON.parse(dec.decode(later.stdout)); expect(laterResult.results.some((x: any) => x.status === "published")).toBe(true);
+ const final = JSON.parse(await readFile(statePath, "utf8")); expect(final.pending_publications[key]).toBeUndefined(); expect(final.publications[key].status).toBe("synced");
+ const commits = Bun.spawnSync({ cmd: ["git", "--git-dir", remote, "rev-list", "--count", "main"], stdout: "pipe" }); expect(dec.decode(commits.stdout).trim()).toBe("1");
+});
+
+test("failed pending publication exposes durable retry queue metadata", async () => {
+ const root = await mkdtemp(join(tmpdir(), "skillsync-publication-retry-red-")); roots.push(root);
+ run(root, ["init"]);
+ const statePath = join(root, "config", "state.json");
+ const state = JSON.parse(await readFile(statePath, "utf8"));
+ const publication = { skill: "demo", destination: "https://offline.invalid/repo.git", branch: "main", path: "skills/demo", approved: true, status: "pending_push", last_hash: null, last_sync: 0 };
+ const key = "pub-demo";
+ state.pending_publications = { [key]: { publication } };
+ await writeFile(statePath, JSON.stringify(state));
+  const result = run(root, ["worker", "--once"]);
+  expect(result.results[0].status).toBe("package_missing");
+  const after = JSON.parse(await readFile(statePath, "utf8"));
+  expect(after.pending_publications[key].attempt_count).toBe(1);
+  expect(after.pending_publications[key].next_attempt_at).toBeGreaterThan(0);
+  const skipped = run(root, ["worker", "--once"]);
+  expect(skipped.results[0].queue).toBe("scheduled");
+  const unchanged = JSON.parse(await readFile(statePath, "utf8"));
+  expect(unchanged.pending_publications[key].attempt_count).toBe(1);
 });
