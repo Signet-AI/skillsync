@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Component, Path},
 };
@@ -350,8 +350,12 @@ pub(crate) fn validate_bundle_bytes(bytes: &[u8]) -> Result<Bundle> {
     }
     for (key, s) in &b.sets {
         crate::strict_component(key, "set name")?;
+        let mut members = BTreeSet::new();
         for m in &s.members {
             crate::set_member_name(m)?;
+            if !members.insert(m) {
+                return Err(anyhow!("duplicate set member: {m}"));
+            }
         }
     }
     for (key, a) in &mut b.local_adoptions {

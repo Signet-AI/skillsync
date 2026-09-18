@@ -22,6 +22,7 @@ mod inventory;
 mod onboarding;
 mod recovery;
 mod repository;
+mod state_apply;
 mod state_boundary;
 mod state_stage;
 mod tui;
@@ -176,6 +177,12 @@ enum StateCmd {
         from: PathBuf,
         #[arg(long)]
         plan: PathBuf,
+    },
+    ApplySets {
+        #[arg(long = "from")]
+        from: PathBuf,
+        #[arg(long)]
+        yes: bool,
     },
 }
 #[derive(Subcommand)]
@@ -905,6 +912,16 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         }
         return state_stage::inspect_plan(None, plan, from.as_deref());
     }
+    if let Cmd::State {
+        command: StateCmd::ApplySets { .. },
+    } = &command
+    {
+        if !config_dir().join("state.json").is_file() {
+            return Err(anyhow!(
+                "target is not initialized; run init before applying sets"
+            ));
+        }
+    }
     if let Cmd::Onboarding {
         command: OnboardingCmd::Plan { out },
     } = &command
@@ -1103,6 +1120,14 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Cmd::State {
             command: StateCmd::Stage { from, plan },
         } => state_stage::stage(&a, &from, &plan),
+        Cmd::State {
+            command: StateCmd::ApplySets { from, yes },
+        } => state_apply::apply_sets(
+            &mut a,
+            &from,
+            yes,
+            operation_lock.ok_or_else(|| anyhow!("apply-sets requires operation lock"))?,
+        ),
         Cmd::State {
             command: StateCmd::Inspect { .. },
         } => unreachable!("state inspect handled before App load"),

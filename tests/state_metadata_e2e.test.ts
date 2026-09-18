@@ -15,6 +15,40 @@ function run(root: string, args: string[], ok = true) {
 async function fixture() { const root = await mkdtemp(join(tmpdir(), "skillsync-state-meta-")); roots.push(root); await mkdir(join(root, "library", "demo"), { recursive: true }); await writeFile(join(root, "library", "demo", "SKILL.md"), "name: demo\n"); run(root, ["init"]); run(root, ["set", "create", "core"]); run(root, ["set", "add", "core", "demo"]); return root; }
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
+test("state apply-sets rejects duplicate members before persisting", async () => {
+  const root = await fixture(); const bundle = join(root, "bundle.json"); const statePath = join(root, "config", "state.json");
+  run(root, ["state", "export", "--out", bundle]);
+  const value = JSON.parse(await readFile(bundle, "utf8"));
+  value.sets = { incoming: { members: ["library:demo", "library:demo"] } };
+  await writeFile(bundle, JSON.stringify(value));
+  const before = await readFile(statePath, "utf8");
+  const result = run(root, ["state", "apply-sets", "--from", bundle, "--yes"], false);
+  expect(result.ok).toBe(false);
+  expect(await readFile(statePath, "utf8")).toBe(before);
+});
+
+test("state apply-sets applies a validated set and replays idempotently", async () => {
+  const root = await fixture(); const bundle = join(root, "bundle.json");
+  run(root, ["state", "export", "--out", bundle]);
+  const value = JSON.parse(await readFile(bundle, "utf8"));
+  value.sets.incoming = { members: ["library:demo"] }; delete value.sets.core;
+  await writeFile(bundle, JSON.stringify(value));
+  expect(run(root, ["state", "apply-sets", "--from", bundle, "--yes"]).sets).toEqual([{ set: "incoming", status: "added" }]);
+  expect(run(root, ["state", "apply-sets", "--from", bundle, "--yes"]).sets).toEqual([{ set: "incoming", status: "already_present" }]);
+});
+
+test("state apply-sets rejects non-set records and divergent sets without mutation", async () => {
+  const root = await fixture(); const bundle = join(root, "bundle.json"); const statePath = join(root, "config", "state.json");
+  run(root, ["state", "export", "--out", bundle]); const before = await readFile(statePath, "utf8");
+  const value = JSON.parse(await readFile(bundle, "utf8")); value.sets.core = { members: ["library:other"] }; value.subscriptions = { forbidden: {} };
+  await writeFile(bundle, JSON.stringify(value));
+  expect(run(root, ["state", "apply-sets", "--from", bundle, "--yes"], false).ok).toBe(false);
+  expect(await readFile(statePath, "utf8")).toBe(before);
+  delete value.subscriptions; await writeFile(bundle, JSON.stringify(value));
+  expect(run(root, ["state", "apply-sets", "--from", bundle, "--yes"], false).ok).toBe(false);
+  expect(await readFile(statePath, "utf8")).toBe(before);
+});
+
 test("state stage writes a deterministic non-activating evidence plan", async () => {
   const root = await fixture(); const bundle = join(root, "bundle.json"); const plan = join(root, "plan.json");
   run(root, ["state", "export", "--out", bundle]);
