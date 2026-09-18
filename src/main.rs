@@ -164,6 +164,11 @@ enum ConflictCmd {
     Show {
         relationship: String,
     },
+    Export {
+        relationship: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
     Resolve {
         relationship: String,
         #[arg(long, conflicts_with = "incoming", required = true)]
@@ -691,7 +696,7 @@ fn requires_lock(command: &Cmd) -> bool {
         Cmd::Publish { dry_run, .. } => !dry_run,
         Cmd::Restore { .. } => true,
         Cmd::Conflicts {
-            command: ConflictCmd::List | ConflictCmd::Show { .. },
+            command: ConflictCmd::List | ConflictCmd::Show { .. } | ConflictCmd::Export { .. },
         } => true,
         _ => true,
     }
@@ -1071,6 +1076,9 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Cmd::Conflicts {
             command: ConflictCmd::Show { relationship },
         } => conflicts::show(&a, &relationship),
+        Cmd::Conflicts {
+            command: ConflictCmd::Export { relationship, out },
+        } => conflicts::export(&a, &relationship, &out),
         Cmd::Conflicts {
             command: ConflictCmd::List,
         } => conflicts::list(&a),

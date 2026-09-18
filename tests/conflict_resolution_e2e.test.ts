@@ -211,3 +211,22 @@ test("resume rolls back both replacements when the second commit preparation fai
   expect(await readFile(livePath, "utf8")).toBe("name: demo\nlocal change\n");
   expect(await readFile(join(baselinePath, "SKILL.md"), "utf8")).toBe(beforeBaseline);
 }, { timeout: 30000 });
+
+test("rejects local repository conflict export before creating a workspace", async () => {
+  const { f, relationship, statePath, livePath } = await conflictFixture();
+  const workspace = join(f.root, "local-source-workspace");
+  const beforeState = await readFile(statePath, "utf8");
+  const beforeLive = await readFile(livePath, "utf8");
+  const beforeLibrary = await readFile(join(f.library, "demo", "SKILL.md"), "utf8");
+  const beforeRecovery = await readdir(join(f.config, "recovery"));
+
+  const rejected = run(f, ["--json", "conflicts", "export", relationship, "--out", workspace], false);
+  expect(rejected.json.ok).toBe(false);
+  expect(rejected.json.message).toContain("non-portable local repository source");
+  expect(await Bun.file(statePath).exists()).toBe(true);
+  expect(await readFile(statePath, "utf8")).toBe(beforeState);
+  expect(await readFile(livePath, "utf8")).toBe(beforeLive);
+  expect(await readFile(join(f.library, "demo", "SKILL.md"), "utf8")).toBe(beforeLibrary);
+  expect(await readdir(join(f.config, "recovery"))).toEqual(beforeRecovery);
+  expect(await Bun.file(workspace).exists()).toBe(false);
+}, { timeout: 30000 });

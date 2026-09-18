@@ -7,8 +7,9 @@ use std::{
 };
 
 use crate::filesystem::{
-    assert_no_symlink_path, canonicalize_path, copy_tree, hash_dir, manifest_name,
-    replace_dir_bound, safe, snapshot_transaction, strict_component, validate_state_path,
+    assert_no_symlink_path, canonicalize_path, canonicalize_path_with_missing, copy_tree, hash_dir,
+    install_dir_noreplace, manifest_name, replace_dir_bound, safe, snapshot_transaction,
+    strict_component, validate_state_path,
 };
 use crate::{relationship_key, App};
 
@@ -325,6 +326,127 @@ pub(crate) fn show(a: &App, relationship: &str) -> Result<serde_json::Value> {
     output["current_live_hash"] = json!(current_live_hash.clone());
     output["stale"] = json!(current_live_hash != output["live_hash_at_detection"]);
     Ok(output)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportManifest {
+    version: u32,
+    status: String,
+    relationship: String,
+    source: String,
+    source_path: String,
+    skill: String,
+    base_hash: String,
+    local_hash: String,
+    incoming_hash: String,
+    live_hash_at_export: String,
+}
+
+fn validate_export_destination(out: &std::path::Path) -> Result<(PathBuf, PathBuf)> {
+    let destination = canonicalize_path_with_missing(out)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow!("workspace destination has no parent"))?
+        .to_path_buf();
+    let mut cursor = parent.clone();
+    loop {
+        let metadata = fs::symlink_metadata(&cursor)
+            .map_err(|_| anyhow!("workspace ancestor is missing: {}", cursor.display()))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || canonicalize_path(&cursor)? != cursor
+        {
+            return Err(anyhow!("workspace destination has an unsafe ancestor"));
+        }
+        if cursor.parent().is_none() || cursor.as_os_str() == "/" {
+            break;
+        }
+        cursor.pop();
+    }
+    if let Ok(metadata) = fs::symlink_metadata(&destination) {
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || canonicalize_path(&destination)? != destination
+        {
+            return Err(anyhow!(
+                "workspace destination is not a regular absent directory"
+            ));
+        }
+        return Err(anyhow!("workspace destination already exists"));
+    }
+    Ok((destination, parent))
+}
+
+pub(crate) fn export(
+    a: &App,
+    relationship: &str,
+    out: &std::path::Path,
+) -> Result<serde_json::Value> {
+    let (destination, parent) = validate_export_destination(out)?;
+    let view = show(a, relationship)?;
+    let subscription = a.state.subscriptions.get(relationship).unwrap();
+    if std::path::Path::new(&subscription.source).is_absolute() {
+        return Err(anyhow!(
+            "non-portable local repository source; conflict export refused"
+        ));
+    }
+    let live_hash = hash_dir(std::path::Path::new(&subscription.local_path))?;
+    let detected = view["live_hash_at_detection"].as_str().unwrap();
+    if live_hash != detected {
+        return Err(anyhow!(
+            "live content changed since conflict detection; export refused"
+        ));
+    }
+    let recovery = PathBuf::from(subscription.recovery_path.as_ref().unwrap());
+    let staged_parent = tempfile::tempdir_in(&parent)?;
+    let result = (|| {
+        let staged = staged_parent.path().join("workspace");
+        fs::create_dir(&staged)?;
+        for side in ["base", "local", "incoming"] {
+            let source = recovery.join(side);
+            validate_evidence_package(
+                &a.recovery,
+                &source,
+                &subscription.skill,
+                view[&format!("{side}_hash")].as_str().unwrap(),
+                side,
+            )?;
+            copy_tree(&source, &staged.join(side))?;
+            if hash_dir(&staged.join(side))? != view[&format!("{side}_hash")].as_str().unwrap() {
+                return Err(anyhow!("copied {side} evidence hash mismatch"));
+            }
+        }
+        let manifest = ExportManifest {
+            version: 1,
+            status: "immutable".into(),
+            relationship: relationship.into(),
+            source: subscription.source.clone(),
+            source_path: subscription.source_path.clone(),
+            skill: subscription.skill.clone(),
+            base_hash: view["base_hash"].as_str().unwrap().into(),
+            local_hash: view["local_hash"].as_str().unwrap().into(),
+            incoming_hash: view["incoming_hash"].as_str().unwrap().into(),
+            live_hash_at_export: live_hash,
+        };
+        let raw = serde_json::to_vec_pretty(&manifest)?;
+        let _: ExportManifest = serde_json::from_slice(&raw)?;
+        fs::write(staged.join("manifest.json"), raw)?;
+        install_dir_noreplace(&staged, &destination)
+            .map_err(|e| anyhow!("workspace publication refused: {e}"))?;
+        Ok(json!({"relationship": relationship, "status": "exported", "workspace": destination}))
+    })();
+    let cleanup = staged_parent.close();
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(anyhow!(
+            "export published but staging cleanup failed; recovery required: {error}"
+        )),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup_error)) => Err(anyhow!(
+            "export failed: {error}; staging cleanup also failed; recovery required: {cleanup_error}"
+        )),
+    }
 }
 
 pub(crate) fn resolve(

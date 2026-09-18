@@ -27,8 +27,10 @@ skillsync delete NAME --yes
 skillsync restore --from /ABSOLUTE/CONFIG/recovery/delete-NAME-STAMP [--skill NAME]
 skillsync conflicts list
 skillsync conflicts show RELATIONSHIP
+skillsync conflicts export RELATIONSHIP --out WORKSPACE  # immutable evidence snapshot
 skillsync conflicts resolve RELATIONSHIP --local|--incoming
 skillsync conflicts resume RELATIONSHIP
+# Conflict export refuses non-portable local repository sources before staging or publishing a workspace.
 # Resolution is explicit side selection; semantic/workspace editing remains deferred.
 skillsync set create NAME | list | show NAME | add NAME SKILL | remove NAME SKILL
 skillsync harness link --root PATH --skill NAME
