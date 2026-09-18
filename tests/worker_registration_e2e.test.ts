@@ -49,6 +49,23 @@ test("uninstall rejects a tampered executable hash without deleting the executab
 
 test("provider failure never reports success",async()=>{ const f=await fixture(); const r=run(f,["worker","enable"],false,{SKILLSYNC_TEST_WORKER_PROVIDER:"fail"}); expect(r.ok).toBe(false); expect(await Bun.file(join(f.config,"worker-registration.json")).exists()).toBe(false); });
 
+test("status reports provider read-back separately from valid registration", async () => {
+  const f = await fixture();
+  run(f, ["worker", "enable"], true, { SKILLSYNC_TEST_WORKER_PROVIDER: "ok" });
+  expect(run(f, ["worker", "status"], true, { SKILLSYNC_TEST_WORKER_PROVIDER: "ok" }).provider_state).toBe("active");
+  expect(run(f, ["worker", "status"], true, { SKILLSYNC_TEST_WORKER_PROVIDER: "inactive" }).provider_state).toBe("inactive");
+  expect(run(f, ["worker", "status"], true, { SKILLSYNC_TEST_WORKER_PROVIDER: "unavailable" }).provider_state).toBe("unavailable");
+});
+
+test("disabled registration reports inactive without probing the native provider", async () => {
+  const f = await fixture();
+  run(f, ["worker", "enable"], true, { SKILLSYNC_TEST_WORKER_PROVIDER: "ok" });
+  run(f, ["worker", "disable"], true, { SKILLSYNC_TEST_WORKER_PROVIDER: "ok" });
+  const status = run(f, ["worker", "status"], true, { SKILLSYNC_TEST_WORKER_PROVIDER: "ok" });
+  expect(status.enabled).toBe(false);
+  expect(status.provider_state).toBe("inactive");
+});
+
 test("disable and uninstall are idempotent", async () => {
   const f = await fixture();
   run(f, ["worker", "enable"], true, { SKILLSYNC_TEST_WORKER_PROVIDER: "ok" });

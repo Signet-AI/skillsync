@@ -260,7 +260,7 @@ fn provider_install(
         let reg_arg = reg
             .to_str()
             .ok_or_else(|| anyhow!("registration path is not UTF-8"))?;
-        let domain = format!("user/{}", unsafe { libc::getuid() });
+        let domain = format!("gui/{}", unsafe { libc::getuid() });
         state.activation_attempted = true;
         if !Command::new("launchctl")
             .args(["bootstrap", &domain, reg_arg])
@@ -291,6 +291,64 @@ fn provider_install(
     #[allow(unreachable_code)]
     Err(anyhow!("worker registration unsupported on this platform"))
 }
+fn provider_state(identity: &str) -> &'static str {
+    #[cfg(feature = "test-hooks")]
+    if let Ok(value) = std::env::var("SKILLSYNC_TEST_WORKER_PROVIDER") {
+        return match value.as_str() {
+            "ok" => "active",
+            "inactive" => "inactive",
+            "unavailable" => "unavailable",
+            _ => "unknown",
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("systemctl")
+            .args(["--user", "is-active", identity])
+            .output();
+        return match output {
+            Ok(output) if output.status.success() => {
+                match String::from_utf8_lossy(&output.stdout).trim() {
+                    "active" => "active",
+                    "inactive" => "inactive",
+                    _ => "unknown",
+                }
+            }
+            Ok(output) if output.status.code() == Some(3) => "inactive",
+            Ok(_) => "unknown",
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "unavailable",
+            Err(_) => "unknown",
+        };
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let domain = format!("gui/{}", unsafe { libc::getuid() });
+        let target = format!("{domain}/{identity}");
+        let output = Command::new("launchctl").args(["print", &target]).output();
+        return match output {
+            Ok(output) if output.status.success() => "active",
+            Ok(_) => "unknown",
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "unavailable",
+            Err(_) => "unknown",
+        };
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("schtasks")
+            .args(["/Query", "/TN", identity, "/FO", "LIST", "/NH"])
+            .output();
+        return match output {
+            Ok(output) if output.status.success() => "active",
+            Ok(_) => "unknown",
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "unavailable",
+            Err(_) => "unknown",
+        };
+    }
+    #[allow(unreachable_code)]
+    "unavailable"
+}
+
 fn provider_disable(identity: &str, reg: &Path) -> Result<()> {
     let _ = reg;
     #[cfg(feature = "test-hooks")]
@@ -315,7 +373,7 @@ fn provider_disable(identity: &str, reg: &Path) -> Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        let domain = format!("user/{}", unsafe { libc::getuid() });
+        let domain = format!("gui/{}", unsafe { libc::getuid() });
         if !Command::new("launchctl")
             .args(["bootout", &domain, identity])
             .status()?
@@ -645,7 +703,7 @@ fn provider_activate_existing(
         let reg_arg = reg
             .to_str()
             .ok_or_else(|| anyhow!("registration path is not UTF-8"))?;
-        let domain = format!("user/{}", unsafe { libc::getuid() });
+        let domain = format!("gui/{}", unsafe { libc::getuid() });
         ensure_owned_bytes(reg, registration, "registration artifact")?;
         state.activation_attempted = true;
         if !Command::new("launchctl")
@@ -789,7 +847,7 @@ pub(crate) fn status(config: &Path) -> Result<serde_json::Value> {
     let Some(r) = load(config)? else {
         return Ok(serde_json::json!({"registered":false,"enabled":false}));
     };
-    let (exe, reg, _) = validate(config, &r)?;
+    let (exe, reg, id) = validate(config, &r)?;
     regular_owned(&exe)?;
     if hash(&exe)? != r.executable_hash {
         return Err(anyhow!("worker executable ownership validation failed"));
@@ -800,8 +858,13 @@ pub(crate) fn status(config: &Path) -> Result<serde_json::Value> {
     if present(&reg)? {
         regular_owned(&reg)?;
     }
+    let provider_state = if r.enabled {
+        provider_state(&id)
+    } else {
+        "inactive"
+    };
     Ok(
-        serde_json::json!({"registered":true,"enabled":r.enabled,"interval":r.interval,"executable":exe,"registration":reg}),
+        serde_json::json!({"registered":true,"enabled":r.enabled,"provider_state":provider_state,"interval":r.interval,"executable":exe,"registration":reg}),
     )
 }
 pub(crate) fn uninstall(config: &Path) -> Result<serde_json::Value> {
