@@ -18,6 +18,7 @@ mod conflicts;
 mod filesystem;
 mod harness;
 mod inventory;
+mod onboarding;
 mod recovery;
 mod repository;
 mod state_boundary;
@@ -50,6 +51,10 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Cmd {
+    Onboarding {
+        #[command(subcommand)]
+        command: OnboardingCmd,
+    },
     State {
         #[command(subcommand)]
         command: StateCmd,
@@ -129,6 +134,10 @@ enum Cmd {
         #[command(subcommand)]
         command: HarnessCmd,
     },
+}
+#[derive(Subcommand)]
+enum OnboardingCmd {
+    Discover,
 }
 #[derive(Subcommand)]
 enum StateCmd {
@@ -873,6 +882,29 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         }
         return state_stage::inspect_plan(None, plan, from.as_deref());
     }
+    if matches!(
+        command,
+        Cmd::Onboarding {
+            command: OnboardingCmd::Discover
+        }
+    ) {
+        let config = config_dir();
+        if config.join("state.json").is_file() {
+            let lock = StateLock::acquire_read_only_if_present(&config)?
+                .ok_or_else(|| anyhow!("initialized target has no shared lock"))?;
+            lock.verify_config_identity(&config)?;
+            let app = App::load(Some(&lock))?;
+            lock.verify_config_identity(&app.config)?;
+            let report = onboarding::discover(&app.library, &app.state)?;
+            lock.verify_config_identity(&app.config)?;
+            return Ok(serde_json::to_value(report)?);
+        }
+        let library = resolve_library_path(&effective_library_path(None))?;
+        return Ok(serde_json::to_value(onboarding::discover(
+            &library,
+            &State::default(),
+        )?)?);
+    }
     if let Cmd::Worker {
         command: Some(_),
         once,
@@ -998,6 +1030,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         lock.verify_config_identity(&a.config)?;
     }
     let result: Result<serde_json::Value> = match command {
+        Cmd::Onboarding { .. } => unreachable!("onboarding discover handled before App load"),
         Cmd::State {
             command: StateCmd::Export { out },
         } => state_boundary::export(&a, &out),

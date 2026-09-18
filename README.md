@@ -16,6 +16,7 @@ skillsync update | sync | status | inventory | diff | doctor
 skillsync state inspect --from PATH
 skillsync state export --out PATH   # deterministic metadata-only bundle
 skillsync state stage --from BUNDLE --plan PLAN   # validate and write non-activating evidence plan
+skillsync onboarding discover                 # read-only package/setup discovery report
 skillsync worker --once
 skillsync worker --interval 300
 skillsync worker enable [--interval 300]
@@ -59,6 +60,8 @@ Subscribe records a stable source-plus-relative-path relationship key, so same-n
 
 
 `state stage` requires an initialized receiving target, takes the exclusive state lock for validation/snapshot/plan write, derives only receiving-library paths, and never activates or mutates canonical state/library/remote relationships. It writes a versioned deny-unknown-fields evidence plan; later apply is intentionally unsupported.
+
+`onboarding discover` is a read-only, deterministic report for the effective library and persisted harness roots. It classifies packages and recorded ownership without adopting, linking, repairing, scanning arbitrary home directories, executing bundled files, or claiming automatic harness discovery. Initialized targets use the shared read lock; uninitialized targets do not create configuration, state, locks, or missing roots.
 
 State loads strictly validate every local adoption record (identity, absolute no-follow source, canonical library destination, hash, and status); tampered records are rejected before status, doctor, or mutation. `SKILL.md` must begin with exactly one unquoted `name: <safe-component>` line; prose or duplicate/conflicting names are rejected. Imports stage content and roll back the newly installed package if provenance state cannot be persisted. Skill names and source-relative package paths reject absolute paths, parent traversal, separators where a package key is required, and control characters. Symlinks and Windows reparse points are rejected; regular-file scans use no-follow opens on Unix and handle-bound reparse checks on Windows, and live package/publication replacements are staged through identity-checked native directory moves. Managed snapshots are rechecked before commit or replacement and abort when a concurrent change is detected; import installation uses an anchored no-replace primitive (Linux `renameat2`, Windows native no-overwrite move) and fails closed where unavailable. External writers are not fully serialized. Bundled files are never executed. `SKILLSYNC_TEST_FAIL_STATE_SAVE=1` is a test-only failure-injection hook for exercising rollback; it is not a configuration or recovery bypass.
 
