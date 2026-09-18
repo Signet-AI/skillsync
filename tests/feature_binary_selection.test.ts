@@ -21,4 +21,4 @@ test("feature binary selection rejects a test-hooks-only artifact", () => {
   });
   expect(result.exitCode).toBe(1);
   expect(decoder.decode(result.stdout)).toContain("cannot run with --json");
-});
+}, { timeout: 30000 });

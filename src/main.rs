@@ -598,7 +598,9 @@ fn validate_set_state(state: &State) -> Result<()> {
 }
 fn validate_local_adoption(key: &str, record: &LocalAdoption, library: &Path) -> Result<()> {
     let skill = strict_component(&record.skill, "local adoption skill name")?;
-    if key != format!("local:{skill}") {
+    let expected_legacy = format!("local:{skill}");
+    let expected_path = format!("local:path:{}", source_rel(&record.source_package)?);
+    if key != expected_legacy && key != expected_path {
         return Err(anyhow!("local adoption key does not match skill"));
     }
     let source = PathBuf::from(&record.source_path);

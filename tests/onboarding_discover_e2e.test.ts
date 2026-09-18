@@ -75,7 +75,7 @@ test("onboarding plan emits a hash-bound adoption plan", async () => {
   expect(result.exitCode).toBe(0);
   const document = JSON.parse(new TextDecoder().decode(await Bun.file(plan).arrayBuffer()));
   expect(document.format).toBe("skillsync-onboarding-adoption-plan");
-  expect(document.version).toBe(1);
+  expect(document.version).toBe(2);
   expect(document.operations).toHaveLength(1);
   expect(document.operations[0]).toMatchObject({ skill: "unmanaged", source_package: "unmanaged", content_hash: expect.any(String) });
 });
@@ -92,15 +92,44 @@ test("onboarding apply requires explicit approval and makes no mutation", async 
   expect((await readdir(f.root, { recursive: true })).sort()).toEqual(before);
 });
 
+test("onboarding v2 adopts same-name packages by distinct canonical paths and replay is idempotent", async () => {
+  const f = await fixture();
+  await mkdir(join(f.library, "one"), { recursive: true });
+  await mkdir(join(f.library, "two"), { recursive: true });
+  await writeFile(join(f.library, "one", "SKILL.md"), "name: same\n");
+  await writeFile(join(f.library, "two", "SKILL.md"), "name: same\n");
+  run(f, ["init"]);
+  const plan = join(f.root, "plan.json");
+  const made = Bun.spawnSync({ cmd: [commandBinary(), "--json", "onboarding", "plan", "--out", plan], env: f.env, stdout: "pipe", stderr: "pipe" });
+  expect(made.exitCode).toBe(0);
+  const document = JSON.parse(await readFile(plan, "utf8"));
+  expect(document.version).toBe(2);
+  expect(document.operations.map((op:any) => op.source_package)).toEqual(["one", "two"]);
+  const first = Bun.spawnSync({ cmd: [commandBinary(), "--json", "onboarding", "apply", "--plan", plan, "--yes"], env: f.env, stdout: "pipe", stderr: "pipe" });
+  expect(first.exitCode).toBe(0);
+  expect(JSON.parse(dec.decode(first.stdout)).operations).toEqual([
+    { skill: "same", status: "adopted", canonical_path: join(f.library, "one") },
+    { skill: "same", status: "adopted", canonical_path: join(f.library, "two") },
+  ]);
+  const second = Bun.spawnSync({ cmd: [commandBinary(), "--json", "onboarding", "apply", "--plan", plan, "--yes"], env: f.env, stdout: "pipe", stderr: "pipe" });
+  expect(second.exitCode).toBe(0);
+  expect(JSON.parse(dec.decode(second.stdout)).operations.every((op:any) => op.status === "already_adopted")).toBe(true);
+  expect(Object.keys(run(f, ["status"]).local_adoptions)).toEqual(["local:path:one", "local:path:two"]);
+});
+
 test("onboarding apply records one adoption and replay is idempotent", async () => {
   const f = await fixture(); await pkg(join(f.library, "unmanaged"));
   run(f, ["init"]); const plan = join(f.root, "plan.json");
   const made = Bun.spawnSync({ cmd: [commandBinary(), "--json", "onboarding", "plan", "--out", plan], env: f.env, stdout: "pipe", stderr: "pipe" }); expect(made.exitCode).toBe(0);
   const first = Bun.spawnSync({ cmd: [commandBinary(), "--json", "onboarding", "apply", "--plan", plan, "--yes"], env: f.env, stdout: "pipe", stderr: "pipe" }); expect(first.exitCode).toBe(0);
-  expect(JSON.parse(new TextDecoder().decode(first.stdout)).status).toBe("adopted");
+  expect(JSON.parse(new TextDecoder().decode(first.stdout))).toMatchObject({
+    skill: "unmanaged",
+    status: "adopted",
+    canonical_path: join(f.library, "unmanaged"),
+  });
   const second = Bun.spawnSync({ cmd: [commandBinary(), "--json", "onboarding", "apply", "--plan", plan, "--yes"], env: f.env, stdout: "pipe", stderr: "pipe" }); expect(second.exitCode).toBe(0);
   expect(JSON.parse(new TextDecoder().decode(second.stdout)).status).toBe("already_adopted");
-  expect(Object.keys(run(f, ["status"]).local_adoptions)).toEqual(["local:unmanaged"]);
+  expect(Object.keys(run(f, ["status"]).local_adoptions)).toEqual(["local:path:unmanaged"]);
 });
 
 
@@ -111,7 +140,7 @@ test("onboarding plan applies a canonical root package", async () => {
   const applied = Bun.spawnSync({ cmd: [commandBinary(), "--json", "onboarding", "apply", "--plan", plan, "--yes"], env: f.env, stdout: "pipe", stderr: "pipe" });
   expect(applied.exitCode).toBe(0);
   expect(JSON.parse(new TextDecoder().decode(applied.stdout))).toMatchObject({status: "adopted", skill: "unmanaged"});
-  expect(run(f, ["status"]).local_adoptions["local:unmanaged"].source_package).toBe("unmanaged");
+  expect(run(f, ["status"]).local_adoptions["local:path:unmanaged"].source_package).toBe("unmanaged");
 });
 
 test("onboarding plan applies a nested package without collapsing its identity", async () => {
@@ -123,7 +152,7 @@ test("onboarding plan applies a nested package without collapsing its identity",
   const applied = Bun.spawnSync({ cmd: [commandBinary(), "--json", "onboarding", "apply", "--plan", plan, "--yes"], env: f.env, stdout: "pipe", stderr: "pipe" });
   expect(applied.exitCode).toBe(0);
   const state = run(f, ["status"]);
-  expect(state.local_adoptions["local:child"]).toMatchObject({skill: "child", source_package: "parent/child", local_path: join(f.library, "parent", "child")});
+  expect(state.local_adoptions["local:path:parent/child"]).toMatchObject({skill: "child", source_package: "parent/child", local_path: join(f.library, "parent", "child")});
 });
 
 test("onboarding apply rejects packages managed by an explicit harness link before mutation", async () => {

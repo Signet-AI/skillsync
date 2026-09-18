@@ -165,14 +165,15 @@ fn portable_state(app: &App) -> Result<Bundle> {
     let mut local_adoptions = BTreeMap::new();
     for (key, a) in &app.state.local_adoptions {
         let skill = crate::strict_component(&a.skill, "skill name")?;
-        if *key != format!("local:{skill}") {
+        let source_package = canonical_source_rel(&a.source_package)?;
+        if *key != format!("local:{skill}") && *key != format!("local:path:{source_package}") {
             return Err(anyhow!("local adoption key does not match skill"));
         }
         local_adoptions.insert(
             key.clone(),
             LocalAdoption {
                 skill: a.skill.clone(),
-                source_package: canonical_source_rel(&a.source_package)?,
+                source_package,
                 content_hash: a.content_hash.clone(),
                 status: a.status.clone(),
             },
@@ -356,10 +357,12 @@ pub(crate) fn validate_bundle_bytes(bytes: &[u8]) -> Result<Bundle> {
     for (key, a) in &mut b.local_adoptions {
         validate_text(&a.skill, "skill")?;
         crate::strict_component(&a.skill, "skill name")?;
-        if key != &format!("local:{}", a.skill) {
+        a.source_package = canonical_source_rel(&a.source_package)?;
+        if key != &format!("local:{}", a.skill)
+            && key != &format!("local:path:{}", a.source_package)
+        {
             return Err(anyhow!("local adoption key does not match skill"));
         }
-        a.source_package = canonical_source_rel(&a.source_package)?;
         validate_hash(&a.content_hash, "content hash")?;
         validate_text(&a.status, "status")?;
     }
