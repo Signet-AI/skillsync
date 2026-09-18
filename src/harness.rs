@@ -409,6 +409,48 @@ pub(crate) fn inventory_harness_health(
     }
     Ok(result)
 }
+fn harness_capabilities(
+    state: &State,
+    diagnostics: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let mut capabilities = state
+        .harness_links
+        .iter()
+        .filter_map(|(relationship, record)| {
+            let status = diagnostics.iter().find_map(|diagnostic| {
+                if diagnostic.get("relationship")?.as_str()? == relationship {
+                    diagnostic.get("status").cloned()
+                } else {
+                    None
+                }
+            })?;
+            Some(serde_json::json!({
+                "relationship": relationship,
+                "adapter": "explicit_directory_link",
+                "skill": record.skill,
+                "harness_root": record.harness_root,
+                "link_path": record.link_path,
+                "support": "partial",
+                "write_back": "canonical_library_package",
+                "filtering": "unsupported",
+                "reload": "unsupported",
+                "verification": if cfg!(target_os = "linux") { "runtime_tested" } else { "compile_checked" },
+                "status": status,
+            }))
+        })
+        .collect::<Vec<_>>();
+    capabilities.sort_by(|left, right| {
+        left.get("relationship")
+            .and_then(serde_json::Value::as_str)
+            .cmp(
+                &right
+                    .get("relationship")
+                    .and_then(serde_json::Value::as_str),
+            )
+    });
+    capabilities
+}
+
 pub(crate) fn list(a: &App) -> Result<serde_json::Value> {
     let mut diagnostics = harness_link_health(a)?;
     diagnostics.sort_by(|left, right| {
@@ -420,7 +462,10 @@ pub(crate) fn list(a: &App) -> Result<serde_json::Value> {
                     .and_then(serde_json::Value::as_str),
             )
     });
-    Ok(serde_json::json!({"links": a.state.harness_links, "diagnostics": diagnostics}))
+    let harness_capabilities = harness_capabilities(&a.state, &diagnostics);
+    Ok(
+        serde_json::json!({"links": a.state.harness_links, "diagnostics": diagnostics, "harness_capabilities": harness_capabilities}),
+    )
 }
 pub(crate) fn harness_link(a: &mut App, root: &Path, raw_skill: &str) -> Result<serde_json::Value> {
     let skill = strict_component(raw_skill, "skill name")?;

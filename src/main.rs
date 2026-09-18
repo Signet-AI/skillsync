@@ -1024,7 +1024,9 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 command: HarnessCmd::List
             }
         ) {
-            return Ok(serde_json::json!({"links": {}, "diagnostics": []}));
+            return Ok(
+                serde_json::json!({"links": {}, "diagnostics": [], "harness_capabilities": []}),
+            );
         }
         if matches!(
             command,

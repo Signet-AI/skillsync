@@ -40,6 +40,19 @@ test("initialized harness list is deterministic, read-only, and reports a valid 
   expect(second).toEqual(first);
   expect(first.diagnostics).toHaveLength(1);
   expect(first.diagnostics[0].status).toBe("healthy");
+  expect(first.harness_capabilities).toEqual([{
+    relationship: first.diagnostics[0].relationship,
+    adapter: "explicit_directory_link",
+    skill: "one",
+    harness_root: harness,
+    link_path: join(harness, "one"),
+    support: "partial",
+    write_back: "canonical_library_package",
+    filtering: "unsupported",
+    reload: "unsupported",
+    verification: "runtime_tested",
+    status: "healthy",
+  }]);
   for (const [p, content] of before) expect(await readFile(p,"utf8")).toBe(content);
   expect(await lstat(join(harness,"one"))).toBeTruthy();
 });
@@ -61,6 +74,7 @@ test("uninitialized harness list has no filesystem side effects", async () => {
   const result = run(f, ["--json", "harness", "list"]);
   expect(result.links).toEqual({});
   expect(result.diagnostics).toEqual([]);
+  expect(result.harness_capabilities).toEqual([]);
   expect(await Bun.file(f.config).exists()).toBe(false);
   expect(await Bun.file(f.library).exists()).toBe(false);
   expect(await Bun.file(join(f.config,"state.json")).exists()).toBe(false);
@@ -76,17 +90,21 @@ test("harness list inspects only recorded ownership and fails closed for unsafe 
   expect(Object.keys(adopted.links)).toHaveLength(1);
   expect(adopted.diagnostics.some((x:any) => x.link_path.endsWith("external"))).toBe(false);
 
+  const capability = (report:any) => report.harness_capabilities[0];
   await rm(join(harness,"one"));
   let missing = run(f, ["--json", "harness", "list"]);
   expect(missing.diagnostics[0].status).toBe("missing");
+  expect(capability(missing).status).toBe("missing");
   await put(join(f.library, "two", "SKILL.md"), "name: two\n");
   await symlink(join(f.library,"two"), join(harness,"one"), "dir");
   let wrong = run(f, ["--json", "harness", "list"]);
   expect(wrong.diagnostics[0].status).toBe("wrong_target");
+  expect(capability(wrong).status).toBe("wrong_target");
   await rm(join(harness,"one"));
   await put(join(harness,"one"), "collision\n");
   let collision = run(f, ["--json", "harness", "list"]);
   expect(collision.diagnostics[0].status).toBe("collision");
+  expect(capability(collision).status).toBe("collision");
   await rm(join(harness,"one"));
   await rm(harness, {recursive:true});
   await symlink(join(f.root,"missing-root"), harness, "dir");
