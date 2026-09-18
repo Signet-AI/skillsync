@@ -23,6 +23,62 @@ test("state stage writes a deterministic non-activating evidence plan", async ()
   const value = JSON.parse(await readFile(plan, "utf8"));
   expect(value.version).toBe(1); expect(value.bundle_hash).toMatch(/^[0-9a-f]{64}$/);
   expect(value.non_activating).toBe(true); expect(value.target.library).toBe(join(root, "library"));
+  expect(value.records.every((record: any) => record.preflight?.readiness && Array.isArray(record.preflight.blockers))).toBe(true);
+});
+
+test("absent set and local adoption records are blocked by unsupported activation", async () => {
+  const root = await fixture(); const bundle = join(root, "bundle.json"); const plan = join(root, "plan.json");
+  await mkdir(join(root, "library", "other"));
+  await writeFile(bundle, JSON.stringify({
+    format: "skillsync-state-metadata", version: 1, metadata_only: true,
+    subscriptions: {}, publications: {}, pending_publications: {},
+    sets: { incoming: { members: ["library:demo"] } },
+    local_adoptions: { "local:other": { skill: "other", source_package: ".", content_hash: "a".repeat(64), status: "adopted" } },
+  }));
+  run(root, ["state", "stage", "--from", bundle, "--plan", plan]);
+  const value = JSON.parse(await readFile(plan, "utf8"));
+  for (const record of value.records) {
+    expect(record.preflight.target_available).toBe(true);
+    expect(record.preflight.blockers).toContain("activation_unsupported");
+    expect(record.preflight.readiness).toBe("blocked");
+  }
+  const forged = structuredClone(value);
+  forged.records[0].preflight.readiness = "ready";
+  await writeFile(plan, JSON.stringify(forged));
+  expect(run(root, ["state", "inspect-plan", "--plan", plan], false).ok).toBe(false);
+});
+
+test("state inspect-plan rejects a forged subscription blocker vector before mutation", async () => {
+  const root = await fixture(); const bundle = join(root, "bundle.json"); const plan = join(root, "plan.json");
+  const source = "https://example.com/skills.git"; const sourcePath = ".";
+  const key = "rel-" + createHash("sha256").update(Buffer.from(source + "\0" + sourcePath)).digest("hex");
+  const subscription = { skill: "demo", source, branch: "main", source_path: sourcePath, baseline_hash: "c".repeat(64), baseline_source: source, baseline_source_path: sourcePath, status: "synced", conflict_selection: null, last_sync: 1, update_count: 0, resolved_commit: "a".repeat(40), resolved_tree: "b".repeat(40) };
+  await writeFile(bundle, JSON.stringify({ format: "skillsync-state-metadata", version: 1, metadata_only: true, subscriptions: { [key]: subscription }, publications: {}, pending_publications: {}, sets: {}, local_adoptions: {} }));
+  run(root, ["state", "stage", "--from", bundle, "--plan", plan]);
+  const before = await readFile(join(root, "config", "state.json"), "utf8");
+  const forged = JSON.parse(await readFile(plan, "utf8"));
+  forged.records[0].preflight.blockers = forged.records[0].preflight.blockers.filter((x: string) => x !== "remote_credentials_required");
+  await writeFile(plan, JSON.stringify(forged));
+  expect(run(root, ["state", "inspect-plan", "--plan", plan], false).ok).toBe(false);
+  expect(await readFile(join(root, "config", "state.json"), "utf8")).toBe(before);
+  expect(await Bun.file(join(root, "library", "demo", "SKILL.md")).exists()).toBe(true);
+});
+
+test("state stage orders generated conflict blockers for an unavailable subscription target", async () => {
+  const root = await fixture(); const bundle = join(root, "bundle.json"); const plan = join(root, "plan.json");
+  const source = "https://example.com/skills.git"; const sourcePath = ".";
+  const key = "rel-" + createHash("sha256").update(Buffer.from(source + "\0" + sourcePath)).digest("hex");
+  const subscription = { skill: "demo", source, branch: "main", source_path: sourcePath, baseline_path: join(root, "library", "demo"), baseline_hash: "c".repeat(64), baseline_source: source, baseline_source_path: sourcePath, local_path: join(root, "library", "demo"), status: "synced", recovery_path: null, conflict_selection: null, last_sync: 1, update_count: 0, resolved_commit: "a".repeat(40), resolved_tree: "b".repeat(40) };
+  const statePath = join(root, "config", "state.json"); const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.subscriptions = { [key]: subscription }; await writeFile(statePath, JSON.stringify(state));
+  await rm(join(root, "library", "demo"), { recursive: true, force: true });
+  const incoming = { skill: "demo", source, branch: "main", source_path: sourcePath, baseline_hash: "d".repeat(64), baseline_source: source, baseline_source_path: sourcePath, status: "synced", conflict_selection: null, last_sync: 1, update_count: 0, resolved_commit: "a".repeat(40), resolved_tree: "b".repeat(40) };
+  await writeFile(bundle, JSON.stringify({ format: "skillsync-state-metadata", version: 1, metadata_only: true, subscriptions: { [key]: incoming }, publications: {}, pending_publications: {}, sets: {}, local_adoptions: {} }));
+  run(root, ["state", "stage", "--from", bundle, "--plan", plan]);
+  const value = JSON.parse(await readFile(plan, "utf8"));
+  expect(value.records[0].classification).toBe("conflict");
+  expect(value.records[0].preflight.target_available).toBe(false);
+  expect(run(root, ["state", "inspect-plan", "--plan", plan]).ok).toBe(true);
 });
 
 test("state inspect-plan validates a staged plan and reports target availability", async () => {

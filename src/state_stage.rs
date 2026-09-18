@@ -31,12 +31,36 @@ enum RecordKind {
     Set,
     LocalAdoption,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum Classification {
     Ready,
     AlreadyPresent,
     Conflict,
+}
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PreflightReadiness {
+    Ready,
+    AlreadyPresent,
+    Blocked,
+}
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum PreflightBlocker {
+    ActivationUnsupported,
+    PackageContentsMissing,
+    BaselineRecoveryEvidenceMissing,
+    TargetConflict,
+    RemoteCredentialsRequired,
+}
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct Preflight {
+    readiness: PreflightReadiness,
+    target_available: bool,
+    current_classification: Classification,
+    blockers: Vec<PreflightBlocker>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,6 +69,7 @@ struct StageRecord {
     key: String,
     skill: String,
     classification: Classification,
+    preflight: Preflight,
     derived_local_path: Option<String>,
     observed: Value,
 }
@@ -121,6 +146,42 @@ fn validate_record_semantics(record: &StageRecord) -> Result<()> {
     Ok(())
 }
 
+fn expected_preflight(
+    kind: &RecordKind,
+    classification: &Classification,
+    target_available: bool,
+) -> Preflight {
+    let mut blockers = vec![PreflightBlocker::ActivationUnsupported];
+    if !target_available {
+        blockers.push(PreflightBlocker::PackageContentsMissing);
+    }
+    if matches!(classification, Classification::Conflict) {
+        blockers.push(PreflightBlocker::TargetConflict);
+    }
+    match kind {
+        RecordKind::Subscription => {
+            blockers.push(PreflightBlocker::BaselineRecoveryEvidenceMissing);
+            blockers.push(PreflightBlocker::RemoteCredentialsRequired);
+        }
+        RecordKind::Publication | RecordKind::PendingPublication => {
+            blockers.push(PreflightBlocker::RemoteCredentialsRequired);
+        }
+        RecordKind::Set | RecordKind::LocalAdoption => {}
+    }
+    blockers.sort_unstable();
+    blockers.dedup();
+    Preflight {
+        readiness: if matches!(classification, Classification::AlreadyPresent) {
+            PreflightReadiness::AlreadyPresent
+        } else {
+            PreflightReadiness::Blocked
+        },
+        target_available,
+        current_classification: classification.clone(),
+        blockers,
+    }
+}
+
 fn validate_plan(plan: &StagePlan) -> Result<()> {
     if plan.format != "skillsync-state-stage-plan" || plan.version != 1 {
         return Err(anyhow!("unsupported stage plan format or version"));
@@ -161,6 +222,24 @@ fn validate_plan(plan: &StagePlan) -> Result<()> {
         if !record.observed.is_object() {
             return Err(anyhow!("malformed observed record"));
         }
+        if record
+            .preflight
+            .blockers
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(anyhow!("malformed preflight result"));
+        }
+        let available = record.derived_local_path.as_ref().is_none_or(|path| {
+            fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+        });
+        if record.preflight.target_available != available {
+            return Err(anyhow!("stale preflight target availability"));
+        }
+        let expected = expected_preflight(&record.kind, &record.classification, available);
+        if serde_json::to_value(&record.preflight)? != serde_json::to_value(expected)? {
+            return Err(anyhow!("forged preflight result"));
+        }
     }
     Ok(())
 }
@@ -173,11 +252,17 @@ fn record(
     current: Option<Value>,
     derived: Option<String>,
 ) -> StageRecord {
+    let classification = classify(current.is_some(), current.as_ref() == Some(&incoming));
+    let target_available = derived.as_ref().is_none_or(|path| {
+        fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+    });
+    let preflight = expected_preflight(&kind, &classification, target_available);
     StageRecord {
         kind,
         key: key.into(),
         skill: skill.into(),
-        classification: classify(current.is_some(), current.as_ref() == Some(&incoming)),
+        classification: classification.clone(),
+        preflight,
         derived_local_path: derived,
         observed: incoming,
     }
@@ -327,7 +412,7 @@ pub(crate) fn inspect_plan(
             "fresh"
         };
         return Ok(
-            json!({"format":plan.format,"version":plan.version,"status":status,"record_count":plan.records.len(),"target_available":true}),
+            json!({"format":plan.format,"version":plan.version,"status":status,"record_count":plan.records.len(),"target_available":true,"records":plan.records}),
         );
     }
     Ok(
