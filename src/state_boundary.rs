@@ -52,6 +52,10 @@ pub(crate) struct Subscription {
     pub(crate) conflict_selection: Option<String>,
     pub(crate) last_sync: u64,
     pub(crate) update_count: u64,
+    #[serde(default)]
+    pub(crate) resolved_commit: Option<String>,
+    #[serde(default)]
+    pub(crate) resolved_tree: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -87,6 +91,8 @@ fn portable_state(app: &App) -> Result<Bundle> {
         crate::strict_component(&s.skill, "subscription skill name")?;
         crate::repository::validate_branch(&s.branch)?;
         validate_hash(&s.baseline_hash, "baseline hash")?;
+        validate_object_id(s.resolved_commit.as_deref(), "resolved commit")?;
+        validate_object_id(s.resolved_tree.as_deref(), "resolved tree")?;
         validate_remote(&s.baseline_source, "baseline source")?;
         if s.baseline_source != s.source {
             return Err(anyhow!("baseline source does not match source"));
@@ -115,6 +121,8 @@ fn portable_state(app: &App) -> Result<Bundle> {
                 conflict_selection: s.conflict_selection.clone(),
                 last_sync: s.last_sync,
                 update_count: s.update_count,
+                resolved_commit: s.resolved_commit.clone(),
+                resolved_tree: s.resolved_tree.clone(),
             },
         );
     }
@@ -228,6 +236,15 @@ fn validate_hash(s: &str, label: &str) -> Result<()> {
         Ok(())
     }
 }
+fn validate_object_id(value: Option<&str>, label: &str) -> Result<()> {
+    if let Some(s) = value {
+        if s.len() != 40 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(anyhow!("invalid {label}"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_subscription_status(s: &str) -> Result<()> {
     if matches!(
         s,
@@ -278,6 +295,8 @@ pub(crate) fn validate_bundle_bytes(bytes: &[u8]) -> Result<Bundle> {
             return Err(anyhow!("baseline source path does not match source path"));
         }
         validate_hash(&s.baseline_hash, "baseline hash")?;
+        validate_object_id(s.resolved_commit.as_deref(), "resolved commit")?;
+        validate_object_id(s.resolved_tree.as_deref(), "resolved tree")?;
         validate_subscription_status(&s.status)?;
         if let Some(x) = &s.conflict_selection {
             validate_conflict_selection(x)?;

@@ -35,6 +35,22 @@ test("state inspect-plan validates a staged plan and reports target availability
   expect(result.record_count).toBeGreaterThan(0); expect(await readFile(join(root, "config", "state.json"), "utf8")).toBe(before);
 });
 
+test("state stage preserves equivalent provenance-bearing subscriptions as already present and fresh", async () => {
+  const root = await fixture(); const bundle = join(root, "bundle.json"); const plan = join(root, "plan.json");
+  const source = "https://example.com/skills.git"; const sourcePath = ".";
+  const key = "rel-" + createHash("sha256").update(Buffer.from(source + "\0" + sourcePath)).digest("hex");
+  const provenance = { resolved_commit: "a".repeat(40), resolved_tree: "b".repeat(40) };
+  const subscription = { skill: "demo", source, branch: "main", source_path: sourcePath, baseline_path: join(root, "library", "demo"), local_path: join(root, "library", "demo"), baseline_hash: "c".repeat(64), baseline_source: source, baseline_source_path: sourcePath, status: "synced", conflict_selection: null, last_sync: 1, update_count: 0, ...provenance };
+  const statePath = join(root, "config", "state.json"); const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.subscriptions = { [key]: subscription }; await writeFile(statePath, JSON.stringify(state));
+  const exported = { format: "skillsync-state-metadata", version: 1, metadata_only: true, subscriptions: { [key]: { skill: subscription.skill, source: subscription.source, branch: subscription.branch, source_path: subscription.source_path, baseline_hash: subscription.baseline_hash, baseline_source: subscription.baseline_source, baseline_source_path: subscription.baseline_source_path, status: subscription.status, conflict_selection: subscription.conflict_selection, last_sync: subscription.last_sync, update_count: subscription.update_count, ...provenance } }, publications: {}, pending_publications: {}, sets: {}, local_adoptions: {} };
+  await writeFile(bundle, JSON.stringify(exported));
+  const staged = run(root, ["state", "stage", "--from", bundle, "--plan", plan]);
+  expect(JSON.parse(await readFile(plan, "utf8")).records[0].classification).toBe("already_present");
+  expect(run(root, ["state", "inspect-plan", "--plan", plan, "--from", bundle]).status).toBe("fresh");
+  expect(staged.record_count).toBe(1);
+});
+
 test("state inspect-plan rejects forged derived paths and duplicate records", async () => {
   const root = await fixture(); const bundle = join(root, "bundle.json"); const plan = join(root, "plan.json");
   run(root, ["state", "export", "--out", bundle]); run(root, ["state", "stage", "--from", bundle, "--plan", plan]);

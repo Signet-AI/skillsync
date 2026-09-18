@@ -280,6 +280,10 @@ struct Subscription {
     conflict_selection: Option<String>,
     last_sync: u64,
     update_count: u64,
+    #[serde(default)]
+    resolved_commit: Option<String>,
+    #[serde(default)]
+    resolved_tree: Option<String>,
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Publication {
@@ -414,12 +418,12 @@ impl App {
             })?
         } else {
             State {
-                version: 5,
+                version: 6,
                 library: expected_library.display().to_string(),
                 ..Default::default()
             }
         };
-        if state.version > 5 {
+        if state.version > 6 {
             return Err(anyhow!("unsupported state version: {}", state.version));
         }
         if state.version < 3 {
@@ -451,6 +455,10 @@ impl App {
                 }
             }
             state.version = 5;
+        }
+        if state.version < 6 {
+            // Additive provenance migration: never contact repositories while loading.
+            state.version = 6;
         }
         validate_set_state(&state)?;
         let library = if state_exists && !state.library.is_empty() {
@@ -513,7 +521,19 @@ pub(crate) fn set_member_name(id: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("invalid set member identity"))?;
     strict_component(name, "set member skill name")
 }
+fn validate_object_id(value: Option<&str>, label: &str) -> Result<()> {
+    if let Some(value) = value {
+        if value.len() != 40 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(anyhow!("invalid {label}"));
+        }
+    }
+    Ok(())
+}
 fn validate_set_state(state: &State) -> Result<()> {
+    for subscription in state.subscriptions.values() {
+        validate_object_id(subscription.resolved_commit.as_deref(), "resolved commit")?;
+        validate_object_id(subscription.resolved_tree.as_deref(), "resolved tree")?;
+    }
     for (name, set) in &state.sets {
         strict_component(name, "set name")?;
         for member in &set.members {
@@ -1008,6 +1028,8 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             let (bp, h, mut baseline_replacement) = snapshot_transaction(&a, &key, src)?;
             let mut live_replacement = replace_dir_bound(&dst, &staged, &library_parent)?;
             let previous_state = a.state.clone();
+            let (resolved_commit, resolved_tree) =
+                repository::rev_parse_provenance(&repo_path, &source_path)?;
             a.state.subscriptions.insert(
                 key.clone(),
                 Subscription {
@@ -1025,6 +1047,8 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                     conflict_selection: None,
                     last_sync: now(),
                     update_count: 0,
+                    resolved_commit: Some(resolved_commit),
+                    resolved_tree: Some(resolved_tree),
                 },
             );
             if let Err(error) = a.save() {

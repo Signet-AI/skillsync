@@ -265,6 +265,24 @@ fn find_skill(root: &Path, q: &str) -> Result<(String, PathBuf, String)> {
         )),
     }
 }
+pub(crate) fn rev_parse_provenance(repo: &Path, source_path: &str) -> Result<(String, String)> {
+    let validate = |value: String, label: &str| {
+        if value.len() != 40 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Err(anyhow!("invalid Git {label} object id"))
+        } else {
+            Ok(value)
+        }
+    };
+    let commit = validate(run_git(Some(repo), &["rev-parse", "HEAD"])?, "commit")?;
+    let spec = if source_path == "." {
+        "HEAD^{tree}".to_owned()
+    } else {
+        format!("HEAD:{source_path}")
+    };
+    let tree = validate(run_git(Some(repo), &["rev-parse", &spec])?, "tree")?;
+    Ok((commit, tree))
+}
+
 pub(crate) fn skill_query(s: &str) -> Result<String> {
     if s.contains('/') || s.contains('\\') {
         let p = s.replace('\\', "/");
@@ -475,6 +493,9 @@ pub(crate) fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
     let repo_path = crate::filesystem::canonicalize_path_with_missing(repo.path())
         .context("canonicalize update repository")?;
     let (_, up, _) = find_skill(&repo_path, &s.source_path)?;
+    let (resolved_commit, resolved_tree) = rev_parse_provenance(&repo_path, &s.source_path)?;
+    s.resolved_commit = Some(resolved_commit);
+    s.resolved_tree = Some(resolved_tree);
     let base = PathBuf::from(&s.baseline_path);
     let lh = hash_dir(&local)?;
     if lh != s.baseline_hash {

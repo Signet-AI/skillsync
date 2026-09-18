@@ -375,6 +375,25 @@ test("rolls back a failed subscribe completely and allows retry", async () => {
   expect(Object.keys(skillsync(fixture, ["--json", "status"]).json.subscriptions)).toHaveLength(1);
 });
 
+test("Git subscriptions persist exact checked-out commit and package tree provenance", async () => {
+  const fixture = await makeFixture();
+  const upstream = join(fixture.root, "provenance-upstream");
+  await put(join(upstream, "SKILL.md"), "name: demo\nbase\n");
+  await put(join(upstream, "nested", "SKILL.md"), "name: nested\none\n");
+  checked(run("git", ["init", "-q"], upstream, fixture.env), "init provenance source");
+  git(fixture, upstream, ["add", "."]);
+  git(fixture, upstream, ["commit", "-qm", "initial"]);
+  const initial = checked(run("git", ["rev-parse", "HEAD"], upstream, fixture.env), "read initial commit").stdout.trim();
+  const nestedTree = checked(run("git", ["rev-parse", "HEAD:nested"], upstream, fixture.env), "read nested tree").stdout.trim();
+  skillsync(fixture, ["--json", "subscribe", upstream, "--skill", "nested"]);
+  const state = skillsync(fixture, ["--json", "status"]).json;
+  const relationship = Object.keys(state.subscriptions)[0];
+  expect(state.subscriptions[relationship].resolved_commit).toBe(initial);
+  expect(state.subscriptions[relationship].resolved_tree).toBe(nestedTree);
+  expect(state.subscriptions[relationship].resolved_commit).toMatch(/^[0-9a-f]{40}$/);
+  expect(state.subscriptions[relationship].resolved_tree).toMatch(/^[0-9a-f]{40}$/);
+});
+
 test("local Git subscribe, merge, conflict recovery, and scoped publication", async () => {
   const fixture = await makeFixture();
   const source = join(fixture.root, "source");
