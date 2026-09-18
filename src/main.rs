@@ -182,6 +182,8 @@ enum ConflictCmd {
     },
     Resume {
         relationship: String,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
     },
 }
 #[derive(Subcommand)]
@@ -1107,8 +1109,17 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 },
         } => conflicts::resolve(&mut a, &relationship, local, incoming),
         Cmd::Conflicts {
-            command: ConflictCmd::Resume { relationship },
-        } => conflicts::resume(&mut a, &relationship),
+            command:
+                ConflictCmd::Resume {
+                    relationship,
+                    workspace,
+                },
+        } => conflicts::resume(
+            &mut a,
+            &relationship,
+            workspace.as_deref(),
+            operation_lock.ok_or_else(|| anyhow!("resume requires operation lock"))?,
+        ),
         Cmd::Update | Cmd::Sync => worker::sync_all(&mut a, false),
         Cmd::Worker {
             command: Some(WorkerCmd::Enable { interval }),

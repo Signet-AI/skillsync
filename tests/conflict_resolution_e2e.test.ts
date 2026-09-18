@@ -128,6 +128,76 @@ test("explicit conflict selection resumes incoming and retains immutable evidenc
   expect(await readFile(livePath, "utf8")).toBe("name: demo\nincoming change\n");
 }, { timeout: 30000 });
 
+test("workspace resume accepts an explicit resolved v2 workspace", async () => {
+  const { f, relationship } = await conflictFixture();
+  const workspace = join(f.root, "resolved-workspace");
+  const state = JSON.parse(await readFile(join(f.config, "state.json"), "utf8"));
+  const recovery = state.subscriptions[relationship].recovery_path as string;
+  const shown = run(f, ["--json", "conflicts", "show", relationship]).json;
+  await mkdir(workspace, { recursive: true });
+  for (const side of ["base", "local", "incoming"] as const) await cp(join(recovery, side), join(workspace, side), { recursive: true });
+  await cp(join(recovery, "local"), join(workspace, "resolved"), { recursive: true });
+  const resolvedHash = shown.local_hash;
+  const source = state.subscriptions[relationship].source;
+  const sourcePath = state.subscriptions[relationship].source_path;
+  await writeFile(join(workspace, "manifest.json"), JSON.stringify({ manifest_version: 2, workspace_kind: "conflict-resolution", status: "resolved", relationship, source, source_path: sourcePath, skill: "demo", base_hash: shown.base_hash, local_hash: shown.local_hash, incoming_hash: shown.incoming_hash, live_hash_at_export: shown.live_hash_at_detection, resolved_tree: "resolved", resolved_hash: resolvedHash, unresolved_markers: false }));
+  const resumed = run(f, ["--json", "conflicts", "resume", relationship, "--workspace", workspace]).json;
+  expect(resumed.status).toBe("synced");
+});
+
+test("rejects a v2 workspace whose evidence fields or copied sides diverge before mutation", async () => {
+  const { f, relationship, statePath, livePath } = await conflictFixture();
+  const workspace = join(f.root, "tampered-v2-workspace");
+  const stateBefore = await readFile(statePath, "utf8");
+  const state = JSON.parse(stateBefore);
+  const recovery = state.subscriptions[relationship].recovery_path as string;
+  const shown = run(f, ["--json", "conflicts", "show", relationship]).json;
+  await mkdir(workspace, { recursive: true });
+  for (const side of ["base", "local", "incoming"] as const) await cp(join(recovery, side), join(workspace, side), { recursive: true });
+  await cp(join(recovery, "local"), join(workspace, "resolved"), { recursive: true });
+  await put(join(workspace, "local/SKILL.md"), "name: demo\ntampered\n");
+  await writeFile(join(workspace, "manifest.json"), JSON.stringify({ manifest_version: 2, workspace_kind: "conflict-resolution", status: "resolved", relationship, source: state.subscriptions[relationship].source, source_path: state.subscriptions[relationship].source_path, skill: "demo", base_hash: shown.base_hash, local_hash: shown.local_hash, incoming_hash: shown.incoming_hash, live_hash_at_export: shown.live_hash_at_detection, resolved_tree: "resolved", resolved_hash: shown.local_hash, unresolved_markers: false }));
+  const rejected = run(f, ["--json", "conflicts", "resume", relationship, "--workspace", workspace], false);
+  expect(rejected.json.ok).toBe(false);
+  expect(await readFile(statePath, "utf8")).toBe(stateBefore);
+  expect(await readFile(livePath, "utf8")).toBe("name: demo\nlocal change\n");
+}, { timeout: 30000 });
+
+test("post-commit verification failure is recovery-required, never synced", async () => {
+  const { f, relationship, statePath, livePath } = await conflictFixture();
+  run(f, ["--json", "conflicts", "resolve", relationship, "--incoming"]);
+  const beforeRecovery = await readdir(join(f.config, "recovery"));
+  const failed = run(f, ["--json", "conflicts", "resume", relationship], false, { SKILLSYNC_TEST_FAIL_RESUME_POSTVERIFY: "1" });
+  expect(failed.json.ok).toBe(false);
+  expect(failed.json.message).toContain("recovery required");
+  expect(failed.json.message).not.toContain("synced");
+  expect(await readdir(join(f.config, "recovery"))).toEqual(beforeRecovery);
+  expect(await readFile(livePath, "utf8")).toBe("name: demo\nincoming change\n");
+  expect(JSON.parse(await readFile(statePath, "utf8")).subscriptions[relationship].status).toBe("synced");
+}, { timeout: 30000 });
+
+test("postverify rejects a replaced config directory instead of following its pathname", async () => {
+  const { f, relationship, statePath, livePath } = await conflictFixture();
+  run(f, ["--json", "conflicts", "resolve", relationship, "--incoming"]);
+  const failed = run(f, ["--json", "conflicts", "resume", relationship], false, { SKILLSYNC_TEST_REPLACE_RESUME_CONFIG: "1" });
+  expect(failed.json.ok).toBe(false);
+  expect(failed.json.message).toContain("recovery required");
+  expect(await readFile(livePath, "utf8")).toBe("name: demo\nincoming change\n");
+}, { timeout: 30000 });
+
+test("persisted state corruption after save is recovery-required, never synced", async () => {
+  const { f, relationship, statePath, livePath } = await conflictFixture();
+  run(f, ["--json", "conflicts", "resolve", relationship, "--incoming"]);
+  const beforeRecovery = await readdir(join(f.config, "recovery"));
+  const failed = run(f, ["--json", "conflicts", "resume", relationship], false, { SKILLSYNC_TEST_CORRUPT_RESUME_STATE: "1" });
+  expect(failed.json.ok).toBe(false);
+  expect(failed.json.message).toContain("recovery required");
+  expect(failed.json.message).not.toContain("synced");
+  expect(await readdir(join(f.config, "recovery"))).toEqual(beforeRecovery);
+  expect(await readFile(livePath, "utf8")).toBe("name: demo\nincoming change\n");
+  expect(await Bun.file(statePath).text()).toContain("\"subscriptions\":null");
+}, { timeout: 30000 });
+
 test("rejects a tampered current-version conflict selection on repeated resume", async () => {
   const { f, relationship, statePath } = await conflictFixture();
   run(f, ["--json", "conflicts", "resolve", relationship, "--incoming"]);

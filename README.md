@@ -30,7 +30,8 @@ skillsync conflicts show RELATIONSHIP
 skillsync conflicts export RELATIONSHIP --out WORKSPACE  # immutable evidence snapshot
 skillsync conflicts inspect-workspace --workspace PATH  # read-only validation/report
 skillsync conflicts resolve RELATIONSHIP --local|--incoming
-skillsync conflicts resume RELATIONSHIP
+skillsync conflicts resume RELATIONSHIP [--workspace WORKSPACE]
+# --workspace applies a strict v2 resolved workspace; v1 remains inspect-only.
 # Conflict export refuses non-portable local repository sources before staging or publishing a workspace.
 # Resolution is explicit side selection; semantic/workspace editing remains deferred.
 skillsync set create NAME | list | show NAME | add NAME SKILL | remove NAME SKILL

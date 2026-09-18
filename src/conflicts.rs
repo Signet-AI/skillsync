@@ -8,11 +8,11 @@ use std::{
 };
 
 use crate::filesystem::{
-    assert_no_symlink_path, canonicalize_path, canonicalize_path_with_missing, copy_tree, hash_dir,
-    install_dir_noreplace, manifest_name, replace_dir_bound, safe, snapshot_transaction,
+    assert_no_symlink_path, canonicalize_path, canonicalize_path_with_missing, copy_tree, files,
+    hash_dir, install_dir_noreplace, manifest_name, replace_dir_bound, safe, snapshot_transaction,
     strict_component, validate_state_path,
 };
-use crate::{relationship_key, App};
+use crate::{filesystem::StateLock, relationship_key, App};
 
 fn validate_subscription(
     a: &App,
@@ -345,6 +345,138 @@ struct ExportManifest {
     live_hash_at_export: String,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedManifest {
+    manifest_version: u32,
+    workspace_kind: String,
+    status: String,
+    relationship: String,
+    source: String,
+    source_path: String,
+    skill: String,
+    base_hash: String,
+    local_hash: String,
+    incoming_hash: String,
+    live_hash_at_export: String,
+    resolved_tree: String,
+    resolved_hash: String,
+    unresolved_markers: bool,
+}
+
+fn validate_resolved_workspace(
+    workspace: &Path,
+    relationship: &str,
+    s: &crate::Subscription,
+    evidence: &serde_json::Value,
+) -> Result<PathBuf> {
+    validate_workspace_spelling(workspace)?;
+    let absolute = if workspace.is_absolute() {
+        workspace.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(workspace)
+    };
+    let workspace = canonicalize_path(&absolute)?;
+    validate_workspace_tree(&workspace, "workspace")?;
+    let entries = fs::read_dir(&workspace)?
+        .map(|e| e.map(|x| x.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<BTreeSet<_>>>()?;
+    let allowed = ["manifest.json", "base", "local", "incoming", "resolved"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    if entries != allowed {
+        return Err(anyhow!("workspace contains unexpected entries"));
+    }
+    let m: ResolvedManifest = serde_json::from_slice(&fs::read(workspace.join("manifest.json"))?)
+        .map_err(|_| anyhow!("resolved workspace manifest is malformed"))?;
+    if m.manifest_version != 2
+        || m.workspace_kind != "conflict-resolution"
+        || m.status != "resolved"
+        || m.relationship != relationship
+        || m.source != s.source
+        || m.source_path != s.source_path
+        || m.skill != s.skill
+        || m.resolved_tree != "resolved"
+        || m.unresolved_markers
+    {
+        return Err(anyhow!("resolved workspace identity or status mismatch"));
+    }
+    for (field, actual) in [
+        ("base_hash", &m.base_hash),
+        ("local_hash", &m.local_hash),
+        ("incoming_hash", &m.incoming_hash),
+    ] {
+        if evidence[field].as_str() != Some(actual.as_str()) {
+            return Err(anyhow!(
+                "resolved workspace {field} does not match conflict evidence"
+            ));
+        }
+    }
+    if m.base_hash != s.baseline_hash {
+        return Err(anyhow!(
+            "resolved workspace base does not match subscription baseline"
+        ));
+    }
+    if m.live_hash_at_export != m.local_hash {
+        return Err(anyhow!(
+            "resolved workspace live hash does not match local evidence"
+        ));
+    }
+    for (v, label) in [
+        (&m.base_hash, "base"),
+        (&m.local_hash, "local"),
+        (&m.incoming_hash, "incoming"),
+        (&m.live_hash_at_export, "live"),
+        (&m.resolved_hash, "resolved"),
+    ] {
+        if v.len() != 64
+            || !v
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(anyhow!("invalid {label} workspace hash"));
+        }
+    }
+    for side in ["base", "local", "incoming"] {
+        validate_workspace_tree(&workspace.join(side), side)?;
+        if manifest_name(&workspace.join(side))? != s.skill {
+            return Err(anyhow!("workspace {side} identity mismatch"));
+        }
+        let expected = &m.base_hash;
+        let expected = match side {
+            "local" => &m.local_hash,
+            "incoming" => &m.incoming_hash,
+            _ => expected,
+        };
+        if hash_dir(&workspace.join(side))? != *expected {
+            return Err(anyhow!(
+                "workspace {side} hash does not match conflict evidence"
+            ));
+        }
+    }
+    let resolved = workspace.join("resolved");
+    validate_workspace_tree(&resolved, "resolved")?;
+    if manifest_name(&resolved)? != s.skill || hash_dir(&resolved)? != m.resolved_hash {
+        return Err(anyhow!("resolved workspace hash or identity mismatch"));
+    }
+    for file in files(&resolved)? {
+        if file.0.file_name().is_some_and(|n| n == "SKILL.md") {
+            let text = String::from_utf8_lossy(&file.1);
+            if text.lines().any(|line| {
+                ["<<<<<<<", "=======", ">>>>>>>"]
+                    .iter()
+                    .any(|x| line.starts_with(x))
+            }) {
+                return Err(anyhow!(
+                    "resolved workspace contains unresolved conflict markers"
+                ));
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 fn validate_export_destination(out: &std::path::Path) -> Result<(PathBuf, PathBuf)> {
     let destination = canonicalize_path_with_missing(out)?;
     let parent = destination
@@ -674,7 +806,103 @@ pub(crate) fn resolve(
     Ok(json!({"relationship":relationship,"status":"selected","selected_side":side}))
 }
 
-pub(crate) fn resume(a: &mut App, relationship: &str) -> Result<serde_json::Value> {
+pub(crate) fn resume(
+    a: &mut App,
+    relationship: &str,
+    workspace: Option<&Path>,
+    operation_lock: &StateLock,
+) -> Result<serde_json::Value> {
+    if let Some(workspace) = workspace {
+        let s = a
+            .state
+            .subscriptions
+            .get(relationship)
+            .cloned()
+            .ok_or_else(|| anyhow!("conflict relationship not found"))?;
+        let view = show(a, relationship)?;
+        let resolved = validate_resolved_workspace(workspace, relationship, &s, &view)?;
+        if hash_dir(Path::new(&s.local_path))? != view["live_hash_at_detection"].as_str().unwrap() {
+            return Err(anyhow!(
+                "live content changed since conflict detection; workspace resume refused"
+            ));
+        }
+        let stage_parent = tempfile::tempdir_in(Path::new(&s.local_path).parent().unwrap())?;
+        let staged = stage_parent.path().join("resolved");
+        copy_tree(&resolved, &staged)?;
+        let parent = crate::filesystem::open_directory_file_bound(
+            Path::new(&s.local_path).parent().unwrap(),
+        )?;
+        let (baseline_path, baseline_hash, mut baseline_replacement) =
+            snapshot_transaction(a, relationship, &staged)?;
+        let mut live_replacement = replace_dir_bound(Path::new(&s.local_path), &staged, &parent)?;
+        let previous = a.state.clone();
+        let mut updated = s;
+        updated.status = "synced".into();
+        updated.conflict_selection = None;
+        updated.baseline_path = baseline_path.display().to_string();
+        updated.baseline_hash = baseline_hash;
+        updated.last_sync = crate::now();
+        updated.update_count += 1;
+        a.state.subscriptions.insert(relationship.into(), updated);
+        live_replacement.prepare()?;
+        baseline_replacement.prepare()?;
+        if let Err(error) = a.save() {
+            a.state = previous;
+            return Err(error).context("persist resolved conflict state; replacements rolled back");
+        }
+        live_replacement.commit()?;
+        baseline_replacement.commit()?;
+        #[cfg(feature = "test-hooks")]
+        if std::env::var("SKILLSYNC_TEST_CORRUPT_RESUME_STATE").as_deref() == Ok("1") {
+            std::fs::write(&a.state_path, b"{\"version\":6,\"subscriptions\":null}")?;
+        }
+        #[cfg(feature = "test-hooks")]
+        if std::env::var("SKILLSYNC_TEST_REPLACE_RESUME_CONFIG").as_deref() == Ok("1") {
+            let replacement = a.config.with_extension("replaced");
+            std::fs::rename(&a.config, &replacement)?;
+            std::fs::create_dir_all(&a.config)?;
+            std::fs::write(
+                a.config.join("state.json"),
+                b"{\"version\":6,\"subscriptions\":null}",
+            )?;
+        }
+        #[cfg(feature = "test-hooks")]
+        if std::env::var("SKILLSYNC_TEST_FAIL_RESUME_POSTVERIFY").as_deref() == Ok("1") {
+            return Err(anyhow!(
+                "resume post-commit verification failed; recovery required"
+            ));
+        }
+        let expected = a
+            .state
+            .subscriptions
+            .get(relationship)
+            .cloned()
+            .ok_or_else(|| anyhow!("resume post-commit verification failed; recovery required"))?;
+        let persisted_app = App::load(Some(operation_lock))
+            .map_err(|_| anyhow!("resume post-commit verification failed; recovery required"))?;
+        let persisted = persisted_app
+            .state
+            .subscriptions
+            .get(relationship)
+            .ok_or_else(|| anyhow!("resume post-commit verification failed; recovery required"))?;
+        if serde_json::to_value(persisted)? != serde_json::to_value(&expected)? {
+            return Err(anyhow!(
+                "resume post-commit verification failed; recovery required"
+            ));
+        }
+        validate_subscription(&persisted_app, relationship, persisted)?;
+        validate_baseline_integrity(&persisted_app, relationship, persisted)?;
+        if hash_dir(Path::new(&persisted.local_path))? != persisted.baseline_hash
+            || hash_dir(Path::new(&persisted.baseline_path))? != persisted.baseline_hash
+        {
+            return Err(anyhow!(
+                "resume post-commit verification failed; recovery required"
+            ));
+        }
+        return Ok(
+            json!({"relationship":relationship,"status":"synced","workspace_applied":true,"recovery_retained":true}),
+        );
+    }
     if let Some(existing) = a.state.subscriptions.get(relationship) {
         if existing.status == "synced" && existing.recovery_path.is_some() {
             validate_subscription(a, relationship, existing)?;
@@ -756,6 +984,53 @@ pub(crate) fn resume(a: &mut App, relationship: &str) -> Result<serde_json::Valu
     }
     live_replacement.commit()?;
     baseline_replacement.commit()?;
+    #[cfg(feature = "test-hooks")]
+    if std::env::var("SKILLSYNC_TEST_CORRUPT_RESUME_STATE").as_deref() == Ok("1") {
+        std::fs::write(&a.state_path, b"{\"version\":6,\"subscriptions\":null}")?;
+    }
+    #[cfg(feature = "test-hooks")]
+    if std::env::var("SKILLSYNC_TEST_REPLACE_RESUME_CONFIG").as_deref() == Ok("1") {
+        let replacement = a.config.with_extension("replaced");
+        std::fs::rename(&a.config, &replacement)?;
+        std::fs::create_dir_all(&a.config)?;
+        std::fs::write(
+            a.config.join("state.json"),
+            b"{\"version\":6,\"subscriptions\":null}",
+        )?;
+    }
+    #[cfg(feature = "test-hooks")]
+    if std::env::var("SKILLSYNC_TEST_FAIL_RESUME_POSTVERIFY").as_deref() == Ok("1") {
+        return Err(anyhow!(
+            "resume post-commit verification failed; recovery required"
+        ));
+    }
+    let expected = a
+        .state
+        .subscriptions
+        .get(relationship)
+        .cloned()
+        .ok_or_else(|| anyhow!("resume post-commit verification failed; recovery required"))?;
+    let persisted_app = App::load(Some(operation_lock))
+        .map_err(|_| anyhow!("resume post-commit verification failed; recovery required"))?;
+    let persisted = persisted_app
+        .state
+        .subscriptions
+        .get(relationship)
+        .ok_or_else(|| anyhow!("resume post-commit verification failed; recovery required"))?;
+    if serde_json::to_value(persisted)? != serde_json::to_value(&expected)? {
+        return Err(anyhow!(
+            "resume post-commit verification failed; recovery required"
+        ));
+    }
+    validate_subscription(&persisted_app, relationship, persisted)?;
+    validate_baseline_integrity(&persisted_app, relationship, persisted)?;
+    if hash_dir(Path::new(&persisted.local_path))? != persisted.baseline_hash
+        || hash_dir(Path::new(&persisted.baseline_path))? != persisted.baseline_hash
+    {
+        return Err(anyhow!(
+            "resume post-commit verification failed; recovery required"
+        ));
+    }
     Ok(
         json!({"relationship":relationship,"status":"synced","selected_side":side,"recovery_retained":true}),
     )
