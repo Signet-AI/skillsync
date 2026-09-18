@@ -238,7 +238,15 @@ pub(crate) fn harness_link_health(a: &App) -> Result<Vec<serde_json::Value>> {
     for (key, record) in &a.state.harness_links {
         let link = PathBuf::from(&record.link_path);
         let expected = PathBuf::from(&record.canonical_path);
-        let (status, message) = if !Path::new(&record.harness_root).exists() {
+        let root_path = Path::new(&record.harness_root);
+        let root_metadata = fs::symlink_metadata(root_path);
+        let (status, message) = if matches!(root_metadata, Ok(ref metadata) if metadata.file_type().is_symlink())
+        {
+            (
+                "unreadable",
+                Some("harness root is a symlink/reparse point".to_owned()),
+            )
+        } else if !root_path.exists() {
             (
                 "missing_root",
                 Some("harness root is unavailable; relationship is degraded".to_owned()),
@@ -254,11 +262,9 @@ pub(crate) fn harness_link_health(a: &App) -> Result<Vec<serde_json::Value>> {
                     "collision",
                     Some("recorded harness path is not a symlink".to_owned()),
                 ),
-                Ok(_) => match resolve_link_target(&link)
-                    .and_then(|target| link_targets_match(&target, &expected))
-                {
-                    Ok(true) => ("healthy", None),
-                    Ok(false) => (
+                Ok(_) => match resolve_link_target(&link) {
+                    Ok(target) if target == expected => ("healthy", None),
+                    Ok(_) => (
                         "wrong_target",
                         Some("link target does not match".to_owned()),
                     ),
@@ -404,7 +410,17 @@ pub(crate) fn inventory_harness_health(
     Ok(result)
 }
 pub(crate) fn list(a: &App) -> Result<serde_json::Value> {
-    Ok(serde_json::json!({"links": a.state.harness_links}))
+    let mut diagnostics = harness_link_health(a)?;
+    diagnostics.sort_by(|left, right| {
+        left.get("relationship")
+            .and_then(serde_json::Value::as_str)
+            .cmp(
+                &right
+                    .get("relationship")
+                    .and_then(serde_json::Value::as_str),
+            )
+    });
+    Ok(serde_json::json!({"links": a.state.harness_links, "diagnostics": diagnostics}))
 }
 pub(crate) fn harness_link(a: &mut App, root: &Path, raw_skill: &str) -> Result<serde_json::Value> {
     let skill = strict_component(raw_skill, "skill name")?;

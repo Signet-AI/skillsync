@@ -712,11 +712,11 @@ fn requires_lock(command: &Cmd) -> bool {
         }
         | Cmd::Status
         | Cmd::Inventory
-        | Cmd::Diff
-        | Cmd::Doctor
         | Cmd::Harness {
             command: HarnessCmd::List,
-        } => false,
+        }
+        | Cmd::Diff
+        | Cmd::Doctor => false,
         Cmd::Publish { dry_run, .. } => !dry_run,
         Cmd::Restore { .. } => true,
         Cmd::Conflicts {
@@ -902,7 +902,14 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         }
     );
     let inventory_read = matches!(command, Cmd::Inventory);
-    let needs_lock = requires_lock(&command) && !conflicts_read_lock && !inventory_read;
+    let harness_read = matches!(
+        command,
+        Cmd::Harness {
+            command: HarnessCmd::List
+        }
+    );
+    let needs_lock =
+        requires_lock(&command) && !conflicts_read_lock && !inventory_read && !harness_read;
     let _state_lock = if needs_lock {
         Some(StateLock::acquire(&config_dir())?)
     } else {
@@ -918,23 +925,38 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
     } else {
         None
     };
+    let harness_read_lock = if harness_read {
+        StateLock::acquire_read_only_if_present(&config_dir())?
+    } else {
+        None
+    };
     if let Some(lock) = &conflicts_read_lock {
         lock.verify_config_identity(&config_dir())?;
     }
     if let Some(lock) = &inventory_read_lock {
         lock.verify_config_identity(&config_dir())?;
     }
+    if let Some(lock) = &harness_read_lock {
+        lock.verify_config_identity(&config_dir())?;
+    }
     let operation_lock = _state_lock
         .as_ref()
         .or(conflicts_read_lock.as_ref())
-        .or(inventory_read_lock.as_ref());
+        .or(inventory_read_lock.as_ref())
+        .or(harness_read_lock.as_ref());
     if operation_lock.is_none()
         && (matches!(
             command,
             Cmd::Conflicts {
                 command: ConflictCmd::List | ConflictCmd::Show { .. }
             }
-        ) || matches!(command, Cmd::Inventory))
+        ) || matches!(command, Cmd::Inventory)
+            || matches!(
+                command,
+                Cmd::Harness {
+                    command: HarnessCmd::List
+                }
+            ))
     {
         let config_path = config_dir();
         let state_path = config_path.join("state.json");
@@ -950,6 +972,14 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         }
         if matches!(
             command,
+            Cmd::Harness {
+                command: HarnessCmd::List
+            }
+        ) {
+            return Ok(serde_json::json!({"links": {}, "diagnostics": []}));
+        }
+        if matches!(
+            command,
             Cmd::Conflicts {
                 command: ConflictCmd::List | ConflictCmd::Show { .. }
             }
@@ -962,6 +992,9 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         lock.verify_config_identity(&a.config)?;
     }
     if let Some(lock) = &inventory_read_lock {
+        lock.verify_config_identity(&a.config)?;
+    }
+    if let Some(lock) = &harness_read_lock {
         lock.verify_config_identity(&a.config)?;
     }
     let result: Result<serde_json::Value> = match command {
