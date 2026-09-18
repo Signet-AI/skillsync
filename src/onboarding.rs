@@ -64,12 +64,14 @@ fn safe_canonical(path: &Path) -> anyhow::Result<PathBuf> {
     crate::filesystem::reject_reparse_point(path, "persisted path")?;
     Ok(fs::canonicalize(path)?)
 }
-fn package_name(path: &Path) -> Option<String> {
-    let meta = fs::symlink_metadata(path.join("SKILL.md")).ok()?;
+fn package_name(path: &Path) -> Result<Option<String>> {
+    let Ok(meta) = fs::symlink_metadata(path.join("SKILL.md")) else {
+        return Ok(None);
+    };
     if !meta.is_file() || meta.file_type().is_symlink() {
-        return None;
+        return Ok(None);
     }
-    path.file_name().map(|n| n.to_string_lossy().into_owned())
+    Ok(Some(crate::filesystem::manifest_name(path)?))
 }
 fn diagnostic(code: &'static str, path: &Path, detail: &'static str) -> DiagnosticReport {
     DiagnosticReport {
@@ -154,32 +156,40 @@ fn walk(
         ));
         return;
     }
-    if let Some(name) = package_name(current) {
-        let rel = normalized_relative_path(root, current);
-        if let Some(hroot) = occurrence_root {
-            occurrences.push(OccurrenceReport {
-                name,
-                root: hroot.into(),
-                path: rel,
-                status: if managed.contains(&real) {
-                    "managed"
-                } else {
-                    "unmanaged"
-                }
-                .into(),
-            });
-        } else {
-            packages.push(PackageReport {
-                name,
-                path: rel,
-                status: if managed.contains(&real) {
-                    "managed"
-                } else {
-                    "unmanaged"
-                }
-                .into(),
-            });
+    match package_name(current) {
+        Ok(Some(name)) => {
+            let rel = normalized_relative_path(root, current);
+            if let Some(hroot) = occurrence_root {
+                occurrences.push(OccurrenceReport {
+                    name,
+                    root: hroot.into(),
+                    path: rel,
+                    status: if managed.contains(&real) {
+                        "managed"
+                    } else {
+                        "unmanaged"
+                    }
+                    .into(),
+                });
+            } else {
+                packages.push(PackageReport {
+                    name,
+                    path: rel,
+                    status: if managed.contains(&real) {
+                        "managed"
+                    } else {
+                        "unmanaged"
+                    }
+                    .into(),
+                });
+            }
         }
+        Ok(None) => {}
+        Err(_) => diagnostics.push(diagnostic(
+            "invalid_manifest",
+            &current.join("SKILL.md"),
+            "SKILL.md manifest is invalid",
+        )),
     }
     let Ok(entries) = fs::read_dir(current) else {
         diagnostics.push(diagnostic(
@@ -345,13 +355,23 @@ pub(crate) fn discover(library: &Path, state: &crate::State) -> Result<DiscoverR
     packages.sort_by(|a, b| (&a.path, &a.name).cmp(&(&b.path, &b.name)));
     occurrences.sort_by(|a, b| (&a.root, &a.path, &a.name).cmp(&(&b.root, &b.path, &b.name)));
     diagnostics.sort_by(|a, b| (&a.code, &a.path, &a.detail).cmp(&(&b.code, &b.path, &b.detail)));
+    let proposals = packages
+        .iter()
+        .filter(|package| package.status == "unmanaged")
+        .map(|package| ProposalReport {
+            kind: "adopt",
+            path: package.path.clone(),
+            requires_approval: true,
+            destructive: false,
+        })
+        .collect();
     Ok(DiscoverReport {
         schema_version: 1,
         mode: "read_only",
         roots,
         packages,
         occurrences,
-        proposals: Vec::new(),
+        proposals,
         diagnostics,
         capabilities: BTreeMap::from([
             ("harness_filtering", "unsupported"),
@@ -423,9 +443,9 @@ mod tests {
     #[test]
     fn discovery_report_is_versioned_and_read_only() {
         let d = tempdir().unwrap();
-        fs::write(d.path().join("SKILL.md"), "x").unwrap();
+        fs::write(d.path().join("SKILL.md"), "name: root\n").unwrap();
         fs::create_dir(d.path().join("pkg")).unwrap();
-        fs::write(d.path().join("pkg/SKILL.md"), "x").unwrap();
+        fs::write(d.path().join("pkg/SKILL.md"), "name: pkg\n").unwrap();
         let n = fs::read_dir(d.path()).unwrap().count();
         let r = discover(d.path(), &crate::State::default()).unwrap();
         assert_eq!(r.schema_version, 1);
