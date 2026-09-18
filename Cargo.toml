@@ -5,6 +5,7 @@ edition = "2021"
 
 [features]
 default = []
+external-editor = []
 test-hooks = []
 
 [dependencies]

@@ -7,7 +7,7 @@ Local-first Rust CLI for importing agent skill packages, preserving local edits 
 ```sh
 skillsync init [--library PATH]
 skillsync config path
-skillsync config edit   # opens config.toml in VISUAL, then EDITOR (TTY only)
+skillsync config edit   # external editor feature; VISUAL, then EDITOR (TTY only)
 skillsync subscribe REPOSITORY [--skill NAME]
 # Without --skill, a TTY offers a line-oriented single-select picker.
 # With neither argument, the TTY asks for the repository first.
@@ -34,7 +34,7 @@ skillsync conflicts resolve RELATIONSHIP --local|--incoming
 skillsync conflicts resume RELATIONSHIP [--workspace WORKSPACE]
 # --workspace applies a strict v2 resolved workspace; v1 remains inspect-only.
 # Conflict export refuses non-portable local repository sources before staging or publishing a workspace.
-# Resolution is explicit side selection; semantic/workspace editing remains deferred.
+# Explicit side selection, resolve, and resume are supported; semantic/workspace editing remains deferred.
 skillsync set create NAME | list | show NAME | add NAME SKILL | remove NAME SKILL
 skillsync harness link --root PATH --skill NAME
 skillsync harness unlink --root PATH --skill NAME
@@ -67,9 +67,9 @@ State loads strictly validate every local adoption record (identity, absolute no
 
 Package copies exclude operational files such as `.env`, logs, credential directories, and private keys. Publication updates managed files in `skills/<name>` without deleting the destination package wholesale, preserving unrelated operational files. Destination changes that cannot be attributed to the recorded publication are rejected. Publication records are written only after a meaningful commit and successful push; a durable pending-publication intent is written before each push so a failed push or post-push state write can be retried without losing the relationship. Mutating commands share a persistent advisory lock in the config directory; the lock is held for a whole operation or worker run, and status probes the lock rather than trusting a stale PID.
 
-Updates compare the durable baseline, live package, and fetched upstream package. `conflicts list` inventories paused conflicts, `conflicts show RELATIONSHIP` is inspection-only: it validates and displays an immutable manifest with base/local/incoming hashes and evidence paths. `conflicts inspect-workspace --workspace PATH` is also inspection-only: it validates a moved immutable conflict-resolution workspace and emits deterministic structured status without selecting or applying a tree. Manual side selection, resolve, resume, and isolated workspace editing remain explicitly deferred; no semantic or automatic conflict resolution is performed; inspect-workspace never executes bundled files or mutates state, library, baselines, recovery, or the workspace. Deletion recovery remains separate via `restore`.
+Updates compare the durable baseline, live package, and fetched upstream package. `conflicts list` inventories paused conflicts, `conflicts show RELATIONSHIP` is inspection-only: it validates and displays an immutable manifest with base/local/incoming hashes and evidence paths. `conflicts inspect-workspace --workspace PATH` is also inspection-only: it validates a moved immutable conflict-resolution workspace and emits deterministic structured status without selecting or applying a tree. Explicit side selection, resolve, and resume are supported; semantic/workspace editing remains deferred; no semantic or automatic conflict resolution is performed; inspect-workspace never executes bundled files or mutates state, library, baselines, recovery, or the workspace. Deletion recovery remains separate via `restore`.
 
-`config edit` is supported only from an interactive terminal. It creates a uniquely named no-follow temporary file inside the config directory, invokes `VISUAL` before `EDITOR` as an executable with that temporary path as its sole argument, then validates and publishes the result without replacing a config created concurrently. Existing configs are published only when their identity and bytes remain unchanged; symlink/reparse substitutions and editor-replaced temporary files fail closed. It inherits terminal streams and reports editor failures. Unix publishes through directory handles; Windows publishes through reparse-protected file handles and verifies the directory/file identity before and after publication. It never parses editor command strings or runs through a shell; `--json` and redirected stdin/stdout fail instead of launching an editor.
+`config edit` is supported only in builds with the optional `external-editor` feature and from an interactive terminal. It creates a uniquely named no-follow temporary file inside the config directory, invokes `VISUAL` before `EDITOR` as an executable with that temporary path as its sole argument, then validates and publishes the result without replacing a config created concurrently. Existing configs are published only when their identity and bytes remain unchanged; symlink/reparse substitutions and editor-replaced temporary files fail closed. It inherits terminal streams and reports editor failures. Unix publishes through directory handles; Windows publishes through reparse-protected file handles and verifies the directory/file identity before and after publication. It never parses editor command strings or runs through a shell; `--json` and redirected stdin/stdout fail instead of launching an editor. Set `VISUAL` or `EDITOR` to an executable path: `nvim` is suitable, while VS Code must be invoked through an explicit wait-capable wrapper/command because the launcher passes exactly one temporary-file argument and does not use a shell.
 
 ## Testing the native binary, then run the TypeScript integration suite with Bun:
 

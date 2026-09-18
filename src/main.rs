@@ -13,6 +13,7 @@ use std::{
 
 mod branch_policy;
 mod capabilities;
+#[cfg(feature = "external-editor")]
 mod config_editor;
 mod conflicts;
 mod filesystem;
@@ -30,13 +31,15 @@ pub(crate) use worker::{worker_status, WORKER_STOP_REQUESTED};
 
 use branch_policy::BranchPolicy;
 
+#[cfg(any(not(unix), feature = "external-editor"))]
+use filesystem::read_regular_file;
 use filesystem::{
     assert_no_symlink_path, atomic, canonicalize_path, checked_regular_path, copy_tree, discover,
-    effective_library_path, files, hash_dir, manifest_name, read_regular_file, replace_dir_bound,
+    effective_library_path, files, hash_dir, manifest_name, replace_dir_bound,
     resolve_library_path, safe, snapshot_transaction, source_rel, strict_component,
     validate_state_path, FileData, StateLock,
 };
-#[cfg(unix)]
+#[cfg(all(unix, feature = "external-editor"))]
 use filesystem::{open_child_file, open_directory_fd};
 
 pub(crate) use recovery::{delete_skill, import_local, restore_skill};
@@ -1095,7 +1098,19 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         } => Ok(serde_json::json!({"path":a.config.join("config.toml")})),
         Cmd::Config {
             command: ConfigCmd::Edit,
-        } => config_editor::edit_config(&a, cli.json),
+        } => {
+            #[cfg(feature = "external-editor")]
+            {
+                config_editor::edit_config(&a, cli.json)
+            }
+            #[cfg(not(feature = "external-editor"))]
+            {
+                let _ = (&a, cli.json);
+                Err(anyhow!(
+                    "config edit is disabled in this build; enable the `external-editor` feature"
+                ))
+            }
+        }
         Cmd::Subscribe {
             repository,
             skill,

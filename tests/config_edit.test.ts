@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { chmod, mkdtemp, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { childEnv, commandBinary } from "./test_harness";
+import { childEnv, commandBinary, featureCommandBinary } from "./test_harness";
 
 type Env = Record<string, string>;
 type Result = { code: number; stdout: string; stderr: string };
@@ -19,7 +19,7 @@ function inheritedEnv(): Env {
 
 function run(args: string[], env: Env, cwd?: string): Result {
   const result = Bun.spawnSync({
-    cmd: [binary, ...args],
+    cmd: [featureCommandBinary(), ...args],
     cwd,
     env: childEnv(env),
     stdout: "pipe",
@@ -36,10 +36,10 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-function runInPty(args: string[], env: Env): Result {
-  const command = [commandBinary(env), ...args].map(shellQuote).join(" ");
+function runInPtyWithBinary(binaryPath: string, args: string[], env: Env): Result {
+  const command = [binaryPath, ...args].map(shellQuote).join(" ");
   const scriptCommand = process.platform === "darwin"
-    ? ["python3", resolve(import.meta.dir, "pty_runner.py"), commandBinary(env), ...args]
+    ? ["python3", resolve(import.meta.dir, "pty_runner.py"), binaryPath, ...args]
     : ["script", "-qefc", command, "/dev/null"];
   const result = Bun.spawnSync({
     cmd: scriptCommand,
@@ -52,6 +52,10 @@ function runInPty(args: string[], env: Env): Result {
     stdout: decoder.decode(result.stdout),
     stderr: decoder.decode(result.stderr),
   };
+}
+
+function runInPty(args: string[], env: Env): Result {
+  return runInPtyWithBinary(featureCommandBinary(), args, env);
 }
 
 async function fixture(): Promise<Fixture> {
@@ -92,6 +96,24 @@ async function editorScript(path: string): Promise<{ log: string; marker: string
   await chmod(path, 0o700);
   return { log, marker };
 }
+
+test("default production binary fails closed before launching config edit", async () => {
+  if (process.platform === "win32") return;
+  const f = await fixture();
+  const editor = join(f.root, "default-editor.sh");
+  const { marker } = await editorScript(editor);
+  const result = runInPtyWithBinary(binary, ["config", "edit"], {
+    ...f.env,
+    VISUAL: editor,
+    SKILLSYNC_EDITOR_LOG: join(f.root, "default.log"),
+    SKILLSYNC_EDITOR_MARKER: marker,
+    SKILLSYNC_EDITOR_LIBRARY: f.library,
+  });
+  expect(result.code, `${result.stdout}\n${result.stderr}`).toBe(1);
+  expect(result.stdout).toContain("enable the `external-editor` feature");
+  expect(await Bun.file(marker).exists()).toBe(false);
+});
+
 
 test("config edit refuses JSON and redirected output before launching an editor", async () => {
   const f = await fixture();
@@ -257,7 +279,7 @@ test("config edit fails closed when the validated directory is replaced during t
   const started = join(f.root, "editor-started");
   await writeFile(editor, `#!/bin/sh\ntouch "$SKILLSYNC_STARTED"\nsleep 1\nprintf 'library = "attacker"\\n' > "$1"\n`);
   await chmod(editor, 0o700);
-  const command = [binary, "config", "edit"].map(shellQuote).join(" ");
+  const command = [featureCommandBinary(), "config", "edit"].map(shellQuote).join(" ");
   const child = Bun.spawn(["script", "-qefc", command, "/dev/null"], { env: { ...inheritedEnv(), ...f.env, VISUAL: editor, SKILLSYNC_STARTED: started }, stdout: "pipe", stderr: "pipe" });
   try {
     for (let i = 0; i < 100 && !(await Bun.file(started).exists()); i++) await Bun.sleep(10);
