@@ -169,6 +169,10 @@ enum ConflictCmd {
         #[arg(long)]
         out: PathBuf,
     },
+    InspectWorkspace {
+        #[arg(long)]
+        workspace: PathBuf,
+    },
     Resolve {
         relationship: String,
         #[arg(long, conflicts_with = "incoming", required = true)]
@@ -698,6 +702,9 @@ fn requires_lock(command: &Cmd) -> bool {
         Cmd::Conflicts {
             command: ConflictCmd::List | ConflictCmd::Show { .. } | ConflictCmd::Export { .. },
         } => true,
+        Cmd::Conflicts {
+            command: ConflictCmd::InspectWorkspace { .. },
+        } => false,
         _ => true,
     }
 }
@@ -818,6 +825,12 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             }));
         }
     };
+    if let Cmd::Conflicts {
+        command: ConflictCmd::InspectWorkspace { workspace },
+    } = &command
+    {
+        return conflicts::inspect_workspace(workspace);
+    }
     if let Cmd::State {
         command: StateCmd::Inspect { from },
     } = &command
@@ -1079,6 +1092,9 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Cmd::Conflicts {
             command: ConflictCmd::Export { relationship, out },
         } => conflicts::export(&a, &relationship, &out),
+        Cmd::Conflicts {
+            command: ConflictCmd::InspectWorkspace { .. },
+        } => unreachable!("workspace inspection handled before App load"),
         Cmd::Conflicts {
             command: ConflictCmd::List,
         } => conflicts::list(&a),

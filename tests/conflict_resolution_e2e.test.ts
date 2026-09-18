@@ -1,7 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile, cp, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 import { childEnv, commandBinary } from "./test_harness";
 
 type Env = Record<string, string>;
@@ -229,4 +230,87 @@ test("rejects local repository conflict export before creating a workspace", asy
   expect(await readFile(join(f.library, "demo", "SKILL.md"), "utf8")).toBe(beforeLibrary);
   expect(await readdir(join(f.config, "recovery"))).toEqual(beforeRecovery);
   expect(await Bun.file(workspace).exists()).toBe(false);
+}, { timeout: 30000 });
+
+test("inspects an immutable conflict workspace without mutation", async () => {
+  const { f, relationship, statePath } = await conflictFixture();
+  const workspace = join(f.root, "portable workspace");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  const recovery = state.subscriptions[relationship].recovery_path as string;
+  const shown = run(f, ["--json", "conflicts", "show", relationship]).json;
+  await mkdir(workspace, { recursive: true });
+  for (const side of ["base", "local", "incoming"]) await cp(join(recovery, side), join(workspace, side), { recursive: true });
+  const source = "owner/repo";
+  const sourcePath = "skills/demo";
+  const portableRelationship = `rel-${createHash("sha256").update(source).update(new Uint8Array([0])).update(sourcePath).digest("hex")}`;
+  await writeFile(join(workspace, "manifest.json"), JSON.stringify({
+    manifest_version: 1, workspace_kind: "conflict-resolution", status: "immutable",
+    relationship: portableRelationship, source, source_path: sourcePath, skill: "demo",
+    base_hash: shown.base_hash, local_hash: shown.local_hash, incoming_hash: shown.incoming_hash,
+    live_hash_at_export: shown.live_hash_at_detection,
+  }));
+  const beforeState = await readFile(statePath, "utf8");
+  const inspected = run(f, ["--json", "conflicts", "inspect-workspace", "--workspace", workspace]).json;
+  expect(inspected.status).toBe("valid_immutable");
+  expect(inspected.identity.relationship).toBe(portableRelationship);
+  expect(inspected.selected_tree).toBeNull();
+  expect(await readFile(statePath, "utf8")).toBe(beforeState);
+
+  const outside = join(f.root, "outside");
+  await mkdir(outside);
+  await cp(workspace, join(outside, "valid"), { recursive: true });
+  for (const [label, candidate] of [
+    ["workspace root symlink", join(f.root, "root-link")],
+    ["dangling root symlink", join(f.root, "dangling-link")],
+    ["symlinked ancestor", join(f.root, "ancestor-link", "valid")],
+  ] as const) {
+    if (label === "workspace root symlink") await symlink(workspace, candidate, "dir");
+    if (label === "dangling root symlink") await symlink(join(f.root, "missing"), candidate, "dir");
+    if (label === "symlinked ancestor") {
+      await symlink(outside, join(f.root, "ancestor-link"), "dir");
+    }
+    const rejected = run(f, ["--json", "conflicts", "inspect-workspace", "--workspace", candidate], false);
+    expect(rejected.json.ok).toBe(false);
+    expect(await readFile(statePath, "utf8")).toBe(beforeState);
+  }
+  const nonDirectory = join(f.root, "workspace-file");
+  await writeFile(nonDirectory, "not a directory");
+  const special = run(f, ["--json", "conflicts", "inspect-workspace", "--workspace", nonDirectory], false);
+  expect(special.json.ok).toBe(false);
+  expect(await readFile(nonDirectory, "utf8")).toBe("not a directory");
+}, { timeout: 30000 });
+
+test("rejects unsafe workspace spellings before following or mutating them", async () => {
+  const { f, relationship, statePath } = await conflictFixture();
+  const workspace = join(f.root, "workspace");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  const recovery = state.subscriptions[relationship].recovery_path as string;
+  const shown = run(f, ["--json", "conflicts", "show", relationship]).json;
+  await mkdir(workspace, { recursive: true });
+  for (const side of ["base", "local", "incoming"]) await cp(join(recovery, side), join(workspace, side), { recursive: true });
+  const source = "owner/repo";
+  const sourcePath = "skills/demo";
+  const portableRelationship = `rel-${createHash("sha256").update(source).update(new Uint8Array([0])).update(sourcePath).digest("hex")}`;
+  await writeFile(join(workspace, "manifest.json"), JSON.stringify({
+    manifest_version: 1, workspace_kind: "conflict-resolution", status: "immutable",
+    relationship: portableRelationship, source, source_path: sourcePath, skill: "demo",
+    base_hash: shown.base_hash, local_hash: shown.local_hash, incoming_hash: shown.incoming_hash,
+    live_hash_at_export: shown.live_hash_at_detection,
+  }));
+  const beforeState = await readFile(statePath, "utf8");
+  const parent = dirname(workspace);
+  await mkdir(join(parent, "child"), { recursive: true });
+  const candidates = [
+    `${parent}/./workspace`,
+    `${parent}/child/../workspace`,
+    `${parent}//workspace/./../workspace`,
+    `${parent}\\\\workspace`,
+    `C:\\\\workspace\\\\..\\\\${workspace}`,
+    `\\\\\\\\server\\\\share\\\\workspace`,
+  ];
+  for (const candidate of candidates) {
+    const result = run(f, ["--json", "conflicts", "inspect-workspace", "--workspace", candidate], false);
+    expect(result.json.ok).toBe(false);
+    expect(await readFile(statePath, "utf8")).toBe(beforeState);
+  }
 }, { timeout: 30000 });

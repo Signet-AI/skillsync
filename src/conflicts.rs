@@ -2,8 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
+    collections::BTreeSet,
     fs,
-    path::{Component, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use crate::filesystem::{
@@ -331,7 +332,8 @@ pub(crate) fn show(a: &App, relationship: &str) -> Result<serde_json::Value> {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExportManifest {
-    version: u32,
+    manifest_version: u32,
+    workspace_kind: String,
     status: String,
     relationship: String,
     source: String,
@@ -418,7 +420,8 @@ pub(crate) fn export(
             }
         }
         let manifest = ExportManifest {
-            version: 1,
+            manifest_version: 1,
+            workspace_kind: "conflict-resolution".into(),
             status: "immutable".into(),
             relationship: relationship.into(),
             source: subscription.source.clone(),
@@ -447,6 +450,139 @@ pub(crate) fn export(
             "export failed: {error}; staging cleanup also failed; recovery required: {cleanup_error}"
         )),
     }
+}
+
+fn validate_workspace_spelling(workspace: &Path) -> Result<()> {
+    let supplied = workspace.to_string_lossy();
+    let raw = supplied.as_ref();
+    if raw.contains('\\')
+        || raw.starts_with("//")
+        || raw.as_bytes().get(1).is_some_and(|b| *b == b':')
+    {
+        return Err(anyhow!("workspace path has an unsupported spelling"));
+    }
+    for (index, segment) in raw.split('/').enumerate() {
+        if segment == "." || segment == ".." {
+            return Err(anyhow!("workspace path contains traversal or dot segments"));
+        }
+        if segment.is_empty() && index != 0 {
+            return Err(anyhow!("workspace path has unsafe separators"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn inspect_workspace(workspace: &Path) -> Result<serde_json::Value> {
+    validate_workspace_spelling(workspace)?;
+    let absolute = if workspace.is_absolute() {
+        workspace.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(workspace)
+    };
+    let mut cursor = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => cursor.push(prefix.as_os_str()),
+            Component::RootDir => cursor.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::Normal(name) => {
+                cursor.push(name);
+                let metadata = fs::symlink_metadata(&cursor).map_err(|_| {
+                    anyhow!("workspace path component is missing: {}", cursor.display())
+                })?;
+                crate::filesystem::reject_reparse_point(&cursor, "workspace ancestor")?;
+                if metadata.file_type().is_symlink() {
+                    return Err(anyhow!(
+                        "workspace path component is a symlink: {}",
+                        cursor.display()
+                    ));
+                }
+                if !metadata.is_dir() {
+                    return Err(anyhow!(
+                        "workspace path component is not a directory: {}",
+                        cursor.display()
+                    ));
+                }
+            }
+            Component::CurDir | Component::ParentDir => {
+                return Err(anyhow!("workspace path contains traversal or dot segments"));
+            }
+        }
+    }
+    let workspace = canonicalize_path(&absolute)?;
+    let meta = fs::symlink_metadata(&workspace)?;
+    if !meta.is_dir()
+        || meta.file_type().is_symlink()
+        || canonicalize_path(&workspace)? != workspace
+    {
+        return Err(anyhow!("workspace must be a canonical regular directory"));
+    }
+    let mut entries = BTreeSet::new();
+    for entry in fs::read_dir(&workspace)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !entries.insert(name) {
+            return Err(anyhow!("duplicate workspace entry"));
+        }
+        let m = fs::symlink_metadata(entry.path())?;
+        if m.file_type().is_symlink() || (!m.is_dir() && !m.is_file()) {
+            return Err(anyhow!("workspace contains unsafe entry"));
+        }
+    }
+    let allowed = ["base", "incoming", "local", "manifest.json"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    if entries != allowed {
+        return Err(anyhow!("workspace contains unexpected entries"));
+    }
+    let manifest: ExportManifest =
+        serde_json::from_slice(&fs::read(workspace.join("manifest.json"))?)
+            .map_err(|_| anyhow!("workspace manifest is malformed"))?;
+    if manifest.manifest_version != 1
+        || manifest.workspace_kind != "conflict-resolution"
+        || manifest.status != "immutable"
+    {
+        return Err(anyhow!("workspace manifest is incompatible"));
+    }
+    strict_component(&manifest.skill, "workspace skill")?;
+    if manifest.relationship != relationship_key(&manifest.source, &manifest.source_path) {
+        return Err(anyhow!("workspace relationship identity mismatch"));
+    }
+    crate::repository::normalize(&manifest.source)?;
+    crate::filesystem::source_rel(&manifest.source_path)?;
+    for (value, label) in [
+        (&manifest.base_hash, "base"),
+        (&manifest.local_hash, "local"),
+        (&manifest.incoming_hash, "incoming"),
+        (&manifest.live_hash_at_export, "live"),
+    ] {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(anyhow!("invalid {label} evidence hash"));
+        }
+    }
+    for (side, expected) in [
+        ("base", &manifest.base_hash),
+        ("local", &manifest.local_hash),
+        ("incoming", &manifest.incoming_hash),
+    ] {
+        let path = workspace.join(side);
+        let m = fs::symlink_metadata(&path)?;
+        if !m.is_dir()
+            || m.file_type().is_symlink()
+            || canonicalize_path(&path)? != path
+            || manifest_name(&path)? != manifest.skill
+            || hash_dir(&path)? != *expected
+        {
+            return Err(anyhow!("workspace {side} evidence is invalid"));
+        }
+    }
+    Ok(
+        json!({"status":"valid_immutable","identity":{"relationship":manifest.relationship,"source":manifest.source,"source_path":manifest.source_path,"skill":manifest.skill},"side_hashes":{"base":manifest.base_hash,"local":manifest.local_hash,"incoming":manifest.incoming_hash,"live_hash_at_export":manifest.live_hash_at_export},"selected_tree":null}),
+    )
 }
 
 pub(crate) fn resolve(
