@@ -841,6 +841,102 @@ test("persists publication intent before a failed push and retries it", async ()
   expect(countPublications(recovered)).toBe(1);
 });
 
+test("retains pending publication when replacement commit fails after push and retries without duplicate commit", async () => {
+  if (process.platform === "win32") return;
+  const fixture = await makeFixture();
+  skillsync(fixture, ["--json", "init"]);
+  await put(join(fixture.library, "replacement-commit/SKILL.md"), "name: replacement-commit\nv1\n");
+  await put(join(fixture.library, "replacement-commit/unrelated.txt"), "keep me\n");
+  const destination = join(fixture.root, "replacement-commit-destination.git");
+  checked(run("git", ["init", "--bare", destination], undefined, fixture.env), "init replacement commit destination");
+  const failed = skillsync(
+    fixture,
+    ["--json", "publish", "replacement-commit", "--repo", destination, "--yes"],
+    false,
+    { SKILLSYNC_TEST_FAIL_REPLACEMENT_COMMIT: "replacement-commit" },
+  );
+  expect(failed.json.ok).toBe(false);
+  expect(failed.json.message).not.toContain('"status":"published"');
+  expect(failed.json.message).not.toContain('"status":"synced"');
+  const pending = skillsync(fixture, ["--json", "status"]).json;
+  expect(Object.keys(pending.pending_publications ?? {})).toHaveLength(1);
+  expect(await readFile(join(fixture.library, "replacement-commit/SKILL.md"), "utf8")).toContain("v1");
+  expect(await readFile(join(fixture.library, "replacement-commit/unrelated.txt"), "utf8")).toBe("keep me\n");
+  const remoteBeforeRetry = checked(run("git", ["--git-dir", destination, "rev-list", "--count", "refs/heads/main"], undefined, fixture.env), "count replacement commit remote").stdout.trim();
+  expect(remoteBeforeRetry).toBe("1");
+  const retried = skillsync(fixture, ["--json", "sync"]).json;
+  expect(retried.results.some((item: any) => item.skill === "replacement-commit" && item.status === "published")).toBe(true);
+  const remoteAfterRetry = checked(run("git", ["--git-dir", destination, "rev-list", "--count", "refs/heads/main"], undefined, fixture.env), "count replacement commit retry remote").stdout.trim();
+  expect(remoteAfterRetry).toBe("1");
+  const recovered = skillsync(fixture, ["--json", "status"]).json;
+  expect(Object.keys(recovered.pending_publications ?? {})).toHaveLength(0);
+  expect(countPublications(recovered)).toBe(1);
+});
+
+test("retains pending publication after post-push state-save failure and retries without duplicate commit", async () => {
+  if (process.platform === "win32") return;
+  const fixture = await makeFixture();
+  skillsync(fixture, ["--json", "init"]);
+  await put(join(fixture.library, "post-push/SKILL.md"), "name: post-push\nv1\n");
+  await put(join(fixture.library, "post-push/unrelated.txt"), "keep me\n");
+  const destination = join(fixture.root, "post-push-destination.git");
+  checked(run("git", ["init", "--bare", destination], undefined, fixture.env), "init post-push destination");
+  skillsync(fixture, ["--json", "publish", "post-push", "--repo", destination, "--yes"]);
+  await put(join(fixture.library, "post-push/SKILL.md"), "name: post-push\nv2\n");
+
+  const failed = skillsync(
+    fixture,
+    ["--json", "sync"],
+    true,
+    { SKILLSYNC_TEST_FAIL_STATE_SAVE_AFTER_PUSH: "post-push" },
+  );
+  expect(failed.json.ok).toBe(true);
+  expect(failed.json.message).not.toContain('"status":"published"');
+  const pending = skillsync(fixture, ["--json", "status"]).json;
+  expect(Object.keys(pending.pending_publications ?? {})).toHaveLength(1);
+  expect(await readFile(join(fixture.library, "post-push/SKILL.md"), "utf8")).toContain("v2");
+  expect(await readFile(join(fixture.library, "post-push/unrelated.txt"), "utf8")).toBe("keep me\n");
+  const firstRemoteCommit = checked(run("git", ["--git-dir", destination, "rev-parse", "refs/heads/main"], undefined, fixture.env), "read first remote commit").stdout.trim();
+
+  const retried = skillsync(fixture, ["--json", "sync"]).json;
+  expect(retried.results.some((item: any) => item.skill === "post-push" && item.status === "published")).toBe(true);
+  const secondRemoteCommit = checked(run("git", ["--git-dir", destination, "rev-parse", "refs/heads/main"], undefined, fixture.env), "read retried remote commit").stdout.trim();
+  expect(secondRemoteCommit).toBe(firstRemoteCommit);
+  const recovered = skillsync(fixture, ["--json", "status"]).json;
+  expect(Object.keys(recovered.pending_publications ?? {})).toHaveLength(0);
+  expect(countPublications(recovered)).toBe(1);
+});
+
+test("retains pending publication after replacement finalization failure and retries without changing remote", async () => {
+  if (process.platform === "win32") return;
+  const fixture = await makeFixture();
+  skillsync(fixture, ["--json", "init"]);
+  await put(join(fixture.library, "replacement-finalization/SKILL.md"), "name: replacement-finalization\nv1\n");
+  await put(join(fixture.library, "replacement-finalization/source-extra.txt"), "source\n");
+  const destination = join(fixture.root, "replacement-finalization-destination.git");
+  checked(run("git", ["init", "--bare", destination], undefined, fixture.env), "init replacement finalization destination");
+  const failed = skillsync(
+    fixture,
+    ["--json", "publish", "replacement-finalization", "--repo", destination, "--yes"],
+    false,
+    { SKILLSYNC_TEST_FAIL_REPLACEMENT_FINALIZATION: "replacement-finalization" },
+  );
+  expect(failed.json.ok).toBe(false);
+  expect(failed.json.message).not.toContain('"status":"published"');
+  expect(failed.json.message).not.toContain('"status":"synced"');
+  const pending = skillsync(fixture, ["--json", "status"]).json;
+  expect(Object.keys(pending.pending_publications ?? {})).toHaveLength(1);
+  expect(await readFile(join(fixture.library, "replacement-finalization/SKILL.md"), "utf8")).toContain("v1");
+  expect(await readFile(join(fixture.library, "replacement-finalization/source-extra.txt"), "utf8")).toBe("source\n");
+  const remoteBeforeRetry = checked(run("git", ["--git-dir", destination, "rev-parse", "refs/heads/main"], undefined, fixture.env), "read replacement finalization remote").stdout.trim();
+  const retried = skillsync(fixture, ["--json", "sync"]).json;
+  expect(retried.results.some((item: any) => item.skill === "replacement-finalization" && item.status === "published")).toBe(true);
+  const remoteAfterRetry = checked(run("git", ["--git-dir", destination, "rev-parse", "refs/heads/main"], undefined, fixture.env), "read replacement finalization remote after retry").stdout.trim();
+  expect(remoteAfterRetry).toBe(remoteBeforeRetry);
+  expect(Object.keys(skillsync(fixture, ["--json", "status"]).json.pending_publications ?? {})).toHaveLength(0);
+  expect(await readFile(join(fixture.library, "replacement-finalization/SKILL.md"), "utf8")).toContain("v1");
+});
+
 test("honors JSON mode for clap validation errors", async () => {
   const fixture = await makeFixture();
   const result = run(binary, ["--json", "publish"], undefined, fixture.env);

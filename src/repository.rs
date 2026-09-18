@@ -827,9 +827,27 @@ pub(crate) fn publish_to_repo(
         last_hash: Some(current_hash),
         last_sync: now(),
     };
+    replacement.prepare_publication(skill)?;
+    replacement.commit_publication(skill)?;
+    let previous_state = a.state.clone();
     a.state.pending_publications.remove(&key);
     a.state.publications.insert(key, publication);
-    a.save()?;
-    replacement.commit()?;
+    if let Err(error) = save_publication_final_state(a, skill) {
+        a.state = previous_state;
+        return Err(error);
+    }
     Ok(serde_json::json!({"skill":skill,"status":"published"}))
+}
+
+fn save_publication_final_state(a: &App, skill: &str) -> Result<()> {
+    #[cfg(not(feature = "test-hooks"))]
+    let _ = skill;
+    #[cfg(feature = "test-hooks")]
+    if std::env::var("SKILLSYNC_TEST_FAIL_STATE_SAVE_AFTER_PUSH").as_deref() == Ok(skill) {
+        std::env::remove_var("SKILLSYNC_TEST_FAIL_STATE_SAVE_AFTER_PUSH");
+        return Err(anyhow!(
+            "injected post-push publication state-save failure (test-only)"
+        ));
+    }
+    a.save()
 }

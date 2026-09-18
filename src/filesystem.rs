@@ -2349,6 +2349,28 @@ impl Replacement {
         }
         Ok(())
     }
+    pub(crate) fn prepare_publication(&self, skill: &str) -> Result<()> {
+        #[cfg(not(feature = "test-hooks"))]
+        let _ = skill;
+        #[cfg(feature = "test-hooks")]
+        if std::env::var("SKILLSYNC_TEST_FAIL_REPLACEMENT_FINALIZATION").as_deref() == Ok(skill) {
+            std::env::remove_var("SKILLSYNC_TEST_FAIL_REPLACEMENT_FINALIZATION");
+            return Err(anyhow!(
+                "injected replacement finalization failure (test-only)"
+            ));
+        }
+        self.prepare()
+    }
+    pub(crate) fn commit_publication(&mut self, skill: &str) -> Result<()> {
+        #[cfg(not(feature = "test-hooks"))]
+        let _ = skill;
+        #[cfg(feature = "test-hooks")]
+        if std::env::var("SKILLSYNC_TEST_FAIL_REPLACEMENT_COMMIT").as_deref() == Ok(skill) {
+            std::env::remove_var("SKILLSYNC_TEST_FAIL_REPLACEMENT_COMMIT");
+            return Err(anyhow!("injected replacement commit failure (test-only)"));
+        }
+        self.commit()
+    }
     /// Finish the owning transaction.  Backups are intentionally retained:
     /// pathname deletion cannot be made safe against an external rename/race.
     pub(crate) fn commit(&mut self) -> Result<()> {
