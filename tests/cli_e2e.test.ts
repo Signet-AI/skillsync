@@ -1175,3 +1175,22 @@ test("harness link collision is atomic and preserves the preexisting entry", asy
   expect(await readFile(join(harness, "collision"), "utf8")).toBe("unrelated\n");
   expect(Object.keys(skillsync(fixture, ["--json", "harness", "list"]).json.links)).toHaveLength(0);
 });
+
+test("settles a source mutation before taking the publication snapshot", async () => {
+  const fixture = await makeFixture();
+  const source = join(fixture.library, "settling");
+  await put(join(source, "SKILL.md"), "name: settling\nv1\n");
+  const destination = join(fixture.root, "settling-destination.git");
+  checked(run("git", ["init", "--bare", destination], undefined, fixture.env), "init settling destination");
+  const published = skillsync(
+    fixture,
+    ["--json", "publish", "settling", "--repo", destination, "--yes"],
+    true,
+    { SKILLSYNC_TEST_MUTATE_SOURCE_DURING_INITIAL_PUBLICATION: "settling" },
+  ).json;
+  expect(published.status).toBe("published");
+  expect(await readFile(join(source, "SKILL.md"), "utf8")).toBe("name: settling\nv2\n");
+  const remote = run("git", ["--git-dir", destination, "show", "main:skills/settling/SKILL.md"], undefined, fixture.env);
+  checked(remote, "read published settling file");
+  expect(remote.stdout).toBe("name: settling\nv2\n");
+});

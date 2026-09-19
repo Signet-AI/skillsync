@@ -752,6 +752,7 @@ pub(crate) fn publish_to_repo(
     if !source.is_dir() {
         return Err(anyhow!("skill not found in library"));
     }
+    wait_for_stable_source(&source, skill)?;
     let source_candidate_parent = tempfile::tempdir()?;
     let source_candidate = source_candidate_parent.path().join("skill");
     copy_tree(&source, &source_candidate)?;
@@ -935,6 +936,51 @@ pub(crate) fn publish_to_repo(
         return Err(error);
     }
     Ok(serde_json::json!({"skill":skill,"status":"published"}))
+}
+
+/// Establish a bounded, no-follow observation boundary before any publication
+/// staging or remote access. This does not make arbitrary external writes
+/// atomic; it only requires the package to settle briefly and fails closed.
+fn wait_for_stable_source(source: &Path, _skill: &str) -> Result<()> {
+    const WINDOW: Duration = Duration::from_secs(2);
+    const SAMPLE_INTERVAL: Duration = Duration::from_millis(25);
+    let started = std::time::Instant::now();
+    let mut previous: Option<(PathBuf, String)> = None;
+    #[cfg(feature = "test-hooks")]
+    let mut mutated = false;
+    while started.elapsed() < WINDOW {
+        let identity = (|| -> Result<PathBuf> {
+            let metadata = fs::symlink_metadata(source)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(anyhow!("source changed during publication; retry"));
+            }
+            assert_no_symlink_path(source, Path::new("."))?;
+            crate::filesystem::canonicalize_path(source)
+        })()?;
+        let Ok(hash) = hash_dir(source) else {
+            previous = None;
+            thread::sleep(SAMPLE_INTERVAL);
+            continue;
+        };
+        #[cfg(feature = "test-hooks")]
+        if !mutated
+            && std::env::var("SKILLSYNC_TEST_MUTATE_SOURCE_DURING_INITIAL_PUBLICATION").as_deref()
+                == Ok(_skill)
+        {
+            fs::write(source.join("SKILL.md"), format!("name: {_skill}\nv2\n"))?;
+            std::env::remove_var("SKILLSYNC_TEST_MUTATE_SOURCE_DURING_INITIAL_PUBLICATION");
+            mutated = true;
+            previous = None;
+            continue;
+        }
+        let observation = (identity, hash);
+        if previous.as_ref() == Some(&observation) {
+            return Ok(());
+        }
+        previous = Some(observation);
+        thread::sleep(SAMPLE_INTERVAL);
+    }
+    Err(anyhow!("source changed during publication; retry"))
 }
 
 fn save_publication_final_state(a: &App, skill: &str) -> Result<()> {
