@@ -59,6 +59,66 @@ describe("baseline transfer command surface", () => {
     } finally { await rm(f.root, { recursive: true, force: true }); }
   });
 
+  test("baseline install command installs an exported v1 artifact into the canonical library", async () => {
+    const f = await fixture();
+    try {
+      const artifact = join(f.root, "external");
+      const exported = Bun.spawnSync({ cmd: [binary, "--json", "state", "baseline", "export", "--relationship", f.relationship, "--out", artifact], env: f.env, stdout: "pipe", stderr: "pipe" });
+      expect(exported.exitCode, dec.decode(exported.stderr)).toBe(0);
+      const result = Bun.spawnSync({ cmd: [binary, "--json", "state", "baseline", "install", "--from", artifact, "--yes"], env: f.env, stdout: "pipe", stderr: "pipe" });
+      expect(result.exitCode, dec.decode(result.stderr) + dec.decode(result.stdout)).toBe(0);
+      expect(await readFile(join(f.library, "demo", "SKILL.md"), "utf8")).toContain("# baseline");
+      const replay = Bun.spawnSync({ cmd: [binary, "--json", "state", "baseline", "install", "--from", artifact, "--yes"], env: f.env, stdout: "pipe", stderr: "pipe" });
+      expect(replay.exitCode).toBe(0);
+      expect(JSON.parse(dec.decode(replay.stdout)).status).toBe("already_present");
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  test("baseline install requires approval and never overwrites a differing destination", async () => {
+    const f = await fixture();
+    try {
+      const artifact = join(f.root, "external");
+      expect(Bun.spawnSync({ cmd: [binary, "--json", "state", "baseline", "export", "--relationship", f.relationship, "--out", artifact], env: f.env, stdout: "pipe", stderr: "pipe" }).exitCode).toBe(0);
+      const missingApproval = Bun.spawnSync({ cmd: [binary, "--json", "state", "baseline", "install", "--from", artifact], env: f.env, stdout: "pipe", stderr: "pipe" });
+      expect(missingApproval.exitCode).not.toBe(0);
+      await mkdir(join(f.library, "demo"));
+      await writeFile(join(f.library, "demo", "SKILL.md"), "name: demo\n\n# local\n");
+      const before = await readFile(join(f.library, "demo", "SKILL.md"));
+      const conflict = Bun.spawnSync({ cmd: [binary, "--json", "state", "baseline", "install", "--from", artifact, "--yes"], env: f.env, stdout: "pipe", stderr: "pipe" });
+      expect(conflict.exitCode).not.toBe(0);
+      expect(await readFile(join(f.library, "demo", "SKILL.md"))).toEqual(before);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  test("uninitialized baseline install leaves every target path absent", async () => {
+    const initialized = await fixture();
+    try {
+      const artifact = join(initialized.root, "external");
+      expect(Bun.spawnSync({ cmd: [binary, "--json", "state", "baseline", "export", "--relationship", initialized.relationship, "--out", artifact], env: initialized.env, stdout: "pipe", stderr: "pipe" }).exitCode).toBe(0);
+      const fresh = join(initialized.root, "fresh-config");
+      const freshLibrary = join(initialized.root, "fresh-library");
+      const env = { ...process.env, SKILLSYNC_CONFIG_DIR: fresh, SKILLSYNC_LIBRARY: freshLibrary };
+      const result = Bun.spawnSync({ cmd: [binary, "--json", "state", "baseline", "install", "--from", artifact, "--yes"], env, stdout: "pipe", stderr: "pipe" });
+      expect(result.exitCode, dec.decode(result.stderr) + dec.decode(result.stdout)).not.toBe(0);
+      for (const path of [fresh, join(fresh, "state.json"), join(fresh, "state.lock"), freshLibrary, join(fresh, "recovery")]) expect(await Bun.file(path).exists()).toBe(false);
+    } finally { await rm(initialized.root, { recursive: true, force: true }); }
+  });
+
+  test("baseline install rejects a syntactically valid but non-authoritative baseline hash before destination creation", async () => {
+    const f = await fixture();
+    try {
+      const artifact = join(f.root, "external");
+      expect(Bun.spawnSync({ cmd: [binary, "--json", "state", "baseline", "export", "--relationship", f.relationship, "--out", artifact], env: f.env, stdout: "pipe", stderr: "pipe" }).exitCode).toBe(0);
+      const manifestPath = join(artifact, "manifest.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+      manifest.baseline_hash = "f".repeat(64);
+      await writeFile(manifestPath, JSON.stringify(manifest));
+      const result = Bun.spawnSync({ cmd: [binary, "--json", "state", "baseline", "install", "--from", artifact, "--yes"], env: f.env, stdout: "pipe", stderr: "pipe" });
+      expect(result.exitCode, dec.decode(result.stderr) + dec.decode(result.stdout)).not.toBe(0);
+      expect(await Bun.file(join(f.library, "demo")).exists()).toBe(false);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+
   test("inspect includes validated portable provenance fields", async () => {
     const f = await fixture();
     try {

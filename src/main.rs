@@ -175,6 +175,12 @@ enum BaselineCmd {
         #[arg(long = "from")]
         from: PathBuf,
     },
+    Install {
+        #[arg(long = "from")]
+        from: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 #[derive(Subcommand)]
 enum StateCmd {
@@ -978,6 +984,18 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         return baseline_transfer::inspect(from);
     }
     if let Cmd::State {
+        command: StateCmd::Baseline {
+            command: BaselineCmd::Install { .. },
+        },
+    } = &command
+    {
+        if !config_dir().join("state.json").is_file() {
+            return Err(anyhow!(
+                "target is not initialized; run init before installing"
+            ));
+        }
+    }
+    if let Cmd::State {
         command: StateCmd::Package { command },
     } = &command
     {
@@ -1258,6 +1276,12 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                     command: BaselineCmd::Export { relationship, out },
                 },
         } => baseline_transfer::export(&a, &relationship, &out),
+        Cmd::State {
+            command:
+                StateCmd::Baseline {
+                    command: BaselineCmd::Install { from, yes },
+                },
+        } => baseline_transfer::install(&a, &from, yes),
         Cmd::State {
             command:
                 StateCmd::Relationship {

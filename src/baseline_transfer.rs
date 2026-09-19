@@ -130,6 +130,9 @@ fn validate_manifest(root: &Path) -> Result<(Manifest, Vec<Entry>)> {
     if !valid_hash(&m.baseline_hash) || !valid_hash(&m.tree_hash) {
         return Err(anyhow!("invalid hash"));
     }
+    if crate::filesystem::hash_dir(&root.join("package"))? != m.baseline_hash {
+        return Err(anyhow!("baseline package content hash mismatch"));
+    }
     for x in [&m.resolved_commit, &m.resolved_tree].into_iter().flatten() {
         if x.len() != 40
             || !x
@@ -161,6 +164,61 @@ pub(crate) fn inspect(from: &Path) -> Result<serde_json::Value> {
         serde_json::json!({"format":m.format,"version":m.version,"relationship":m.relationship,"source":m.source,"source_path":m.source_path,"skill":m.skill,"branch":m.branch,"branch_policy":m.branch_policy,"resolved_commit":m.resolved_commit,"resolved_tree":m.resolved_tree,"baseline_hash":m.baseline_hash,"tree_hash":m.tree_hash,"entry_count":e.len()}),
     )
 }
+pub(crate) fn install(a: &crate::App, from: &Path, yes: bool) -> Result<serde_json::Value> {
+    if !yes {
+        return Err(anyhow!("approval required: pass --yes"));
+    }
+    if !a.state_path.is_file() {
+        return Err(anyhow!(
+            "target is not initialized; run init before installing"
+        ));
+    }
+    let (manifest, entries) = validate_manifest(from)?;
+    let destination = a.library.join(&manifest.skill);
+    let library_identity = crate::filesystem::canonicalize_path_with_missing(&a.library)?;
+    let destination_identity = crate::filesystem::canonicalize_path_with_missing(&destination)?;
+    if !destination_identity.starts_with(&library_identity)
+        || destination_identity == library_identity
+    {
+        return Err(anyhow!("invalid baseline package destination"));
+    }
+    if destination.exists() {
+        let metadata = fs::symlink_metadata(&destination)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(anyhow!("unsafe existing package destination"));
+        }
+        if scan(&destination)? == entries {
+            return Ok(serde_json::json!({"package":manifest.skill,"status":"already_present"}));
+        }
+        return Err(anyhow!(
+            "package destination exists with different contents; not overwritten"
+        ));
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow!("destination has no parent"))?;
+    if parent != a.library {
+        return Err(anyhow!("baseline package destination escaped library"));
+    }
+    let temp = tempfile::Builder::new()
+        .prefix(".skillsync-baseline-install-")
+        .tempdir_in(&a.library)?;
+    let staged = temp.path().join("package");
+    fs::create_dir(&staged)?;
+    crate::filesystem::copy_tree(&from.join("package"), &staged)?;
+    if scan(&staged)? != entries {
+        return Err(anyhow!("staged baseline package verification failed"));
+    }
+    crate::filesystem::install_dir_noreplace(&staged, &destination)
+        .context("install canonical baseline package without replacement")?;
+    if scan(&destination)? != entries {
+        return Err(anyhow!("installed baseline package verification failed"));
+    }
+    Ok(
+        serde_json::json!({"package":manifest.skill,"status":"installed","entry_count":entries.len()}),
+    )
+}
+
 pub(crate) fn export(a: &crate::App, relationship: &str, out: &Path) -> Result<serde_json::Value> {
     let s = a
         .state
