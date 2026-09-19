@@ -202,6 +202,12 @@ enum PackageCmd {
         #[arg(long)]
         out: PathBuf,
     },
+    Install {
+        #[arg(long = "from")]
+        from: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 #[derive(Subcommand)]
 enum WorkerCmd {
@@ -772,7 +778,10 @@ fn requires_lock(command: &Cmd) -> bool {
             command: StateCmd::Inspect { .. },
         }
         | Cmd::State {
-            command: StateCmd::Package { .. },
+            command:
+                StateCmd::Package {
+                    command: PackageCmd::Inspect { .. } | PackageCmd::Stage { .. },
+                },
         } => false,
         Cmd::Worker {
             command: Some(WorkerCmd::Status),
@@ -926,10 +935,11 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         command: StateCmd::Package { command },
     } = &command
     {
-        return match command {
-            PackageCmd::Inspect { from } => package_transfer::inspect(from),
-            PackageCmd::Stage { from, out } => package_transfer::stage(from, out),
-        };
+        match command {
+            PackageCmd::Inspect { from } => return package_transfer::inspect(from),
+            PackageCmd::Stage { from, out } => return package_transfer::stage(from, out),
+            PackageCmd::Install { .. } => {}
+        }
     }
     if let Cmd::State {
         command: StateCmd::Inspect { from },
@@ -1162,7 +1172,16 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             command: StateCmd::Stage { from, plan },
         } => state_stage::stage(&a, &from, &plan),
         Cmd::State {
-            command: StateCmd::Package { .. },
+            command:
+                StateCmd::Package {
+                    command: PackageCmd::Install { from, yes },
+                },
+        } => package_transfer::install(&a, &from, yes),
+        Cmd::State {
+            command:
+                StateCmd::Package {
+                    command: PackageCmd::Inspect { .. } | PackageCmd::Stage { .. },
+                },
         } => unreachable!("package transfer handled before App load"),
         Cmd::State {
             command: StateCmd::ApplySets { from, yes },
