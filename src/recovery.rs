@@ -180,9 +180,21 @@ fn validate_retained_conflict(
             return Err(anyhow!("conflict {label} evidence hash mismatch"));
         }
     }
-    Ok(
-        serde_json::json!({"category":"conflict","status":"open","reason":"validated_conflict_evidence_retained","deletable":false}),
-    )
+    let retained_artifact_hash = recovery_inventory_digest(&artifact)?;
+    Ok(serde_json::json!({
+        "category":"conflict",
+        "status":"open",
+        "reason":"validated_conflict_evidence_retained",
+        "deletable":false,
+        "ownership":"state_backed_conflict_evidence",
+        "relationship":relationship,
+        "skill":subscription.skill,
+        "base_hash":m.base_hash,
+        "local_hash":m.local_hash,
+        "incoming_hash":m.incoming_hash,
+        "live_hash":m.live_hash_at_detection,
+        "retained_artifact_hash":retained_artifact_hash,
+    }))
 }
 
 #[cfg(unix)]
@@ -841,16 +853,26 @@ pub(crate) fn inspect(a: &App, id: &str) -> Result<serde_json::Value> {
         if subscription.status == "conflict"
             && subscription.recovery_path.as_deref()
                 == Some(artifact_path.to_string_lossy().as_ref())
-            && validate_retained_conflict(&root, &name, relationship, subscription).is_ok()
         {
-            let current = fs::symlink_metadata(&a.recovery)
-                .map_err(|_| anyhow!("recovery root changed during inspection"))?;
-            if current.dev() != root_meta.dev() || current.ino() != root_meta.ino() {
-                return Err(anyhow!("recovery root changed during inspection"));
+            if let Ok(evidence) =
+                validate_retained_conflict(&root, &name, relationship, subscription)
+            {
+                let current = fs::symlink_metadata(&a.recovery)
+                    .map_err(|_| anyhow!("recovery root changed during inspection"))?;
+                if current.dev() != root_meta.dev() || current.ino() != root_meta.ino() {
+                    return Err(anyhow!("recovery root changed during inspection"));
+                }
+                let mut output = serde_json::json!({"id":id});
+                if let (Some(target), Some(values)) = (output.as_object_mut(), evidence.as_object())
+                {
+                    target.extend(
+                        values
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone())),
+                    );
+                }
+                return Ok(output);
             }
-            return Ok(
-                serde_json::json!({"id":id,"category":"conflict","status":"open","reason":"validated_conflict_evidence_retained","deletable":false}),
-            );
         }
     }
     Err(anyhow!("invalid recovery artifact"))

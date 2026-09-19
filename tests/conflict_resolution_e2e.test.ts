@@ -109,10 +109,13 @@ test("conflict show reports bounded source and retention diagnostics", async () 
 });
 
 test("recovery inspect validates a retained conflict artifact", async () => {
-  const { f } = await conflictFixture();
+  const { f, relationship } = await conflictFixture();
   const listed = run(f, ["--json", "recovery", "list"]).json;
   const inspected = run(f, ["--json", "recovery", "inspect", listed.artifacts[0].id]).json;
-  expect(inspected).toMatchObject({ ok: true, id: listed.artifacts[0].id, category: "conflict", status: "open", reason: "validated_conflict_evidence_retained", deletable: false });
+  expect(inspected).toMatchObject({ ok: true, id: listed.artifacts[0].id, category: "conflict", status: "open", reason: "validated_conflict_evidence_retained", deletable: false, ownership: "state_backed_conflict_evidence", relationship, skill: "demo" });
+  for (const key of ["base_hash", "local_hash", "incoming_hash", "live_hash", "retained_artifact_hash"]) {
+    expect(inspected[key]).toMatch(/^[0-9a-f]{64}$/);
+  }
 });
 
 test("recovery list keeps state-backed conflict artifacts opaque", async () => {
