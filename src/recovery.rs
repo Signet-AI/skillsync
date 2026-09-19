@@ -19,6 +19,15 @@ use crate::*;
 #[cfg(unix)]
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+struct DeletionSnapshotMarker {
+    marker_version: u32,
+    skill: String,
+    package_hash: String,
+}
+
+#[cfg(unix)]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RetainedConflictManifest {
     manifest_version: u32,
     relationship: String,
@@ -682,6 +691,178 @@ pub(crate) fn list_inventory(a: &mut App) -> Result<serde_json::Value> {
     Ok(serde_json::json!({"artifacts": artifacts, "count": artifacts.len()}))
 }
 
+#[cfg(unix)]
+pub(crate) fn inspect(a: &App, id: &str) -> Result<serde_json::Value> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    if id.len() != 25
+        || !id.starts_with("recovery-")
+        || !id[9..]
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(anyhow!("invalid recovery id"));
+    }
+    let root = crate::filesystem::open_directory_file_bound(&a.recovery)?;
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    let root_meta = root.metadata()?;
+    let mut matches = Vec::new();
+    for name in read_directory_entries(root.as_raw_fd())? {
+        let entry = match open_entry_checked(
+            root.as_raw_fd(),
+            &CString::new(name.as_bytes())?,
+            Path::new("recovery inspect artifact"),
+        ) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let digest = match recovery_inventory_digest(&entry) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let mut h = Sha256::new();
+        h.update(b"skillsync-recovery-opaque-id-v2\\0");
+        h.update((name.as_bytes().len() as u64).to_le_bytes());
+        h.update(name.as_bytes());
+        h.update(digest.as_bytes());
+        let full = format!("{:x}", h.finalize());
+        if format!("recovery-{}", &full[..16]) == id {
+            matches.push((name, entry));
+        }
+    }
+    if matches.len() != 1 {
+        return Err(anyhow!(if matches.is_empty() {
+            "recovery artifact not found"
+        } else {
+            "ambiguous recovery artifact id"
+        }));
+    }
+    let (name, _) = matches.pop().unwrap();
+    let artifact = open_entry_checked(
+        root.as_raw_fd(),
+        &CString::new(name.as_bytes())?,
+        Path::new("recovery inspect artifact"),
+    )?;
+    let refreshed_digest = recovery_inventory_digest(&artifact)
+        .map_err(|_| anyhow!("recovery artifact changed during inspection"))?;
+    let mut refreshed_id = Sha256::new();
+    refreshed_id.update(b"skillsync-recovery-opaque-id-v2\\0");
+    refreshed_id.update((name.as_bytes().len() as u64).to_le_bytes());
+    refreshed_id.update(name.as_bytes());
+    refreshed_id.update(refreshed_digest.as_bytes());
+    let refreshed_hex = format!("{:x}", refreshed_id.finalize());
+    if format!("recovery-{}", &refreshed_hex[..16]) != id {
+        return Err(anyhow!("recovery artifact changed during inspection"));
+    }
+    let artifact = open_entry_checked(
+        root.as_raw_fd(),
+        &CString::new(name.as_bytes())?,
+        Path::new("recovery inspect artifact"),
+    )?;
+    let artifact_path = a.recovery.join(&name);
+    let entries = read_directory_entries(artifact.as_raw_fd())?;
+    if entries.len() == 2
+        && entries.iter().any(|entry| entry == "package")
+        && entries
+            .iter()
+            .any(|entry| entry == ".skillsync-deletion.json")
+    {
+        let artifact_name = name.to_string_lossy();
+        let record = a
+            .state
+            .recovery_snapshots
+            .get(artifact_name.as_ref())
+            .ok_or_else(|| anyhow!("invalid recovery artifact"))?;
+        if record.artifact_hash != refreshed_digest {
+            return Err(anyhow!("invalid recovery artifact"));
+        }
+        let marker_file = open_entry_checked(
+            artifact.as_raw_fd(),
+            &CString::new(".skillsync-deletion.json")?,
+            Path::new("recovery deletion marker"),
+        )?;
+        if !marker_file.metadata()?.is_file() {
+            return Err(anyhow!("invalid recovery artifact"));
+        }
+        let mut marker_raw = Vec::new();
+        (&marker_file).read_to_end(&mut marker_raw)?;
+        let marker: DeletionSnapshotMarker = serde_json::from_slice(&marker_raw)
+            .map_err(|_| anyhow!("invalid recovery artifact"))?;
+        if marker.marker_version != 1
+            || strict_component(&marker.skill, "recovery marker skill").is_err()
+        {
+            return Err(anyhow!("invalid recovery artifact"));
+        }
+        let package_file = open_entry_checked(
+            artifact.as_raw_fd(),
+            &CString::new("package")?,
+            Path::new("recovery package"),
+        )?;
+        if !package_file.metadata()?.is_dir() {
+            return Err(anyhow!("invalid recovery artifact"));
+        }
+        let hash = recovery_inventory_digest(&package_file)
+            .map_err(|_| anyhow!("invalid recovery artifact"))?;
+        if marker.package_hash != hash
+            || record.package_hash != hash
+            || record.skill != marker.skill
+        {
+            return Err(anyhow!("invalid recovery artifact"));
+        }
+        let mut raw = Vec::new();
+        let manifest = open_entry_checked(
+            package_file.as_raw_fd(),
+            &CString::new("SKILL.md")?,
+            Path::new("recovery manifest"),
+        )?;
+        if !manifest.metadata()?.is_file() {
+            return Err(anyhow!("invalid recovery artifact"));
+        }
+        use std::io::Read;
+        (&manifest).read_to_end(&mut raw)?;
+        let text = String::from_utf8(raw).map_err(|_| anyhow!("invalid recovery artifact"))?;
+        let first = text.lines().next().unwrap_or("");
+        let value = first.strip_prefix("name:").map(str::trim).unwrap_or("");
+        strict_component(value, "recovery manifest skill name")
+            .map_err(|_| anyhow!("invalid recovery artifact"))?;
+        if marker.skill != value {
+            return Err(anyhow!("invalid recovery artifact"));
+        }
+        let current = fs::symlink_metadata(&a.recovery)?;
+        if current.dev() != root_meta.dev() || current.ino() != root_meta.ino() {
+            return Err(anyhow!("recovery root changed during inspection"));
+        }
+        return Ok(
+            serde_json::json!({"id":id,"category":"deletion","status":"retained","reason":"validated_deletion_snapshot_retained","deletable":false,"snapshot_hash":hash}),
+        );
+    }
+    for (relationship, subscription) in &a.state.subscriptions {
+        if subscription.status == "conflict"
+            && subscription.recovery_path.as_deref()
+                == Some(artifact_path.to_string_lossy().as_ref())
+            && validate_retained_conflict(&root, &name, relationship, subscription).is_ok()
+        {
+            let current = fs::symlink_metadata(&a.recovery)
+                .map_err(|_| anyhow!("recovery root changed during inspection"))?;
+            if current.dev() != root_meta.dev() || current.ino() != root_meta.ino() {
+                return Err(anyhow!("recovery root changed during inspection"));
+            }
+            return Ok(
+                serde_json::json!({"id":id,"category":"conflict","status":"open","reason":"validated_conflict_evidence_retained","deletable":false}),
+            );
+        }
+    }
+    Err(anyhow!("invalid recovery artifact"))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn inspect(_a: &App, _id: &str) -> Result<serde_json::Value> {
+    Err(anyhow!(
+        "safe descriptor-relative recovery inspection unavailable on this platform"
+    ))
+}
+
 pub(crate) fn import_local(
     a: &mut App,
     source: &Path,
@@ -929,6 +1110,21 @@ pub(crate) fn delete_skill(a: &mut App, raw_skill: &str, yes: bool) -> Result<se
     let snapshot = recovery_path.join("package");
     copy_complete_tree(&path, &snapshot)?;
     let hash = hash_dir(&snapshot)?;
+    #[cfg(unix)]
+    let marker_hash = crate::filesystem::open_directory_file_bound(&snapshot)
+        .and_then(|file| recovery_inventory_digest(&file))?;
+    #[cfg(not(unix))]
+    let marker_hash = hash_dir(&snapshot)?;
+    let marker = serde_json::json!({"marker_version":1,"skill":skill,"package_hash":marker_hash});
+    fs::write(
+        recovery_path.join(".skillsync-deletion.json"),
+        serde_json::to_vec(&marker)?,
+    )?;
+    #[cfg(unix)]
+    let artifact_hash = crate::filesystem::open_directory_file_bound(&recovery_path)
+        .and_then(|file| recovery_inventory_digest(&file))?;
+    #[cfg(not(unix))]
+    let artifact_hash = hash_dir(&recovery_path)?;
     if hash_dir(&path)? != hash {
         return Err(anyhow!(
             "canonical package changed while staging deletion; recovery retained"
@@ -944,8 +1140,21 @@ pub(crate) fn delete_skill(a: &mut App, raw_skill: &str, yes: bool) -> Result<se
         ));
     }
     let quarantine_identity = directory_identity(&quarantine)?;
+    let recovery_name = recovery_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("recovery snapshot name is not valid UTF-8"))?
+        .to_owned();
     let previous_state = a.state.clone();
     a.state.local_adoptions.remove(&format!("local:{skill}"));
+    a.state.recovery_snapshots.insert(
+        recovery_name,
+        RecoverySnapshotRecord {
+            skill: skill.to_owned(),
+            package_hash: marker_hash,
+            artifact_hash,
+        },
+    );
     if let Err(error) = a.save() {
         a.state = previous_state;
         return match install_dir_noreplace(&quarantine, &path) {

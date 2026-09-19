@@ -290,6 +290,7 @@ enum ConflictCmd {
 #[derive(Subcommand)]
 enum RecoveryCmd {
     List,
+    Inspect { id: String },
 }
 #[derive(Subcommand)]
 enum HarnessCmd {
@@ -332,6 +333,12 @@ enum ConfigCmd {
     Path,
     Edit,
 }
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct RecoverySnapshotRecord {
+    pub(crate) skill: String,
+    pub(crate) package_hash: String,
+    pub(crate) artifact_hash: String,
+}
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 struct State {
     pub(crate) version: u32,
@@ -340,6 +347,8 @@ struct State {
     pub(crate) publications: BTreeMap<String, Publication>,
     #[serde(default)]
     pub(crate) pending_publications: BTreeMap<String, PendingPublication>,
+    #[serde(default)]
+    pub(crate) recovery_snapshots: BTreeMap<String, RecoverySnapshotRecord>,
     #[serde(default)]
     pub(crate) sets: BTreeMap<String, SkillSet>,
     #[serde(default)]
@@ -1419,7 +1428,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Cmd::Conflicts {
             command: ConflictCmd::List | ConflictCmd::Show { .. },
         } | Cmd::Recovery {
-            command: RecoveryCmd::List
+            command: RecoveryCmd::List | RecoveryCmd::Inspect { .. }
         } | Cmd::State {
             command: StateCmd::Relationship {
                 command: RelationshipCmd::Verify { .. },
@@ -1430,7 +1439,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
     let recovery_read = matches!(
         command,
         Cmd::Recovery {
-            command: RecoveryCmd::List
+            command: RecoveryCmd::List | RecoveryCmd::Inspect { .. }
         }
     );
     let harness_read = matches!(
@@ -1489,7 +1498,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         ) || matches!(
             command,
             Cmd::Recovery {
-                command: RecoveryCmd::List
+                command: RecoveryCmd::List | RecoveryCmd::Inspect { .. }
             }
         ) || matches!(command, Cmd::Inventory)
             || matches!(
@@ -1536,6 +1545,14 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             }
         ) {
             return Ok(serde_json::json!({"artifacts": [], "count": 0}));
+        }
+        if matches!(
+            command,
+            Cmd::Recovery {
+                command: RecoveryCmd::Inspect { .. }
+            }
+        ) {
+            return Err(anyhow!("recovery artifact not found"));
         }
     }
     if relationship_verify || recovery_read {
@@ -1771,6 +1788,9 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Cmd::Recovery {
             command: RecoveryCmd::List,
         } => recovery::list_inventory(&mut a),
+        Cmd::Recovery {
+            command: RecoveryCmd::Inspect { id },
+        } => recovery::inspect(&a, &id),
         Cmd::Conflicts {
             command: ConflictCmd::Show { relationship },
         } => conflicts::show(&a, &relationship),

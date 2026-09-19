@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { childEnv, commandBinary } from "./test_harness";
@@ -11,6 +11,110 @@ function env(root: string) {
 function run(root: string, args: string[], extra: Record<string, string> = {}) {
   return Bun.spawnSync({ cmd: [commandBinary(extra), ...args], env: childEnv({ ...env(root), ...extra }), stdout: "pipe", stderr: "pipe" });
 }
+
+test("recovery inspect rejects an attacker-created package-shaped artifact", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skillsync-recovery-inspect-"));
+  await mkdir(join(root, "library/demo"), { recursive: true });
+  await writeFile(join(root, "library/demo/SKILL.md"), "name: demo\n");
+  expect(run(root, ["--json", "init"]).exitCode).toBe(0);
+  const attacker = join(root, "config/recovery/attacker/package");
+  await mkdir(attacker, { recursive: true });
+  await writeFile(join(attacker, "SKILL.md"), "name: attacker\n");
+  const listed = JSON.parse(dec.decode(run(root, ["--json", "recovery", "list"]).stdout));
+  const artifact = listed.artifacts.find((item: any) => item.category === "unknown");
+  expect(artifact).toBeDefined();
+  const inspected = run(root, ["--json", "recovery", "inspect", artifact.id]);
+  expect(inspected.exitCode).not.toBe(0);
+});
+
+test("recovery inspect rejects a fabricated marker copied from a real snapshot", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skillsync-recovery-inspect-"));
+  await mkdir(join(root, "library/demo"), { recursive: true });
+  await writeFile(join(root, "library/demo/SKILL.md"), "name: demo\n");
+  expect(run(root, ["--json", "init"]).exitCode).toBe(0);
+  expect(run(root, ["--json", "delete", "demo", "--yes"]).exitCode).toBe(0);
+  const recoveryRoot = join(root, "config/recovery");
+  const original = (await readdir(recoveryRoot))[0];
+  const packageBytes = await readFile(join(recoveryRoot, original, "package/SKILL.md"));
+  const markerBytes = await readFile(join(recoveryRoot, original, ".skillsync-deletion.json"));
+  const forged = join(recoveryRoot, "forged-delete");
+  await mkdir(join(forged, "package"), { recursive: true });
+  await writeFile(join(forged, "package/SKILL.md"), packageBytes);
+  await writeFile(join(forged, ".skillsync-deletion.json"), markerBytes);
+  await rm(join(recoveryRoot, original), { recursive: true });
+  const listed = JSON.parse(dec.decode(run(root, ["--json", "recovery", "list"]).stdout));
+  expect(listed.count).toBe(1);
+  const inspected = run(root, ["--json", "recovery", "inspect", listed.artifacts[0].id]);
+  expect(inspected.exitCode).not.toBe(0);
+});
+
+test("recovery inspect validates a retained deletion snapshot", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skillsync-recovery-inspect-"));
+  await mkdir(join(root, "library/demo"), { recursive: true });
+  await writeFile(join(root, "library/demo/SKILL.md"), "name: demo\n");
+  expect(run(root, ["--json", "init"]).exitCode).toBe(0);
+  expect(run(root, ["--json", "delete", "demo", "--yes"]).exitCode).toBe(0);
+  const listed = JSON.parse(dec.decode(run(root, ["--json", "recovery", "list"]).stdout));
+  const inspected = run(root, ["--json", "recovery", "inspect", listed.artifacts[0].id]);
+  expect(inspected.exitCode).toBe(0);
+  expect(JSON.parse(dec.decode(inspected.stdout))).toMatchObject({ ok: true, id: listed.artifacts[0].id, category: "deletion", status: "retained", deletable: false });
+});
+
+test("recovery inspect rejects malformed and unknown ids without mutation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skillsync-recovery-inspect-"));
+  const before = await readdir(root);
+  for (const id of ["bad", "recovery-0000000000000000"]) {
+    const result = run(root, ["--json", "recovery", "inspect", id]);
+    expect(result.exitCode).not.toBe(0);
+    expect(dec.decode(result.stdout) + dec.decode(result.stderr)).not.toContain(id);
+  }
+  expect(await readdir(root)).toEqual(before);
+  expect(await Bun.file(join(root, "config")).exists()).toBe(false);
+});
+
+test("recovery inspect is no-create when uninitialized", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skillsync-recovery-inspect-"));
+  const result = run(root, ["--json", "recovery", "inspect", "recovery-0000000000000000"]);
+  expect(result.exitCode).not.toBe(0);
+  expect(await Bun.file(join(root, "config", "config.toml")).exists()).toBe(false);
+  expect(await Bun.file(join(root, "config", "recovery")).exists()).toBe(false);
+});
+
+test("recovery inspect returns only bounded deletion evidence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skillsync-recovery-inspect-"));
+  await mkdir(join(root, "library/demo"), { recursive: true });
+  await writeFile(join(root, "library/demo/SKILL.md"), "name: demo\nsecret-manifest-token\n");
+  expect(run(root, ["--json", "init"]).exitCode).toBe(0);
+  expect(run(root, ["--json", "delete", "demo", "--yes"]).exitCode).toBe(0);
+  const listed = JSON.parse(dec.decode(run(root, ["--json", "recovery", "list"]).stdout));
+  const result = run(root, ["--json", "recovery", "inspect", listed.artifacts[0].id]);
+  const output = dec.decode(result.stdout) + dec.decode(result.stderr);
+  expect(result.exitCode).toBe(0);
+  expect(output).not.toContain("delete-demo");
+  expect(output).not.toContain("secret-manifest-token");
+  expect(output).not.toContain(join(root, "config"));
+});
+
+test("recovery inspect fails closed for a tampered snapshot and symlink entry", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skillsync-recovery-inspect-"));
+  await mkdir(join(root, "library/demo"), { recursive: true });
+  await writeFile(join(root, "library/demo/SKILL.md"), "name: demo\n");
+  expect(run(root, ["--json", "init"]).exitCode).toBe(0);
+  expect(run(root, ["--json", "delete", "demo", "--yes"]).exitCode).toBe(0);
+  const recoveryRoot = join(root, "config/recovery");
+  const artifact = (await readdir(recoveryRoot))[0];
+  const listed = JSON.parse(dec.decode(run(root, ["--json", "recovery", "list"]).stdout));
+  await writeFile(join(recoveryRoot, artifact, "package", "extra"), "tampered\n");
+  const tampered = run(root, ["--json", "recovery", "inspect", listed.artifacts[0].id]);
+  expect(tampered.exitCode).not.toBe(0);
+  const outside = join(root, "outside");
+  await writeFile(outside, "outside\n");
+  await symlink(outside, join(recoveryRoot, artifact, "package", "linked"));
+  const relisted = JSON.parse(dec.decode(run(root, ["--json", "recovery", "list"]).stdout));
+  const linked = run(root, ["--json", "recovery", "inspect", relisted.artifacts[0].id]);
+  expect(linked.exitCode).not.toBe(0);
+  expect(await readFile(outside, "utf8")).toBe("outside\n");
+});
 
 test("recovery list reports an empty deterministic inventory without initialization", async () => {
   const root = await mkdtemp(join(tmpdir(), "skillsync-recovery-list-"));
