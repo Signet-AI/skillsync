@@ -182,6 +182,31 @@ fn expected_preflight(
     }
 }
 
+pub(crate) fn relationship_preflight(app: &App, subscription: &crate::Subscription) -> Vec<String> {
+    let target_available = fs::symlink_metadata(app.library.join(&subscription.skill))
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+    expected_preflight(
+        &RecordKind::Subscription,
+        &Classification::Ready,
+        target_available,
+    )
+    .blockers
+    .into_iter()
+    .map(|blocker| {
+        match blocker {
+            PreflightBlocker::ActivationUnsupported => "activation_unsupported",
+            PreflightBlocker::PackageContentsMissing => "package_contents_missing",
+            PreflightBlocker::BaselineRecoveryEvidenceMissing => {
+                "baseline_recovery_evidence_missing"
+            }
+            PreflightBlocker::TargetConflict => "target_conflict",
+            PreflightBlocker::RemoteCredentialsRequired => "remote_credentials_required",
+        }
+        .to_owned()
+    })
+    .collect()
+}
+
 fn validate_plan(plan: &StagePlan) -> Result<()> {
     if plan.format != "skillsync-state-stage-plan" || plan.version != 1 {
         return Err(anyhow!("unsupported stage plan format or version"));

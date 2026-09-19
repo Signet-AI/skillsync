@@ -23,6 +23,7 @@ mod inventory;
 mod onboarding;
 mod package_transfer;
 mod recovery;
+mod relationship_verify;
 mod repository;
 mod state_apply;
 mod state_boundary;
@@ -173,6 +174,10 @@ enum BaselineCmd {
 }
 #[derive(Subcommand)]
 enum StateCmd {
+    Relationship {
+        #[command(subcommand)]
+        command: RelationshipCmd,
+    },
     Baseline {
         #[command(subcommand)]
         command: BaselineCmd,
@@ -206,6 +211,13 @@ enum StateCmd {
         from: PathBuf,
         #[arg(long)]
         yes: bool,
+    },
+}
+#[derive(Subcommand)]
+enum RelationshipCmd {
+    Verify {
+        #[arg(long)]
+        relationship: String,
     },
 }
 #[derive(Subcommand)]
@@ -1079,10 +1091,23 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             return Err(anyhow!("repository and --skill are required in noninteractive mode; picker requires interactive stdin and stdout"));
         }
     }
+    let relationship_verify = matches!(
+        command,
+        Cmd::State {
+            command: StateCmd::Relationship {
+                command: RelationshipCmd::Verify { .. }
+            }
+        }
+    );
+
     let conflicts_read_lock = matches!(
         command,
         Cmd::Conflicts {
-            command: ConflictCmd::List | ConflictCmd::Show { .. }
+            command: ConflictCmd::List | ConflictCmd::Show { .. },
+        } | Cmd::State {
+            command: StateCmd::Relationship {
+                command: RelationshipCmd::Verify { .. },
+            },
         }
     );
     let inventory_read = matches!(command, Cmd::Inventory);
@@ -1114,9 +1139,6 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
     } else {
         None
     };
-    if let Some(lock) = &conflicts_read_lock {
-        lock.verify_config_identity(&config_dir())?;
-    }
     if let Some(lock) = &inventory_read_lock {
         lock.verify_config_identity(&config_dir())?;
     }
@@ -1128,6 +1150,11 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         .or(conflicts_read_lock.as_ref())
         .or(inventory_read_lock.as_ref())
         .or(harness_read_lock.as_ref());
+    if relationship_verify {
+        if let Some(lock) = operation_lock {
+            lock.verify_config_identity(&config_dir())?;
+        }
+    }
     if operation_lock.is_none()
         && (matches!(
             command,
@@ -1197,6 +1224,12 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                     command: BaselineCmd::Export { relationship, out },
                 },
         } => baseline_transfer::export(&a, &relationship, &out),
+        Cmd::State {
+            command:
+                StateCmd::Relationship {
+                    command: RelationshipCmd::Verify { relationship },
+                },
+        } => relationship_verify::verify(&a, &relationship),
         Cmd::State {
             command: StateCmd::Baseline { .. },
         } => unreachable!("baseline inspect handled before App load"),
@@ -1612,5 +1645,10 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             Ok(serde_json::json!({"skill":skill,"status":"unpublished; destination retained"}))
         }
     };
+    if relationship_verify {
+        if let Some(lock) = operation_lock {
+            lock.verify_config_identity(&a.config)?;
+        }
+    }
     result
 }

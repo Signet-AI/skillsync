@@ -14,7 +14,7 @@ use crate::filesystem::{
 };
 use crate::{filesystem::StateLock, relationship_key, App};
 
-fn validate_subscription(
+pub(crate) fn validate_subscription(
     a: &App,
     relationship: &str,
     subscription: &crate::Subscription,
@@ -119,7 +119,7 @@ fn validate_subscription(
     Ok(())
 }
 
-fn validate_baseline_integrity(
+pub(crate) fn validate_baseline_integrity(
     a: &App,
     relationship: &str,
     subscription: &crate::Subscription,

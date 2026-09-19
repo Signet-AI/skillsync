@@ -5,7 +5,9 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use crate::filesystem;
@@ -291,6 +293,31 @@ fn provider_install(
     #[allow(unreachable_code)]
     Err(anyhow!("worker registration unsupported on this platform"))
 }
+const PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn bounded_provider_status(mut command: Command) -> std::io::Result<ExitStatus> {
+    let mut child: Child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + PROVIDER_PROBE_TIMEOUT;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "worker provider probe timed out",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn provider_state(identity: &str) -> &'static str {
     #[cfg(feature = "test-hooks")]
     if let Ok(value) = std::env::var("SKILLSYNC_TEST_WORKER_PROVIDER") {
@@ -304,18 +331,12 @@ fn provider_state(identity: &str) -> &'static str {
 
     #[cfg(target_os = "linux")]
     {
-        let output = Command::new("systemctl")
-            .args(["--user", "is-active", identity])
-            .output();
+        let mut command = Command::new("systemctl");
+        command.args(["--user", "is-active", identity]);
+        let output = bounded_provider_status(command);
         return match output {
-            Ok(output) if output.status.success() => {
-                match String::from_utf8_lossy(&output.stdout).trim() {
-                    "active" => "active",
-                    "inactive" => "inactive",
-                    _ => "unknown",
-                }
-            }
-            Ok(output) if output.status.code() == Some(3) => "inactive",
+            Ok(status) if status.success() => "active",
+            Ok(status) if status.code() == Some(3) => "inactive",
             Ok(_) => "unknown",
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => "unavailable",
             Err(_) => "unknown",
@@ -325,9 +346,11 @@ fn provider_state(identity: &str) -> &'static str {
     {
         let domain = format!("gui/{}", unsafe { libc::getuid() });
         let target = format!("{domain}/{identity}");
-        let output = Command::new("launchctl").args(["print", &target]).output();
+        let mut command = Command::new("launchctl");
+        command.args(["print", &target]);
+        let output = bounded_provider_status(command);
         return match output {
-            Ok(output) if output.status.success() => "active",
+            Ok(status) if status.success() => "active",
             Ok(_) => "unknown",
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => "unavailable",
             Err(_) => "unknown",
@@ -335,11 +358,11 @@ fn provider_state(identity: &str) -> &'static str {
     }
     #[cfg(target_os = "windows")]
     {
-        let output = Command::new("schtasks")
-            .args(["/Query", "/TN", identity, "/FO", "LIST", "/NH"])
-            .output();
+        let mut command = Command::new("schtasks");
+        command.args(["/Query", "/TN", identity, "/FO", "LIST", "/NH"]);
+        let output = bounded_provider_status(command);
         return match output {
-            Ok(output) if output.status.success() => "active",
+            Ok(status) if status.success() => "active",
             Ok(_) => "unknown",
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => "unavailable",
             Err(_) => "unknown",
