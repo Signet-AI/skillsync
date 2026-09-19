@@ -112,8 +112,39 @@ test("recovery list keeps state-backed conflict artifacts opaque", async () => {
   const { f, relationship } = await conflictFixture();
   const listed = run(f, ["--json", "recovery", "list"]).json;
   expect(listed.count).toBe(1);
-  expect(listed.artifacts[0]).toMatchObject({ category: "unknown", status: "invalid", reason: "unrecognized_recovery_artifact", deletable: false });
+  expect(listed.artifacts[0]).toMatchObject({ category: "conflict", status: "open", reason: "validated_conflict_evidence_retained", deletable: false });
   expect(relationship).toBeTruthy();
+});
+
+test("recovery list rejects extra top-level retained evidence entries without mutation", async () => {
+  const { f, relationship } = await conflictFixture();
+  const statePath = join(f.config, "state.json");
+  const stateBefore = await readFile(statePath, "utf8");
+  const recovery = JSON.parse(stateBefore).subscriptions[relationship].recovery_path as string;
+  await writeFile(join(recovery, "unexpected.txt"), "unexpected\\n");
+  await mkdir(join(recovery, "unexpected-dir"));
+  await writeFile(join(recovery, "unexpected-dir", "marker"), "unexpected\\n");
+
+  const listed = run(f, ["--json", "recovery", "list"]).json;
+  expect(listed.count).toBe(1);
+  expect(listed.artifacts[0]).toMatchObject({ category: "unknown", status: "invalid", reason: "unrecognized_recovery_artifact", deletable: false });
+  expect(await readFile(statePath, "utf8")).toBe(stateBefore);
+  expect(await readFile(join(recovery, "unexpected.txt"), "utf8")).toBe("unexpected\\n");
+});
+
+test("recovery list rejects extra top-level operational evidence entries without mutation", async () => {
+  const { f, relationship } = await conflictFixture();
+  const statePath = join(f.config, "state.json");
+  const stateBefore = await readFile(statePath, "utf8");
+  const recovery = JSON.parse(stateBefore).subscriptions[relationship].recovery_path as string;
+  await mkdir(join(recovery, ".cache"));
+  await writeFile(join(recovery, ".cache", "marker"), "unexpected\\n");
+
+  const listed = run(f, ["--json", "recovery", "list"]).json;
+  expect(listed.count).toBe(1);
+  expect(listed.artifacts[0]).toMatchObject({ category: "unknown", status: "invalid", reason: "unrecognized_recovery_artifact", deletable: false });
+  expect(await readFile(statePath, "utf8")).toBe(stateBefore);
+  expect(await readFile(join(recovery, ".cache", "marker"), "utf8")).toBe("unexpected\\n");
 });
 
 test("recovery list stays bound to retained artifact after root replacement", async () => {

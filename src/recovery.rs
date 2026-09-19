@@ -17,6 +17,166 @@ use crate::filesystem::{
 use crate::*;
 
 #[cfg(unix)]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedConflictManifest {
+    manifest_version: u32,
+    relationship: String,
+    source: String,
+    source_path: String,
+    path: String,
+    base_hash: String,
+    base_path: String,
+    local_hash: String,
+    local_path: String,
+    incoming_hash: String,
+    incoming_path: String,
+    live_hash_at_detection: String,
+    baseline_path: String,
+    baseline_source: String,
+    baseline_source_path: String,
+    transition: String,
+    status: String,
+}
+
+#[cfg(unix)]
+fn retained_tree_hash(root: &fs::File) -> Result<String> {
+    use std::{ffi::CString, io::Read, os::fd::AsRawFd};
+    let mut files = Vec::new();
+    fn walk(dir: &fs::File, rel: &Path, out: &mut Vec<(PathBuf, Vec<u8>, u32)>) -> Result<()> {
+        for name in read_directory_entries(dir.as_raw_fd())? {
+            let c = CString::new(name.as_encoded_bytes())?;
+            let child = open_entry_checked(dir.as_raw_fd(), &c, Path::new("conflict evidence"))?;
+            let meta = child.metadata()?;
+            let child_rel = rel.join(&name);
+            if crate::filesystem::operational(&child_rel) {
+                continue;
+            }
+            if meta.is_dir() {
+                walk(&child, &child_rel, out)?;
+            } else if meta.is_file() {
+                let mut bytes = Vec::new();
+                (&child).read_to_end(&mut bytes)?;
+                #[cfg(unix)]
+                use std::os::unix::fs::PermissionsExt;
+                out.push((child_rel, bytes, meta.permissions().mode()));
+            } else {
+                return Err(anyhow!("conflict evidence contains unsupported entry"));
+            }
+        }
+        Ok(())
+    }
+    walk(root, Path::new(""), &mut files)?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut h = Sha256::new();
+    for (path, bytes, mode) in files {
+        h.update(path.to_string_lossy().replace('\\', "/").as_bytes());
+        h.update([0]);
+        h.update(mode.to_le_bytes());
+        h.update([0]);
+        h.update(bytes);
+        h.update([0]);
+    }
+    Ok(format!("{:x}", h.finalize()))
+}
+
+#[cfg(unix)]
+fn validate_retained_conflict(
+    root: &fs::File,
+    name: &std::ffi::OsStr,
+    relationship: &str,
+    subscription: &crate::Subscription,
+) -> Result<serde_json::Value> {
+    use std::{ffi::CString, io::Read, os::fd::AsRawFd, os::unix::ffi::OsStrExt};
+    let direct = CString::new(name.as_bytes())?;
+    let artifact = open_entry_checked(
+        root.as_raw_fd(),
+        &direct,
+        Path::new("conflict recovery artifact"),
+    )?;
+    if !artifact.metadata()?.is_dir() {
+        return Err(anyhow!("conflict recovery artifact is not a directory"));
+    }
+    for entry in read_directory_entries(artifact.as_raw_fd())? {
+        let allowed = matches!(
+            entry.to_str(),
+            Some("manifest.json") | Some("base") | Some("local") | Some("incoming")
+        );
+        if !allowed {
+            return Err(anyhow!(
+                "conflict recovery artifact contains unknown top-level entry"
+            ));
+        }
+        let entry_name = CString::new(entry.as_bytes())?;
+        let entry_file = open_entry_checked(
+            artifact.as_raw_fd(),
+            &entry_name,
+            Path::new("conflict recovery artifact entry"),
+        )?;
+        let metadata = entry_file.metadata()?;
+        if !metadata.is_file() && !metadata.is_dir() {
+            return Err(anyhow!(
+                "conflict recovery artifact contains unsupported entry"
+            ));
+        }
+    }
+    let manifest_name = CString::new("manifest.json")?;
+    let manifest_file = open_entry_checked(
+        artifact.as_raw_fd(),
+        &manifest_name,
+        Path::new("conflict manifest"),
+    )?;
+    if !manifest_file.metadata()?.is_file() {
+        return Err(anyhow!("conflict manifest is not a regular file"));
+    }
+    let mut raw = Vec::new();
+    (&manifest_file).read_to_end(&mut raw)?;
+    let m: RetainedConflictManifest =
+        serde_json::from_slice(&raw).map_err(|_| anyhow!("conflict manifest is malformed"))?;
+    if m.manifest_version != 1
+        || m.relationship != relationship
+        || m.source != subscription.source
+        || m.source_path != subscription.source_path
+        || m.path != subscription.local_path
+        || m.baseline_path != subscription.baseline_path
+        || m.baseline_source != subscription.source
+        || m.baseline_source_path != subscription.source_path
+        || m.transition != "directory"
+        || m.status != "open"
+    {
+        return Err(anyhow!("conflict manifest is incompatible or mismatched"));
+    }
+    if m.base_hash != subscription.baseline_hash || m.live_hash_at_detection != m.local_hash {
+        return Err(anyhow!("conflict evidence identity mismatch"));
+    }
+    for (label, path, expected) in [
+        ("base", m.base_path.as_str(), &m.base_hash),
+        ("local", m.local_path.as_str(), &m.local_hash),
+        ("incoming", m.incoming_path.as_str(), &m.incoming_hash),
+    ] {
+        if path
+            != Path::new(subscription.recovery_path.as_deref().unwrap_or(""))
+                .join(label)
+                .display()
+                .to_string()
+        {
+            return Err(anyhow!("conflict {label} path mismatch"));
+        }
+        let child = open_entry_checked(
+            artifact.as_raw_fd(),
+            &CString::new(label)?,
+            Path::new("conflict evidence side"),
+        )?;
+        if !child.metadata()?.is_dir() || retained_tree_hash(&child)? != *expected {
+            return Err(anyhow!("conflict {label} evidence hash mismatch"));
+        }
+    }
+    Ok(
+        serde_json::json!({"category":"conflict","status":"open","reason":"validated_conflict_evidence_retained","deletable":false}),
+    )
+}
+
+#[cfg(unix)]
 pub(crate) type DirectoryIdentity = (u64, u64);
 #[cfg(windows)]
 pub(crate) type DirectoryIdentity = (u32, u32, u32);
@@ -489,6 +649,17 @@ pub(crate) fn list_inventory(a: &mut App) -> Result<serde_json::Value> {
             let id_digest = format!("{:x}", id_hasher.finalize());
             format!("recovery-{}", &id_digest[..16])
         };
+        #[cfg(unix)]
+        if let Some((relationship, subscription)) = a.state.subscriptions.iter().find(|(_, s)| {
+            s.status == "conflict"
+                && s.recovery_path.as_deref().map(Path::new)
+                    == Some(a.recovery.join(&name).as_path())
+        }) {
+            if validate_retained_conflict(&root_file, &name, relationship, subscription).is_ok() {
+                artifacts.push(serde_json::json!({"id":opaque_id,"category":"conflict","status":"open","reason":"validated_conflict_evidence_retained","deletable":false}));
+                continue;
+            }
+        }
         // Recovery inventory is deliberately conservative until its complete
         // descriptor-relative manifest/evidence validator has accepted the
         // artifact. Never delegate to conflicts::show here: that validator
