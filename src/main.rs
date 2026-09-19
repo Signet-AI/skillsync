@@ -20,6 +20,7 @@ mod filesystem;
 mod harness;
 mod inventory;
 mod onboarding;
+mod package_transfer;
 mod recovery;
 mod repository;
 mod state_apply;
@@ -178,11 +179,28 @@ enum StateCmd {
         #[arg(long)]
         plan: PathBuf,
     },
+    Package {
+        #[command(subcommand)]
+        command: PackageCmd,
+    },
     ApplySets {
         #[arg(long = "from")]
         from: PathBuf,
         #[arg(long)]
         yes: bool,
+    },
+}
+#[derive(Subcommand)]
+enum PackageCmd {
+    Inspect {
+        #[arg(long = "from")]
+        from: PathBuf,
+    },
+    Stage {
+        #[arg(long = "from")]
+        from: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 #[derive(Subcommand)]
@@ -749,6 +767,12 @@ fn requires_lock(command: &Cmd) -> bool {
     match command {
         Cmd::State {
             command: StateCmd::InspectPlan { .. },
+        }
+        | Cmd::State {
+            command: StateCmd::Inspect { .. },
+        }
+        | Cmd::State {
+            command: StateCmd::Package { .. },
         } => false,
         Cmd::Worker {
             command: Some(WorkerCmd::Status),
@@ -897,6 +921,15 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
     } = &command
     {
         return conflicts::inspect_workspace(workspace);
+    }
+    if let Cmd::State {
+        command: StateCmd::Package { command },
+    } = &command
+    {
+        return match command {
+            PackageCmd::Inspect { from } => package_transfer::inspect(from),
+            PackageCmd::Stage { from, out } => package_transfer::stage(from, out),
+        };
     }
     if let Cmd::State {
         command: StateCmd::Inspect { from },
@@ -1128,6 +1161,9 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Cmd::State {
             command: StateCmd::Stage { from, plan },
         } => state_stage::stage(&a, &from, &plan),
+        Cmd::State {
+            command: StateCmd::Package { .. },
+        } => unreachable!("package transfer handled before App load"),
         Cmd::State {
             command: StateCmd::ApplySets { from, yes },
         } => state_apply::apply_sets(

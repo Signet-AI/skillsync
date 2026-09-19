@@ -14,6 +14,8 @@ skillsync subscribe REPOSITORY [--skill NAME]
 skillsync import --from PATH --skill NAME
 skillsync update | sync | status | inventory | diff | doctor
 skillsync state inspect --from PATH
+skillsync state package inspect --from PATH
+skillsync state package stage --from PATH --out PATH  # non-activating staged artifact
 skillsync state export --out PATH   # deterministic metadata-only bundle
 skillsync state stage --from BUNDLE --plan PLAN   # validate and write non-activating evidence plan
 skillsync state apply-sets --from BUNDLE --yes # apply only validated portable set definitions
