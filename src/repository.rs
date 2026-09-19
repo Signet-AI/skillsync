@@ -756,6 +756,7 @@ pub(crate) fn publish_to_repo(
         .context("canonicalize publication repository")?;
     let destination_rel = format!("skills/{skill}");
     let destination_rel_path = Path::new(&destination_rel);
+    let key = publication_key(skill, url, &branch_name, &destination_rel);
     assert_no_symlink_path(&tmp_path, destination_rel_path)?;
     let destination = tmp_path.join(destination_rel_path);
     let destination_exists = destination.exists();
@@ -770,9 +771,33 @@ pub(crate) fn publish_to_repo(
         String::new()
     };
     let existing_is_only_operational = destination_exists && files(&destination)?.is_empty();
+    let pending_for_destination = a
+        .state
+        .pending_publications
+        .values()
+        .filter(|pending| {
+            pending.publication.skill == skill && pending.publication.destination == url
+        })
+        .collect::<Vec<_>>();
+    if pending_for_destination.iter().any(|pending| {
+        pending.publication.branch != branch_name
+            || pending.publication.path != destination_rel
+            || !pending.publication.approved
+    }) {
+        return Err(anyhow!(
+            "pending publication intent does not match destination identity"
+        ));
+    }
     let previously_published = previous
         .and_then(|publication| publication.last_hash.as_ref())
-        .is_some_and(|hash| hash == &existing_hash);
+        .is_some_and(|hash| hash == &existing_hash)
+        || pending_for_destination.iter().any(|pending| {
+            pending.publication.skill == skill
+                && pending.publication.destination == url
+                && pending.publication.branch == branch_name
+                && pending.publication.path == destination_rel
+                && pending.publication.approved
+        });
     if destination_exists
         && existing_hash != current_hash
         && !existing_is_only_operational
@@ -809,7 +834,6 @@ pub(crate) fn publish_to_repo(
         return Err(anyhow!("source changed during publication; retry"));
     }
     let changed = cached_changes(&tmp_path)?;
-    let key = publication_key(skill, url, &branch_name, &destination_rel);
     if changed {
         run_git(
             Some(&tmp_path),
@@ -860,6 +884,20 @@ pub(crate) fn publish_to_repo(
     let local_hash = run_git(Some(&tmp_path), &["rev-parse", "HEAD"])?;
     if remote_hash != local_hash {
         return Err(anyhow!("remote readback did not match published commit"));
+    }
+    if hash_dir(&source)? != current_hash {
+        return Err(anyhow!("source changed after publication; retry"));
+    }
+    #[cfg(feature = "test-hooks")]
+    if std::env::var("SKILLSYNC_TEST_MUTATE_SOURCE_AFTER_READBACK").as_deref() == Ok(skill) {
+        std::fs::write(source.join("SKILL.md"), format!("name: {skill}\\nv2\\n"))
+            .context("injected source mutation after final pre-state check (test-only)")?;
+        std::env::remove_var("SKILLSYNC_TEST_MUTATE_SOURCE_AFTER_READBACK");
+    }
+    if hash_dir(&source)? != current_hash {
+        return Err(anyhow!(
+            "source changed before publication state commit; retry"
+        ));
     }
     let publication = Publication {
         skill: skill.to_owned(),

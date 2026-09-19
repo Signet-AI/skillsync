@@ -873,6 +873,68 @@ test("retains pending publication when replacement commit fails after push and r
   expect(countPublications(recovered)).toBe(1);
 });
 
+test("does not attribute unrelated destination edits to mismatched pending intent", async () => {
+  if (process.platform === "win32") return;
+  const fixture = await makeFixture();
+  skillsync(fixture, ["--json", "init"]);
+  await put(join(fixture.library, "identity/SKILL.md"), "name: identity\\nv1\\n");
+  const destination = join(fixture.root, "identity-destination.git");
+  checked(run("git", ["init", "--bare", destination], undefined, fixture.env), "init identity destination");
+  const hook = join(destination, "hooks/update");
+  await writeFile(hook, "#!/bin/sh\\nexit 1\\n");
+  await chmod(hook, 0o755);
+  const failed = skillsync(fixture, ["--json", "publish", "identity", "--repo", destination, "--yes"], false);
+  expect(failed.json.ok).toBe(false);
+  const statePath = join(fixture.config, "state.json");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  const pendingKey = Object.keys(state.pending_publications)[0];
+  state.pending_publications[pendingKey].publication.branch = "other";
+  state.pending_publications[pendingKey].publication.path = "other/identity";
+  await writeFile(statePath, JSON.stringify(state));
+  await unlink(hook);
+  const unrelated = await makeFixture();
+  git(unrelated, unrelated.root, ["init"]);
+  await put(join(unrelated.root, "README.md"), "unrelated\\n");
+  git(unrelated, unrelated.root, ["add", "."]);
+  git(unrelated, unrelated.root, ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "unrelated"]);
+  git(unrelated, unrelated.root, ["branch", "-M", "main"]);
+  git(unrelated, unrelated.root, ["remote", "add", "origin", destination]);
+  git(unrelated, unrelated.root, ["push", "origin", "main"]);
+  const retried = skillsync(fixture, ["--json", "sync"], false);
+  expect(retried.json.ok).toBe(false);
+  expect((await readFile(statePath, "utf8"))).toContain("pending_publications");
+  const remote = checked(run("git", ["--git-dir", destination, "show", "refs/heads/main:README.md"], undefined, fixture.env), "read unrelated remote");
+  expect(remote.stdout).toContain("unrelated");
+});
+
+test("fails closed when the source changes after remote readback", async () => {
+  if (process.platform === "win32") return;
+  const fixture = await makeFixture();
+  skillsync(fixture, ["--json", "init"]);
+  await put(join(fixture.library, "stability/SKILL.md"), "name: stability\\nv1\\n");
+  const destination = join(fixture.root, "stability-destination.git");
+  checked(run("git", ["init", "--bare", destination], undefined, fixture.env), "init stability destination");
+  const failed = skillsync(
+    fixture,
+    ["--json", "publish", "stability", "--repo", destination, "--yes"],
+    false,
+    { SKILLSYNC_TEST_MUTATE_SOURCE_AFTER_READBACK: "stability" },
+  );
+  expect(failed.json.ok).toBe(false);
+  expect(failed.json.message).not.toContain('"status":"synced"');
+  const status = skillsync(fixture, ["--json", "status"]).json;
+  expect(Object.keys(status.pending_publications ?? {})).toHaveLength(1);
+  expect(status.publications?.[Object.keys(status.pending_publications)[0]]?.status).not.toBe("synced");
+  expect(await readFile(join(fixture.library, "stability/SKILL.md"), "utf8")).toContain("v2");
+  const remoteSnapshot = checked(run("git", ["--git-dir", destination, "show", "refs/heads/main:skills/stability/SKILL.md"], undefined, fixture.env), "read stability remote snapshot");
+  expect(remoteSnapshot.stdout).toContain("v1");
+  const retried = skillsync(fixture, ["--json", "sync"], true, { SKILLSYNC_TEST_MUTATE_SOURCE_AFTER_READBACK: "" }).json;
+  expect(retried.results.some((item: any) => item.skill === "stability" && item.status === "published")).toBe(true);
+  expect(Object.keys(skillsync(fixture, ["--json", "status"]).json.pending_publications ?? {})).toHaveLength(0);
+  const finalSnapshot = checked(run("git", ["--git-dir", destination, "show", "refs/heads/main:skills/stability/SKILL.md"], undefined, fixture.env), "read retried stability remote snapshot");
+  expect(finalSnapshot.stdout).toContain("v2");
+});
+
 test("retains pending publication after post-push state-save failure and retries without duplicate commit", async () => {
   if (process.platform === "win32") return;
   const fixture = await makeFixture();

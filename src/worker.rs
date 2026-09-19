@@ -145,7 +145,12 @@ pub(crate) fn sync_all(a: &mut App, continue_on_error: bool) -> Result<serde_jso
                 continue;
             }
         }
-        let previous = a.state.publications.get(&key).cloned();
+        let previous = a
+            .state
+            .publications
+            .get(&key)
+            .cloned()
+            .or_else(|| Some(intent.clone()));
         match repository::publish_to_repo(a, &intent.skill, &intent.destination, previous.as_ref())
         {
             Ok(result) => results.push(result),
