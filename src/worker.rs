@@ -69,6 +69,42 @@ fn safe_error(status: &str) -> &'static str {
     }
 }
 
+fn cycle_summary(results: &[serde_json::Value]) -> serde_json::Value {
+    let mut subscriptions = [0_u64; 4];
+    let mut publications = [0_u64; 4];
+    let mut by_status = std::collections::BTreeMap::<String, u64>::new();
+    for result in results {
+        let status = result
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        *by_status.entry(status.to_owned()).or_default() += 1;
+        let scheduled =
+            result.get("queue").and_then(serde_json::Value::as_str) == Some("scheduled");
+        let counters = if result.get("relationship").is_some() && !scheduled {
+            &mut subscriptions
+        } else {
+            &mut publications
+        };
+        if scheduled {
+            counters[3] += 1;
+        } else {
+            counters[0] += 1;
+            if matches!(status, "synced" | "customized" | "no_change" | "published") {
+                counters[1] += 1;
+            } else {
+                counters[2] += 1;
+            }
+        }
+    }
+    serde_json::json!({
+        "total_results": results.len(),
+        "subscriptions": {"attempted": subscriptions[0], "succeeded": subscriptions[1], "failed": subscriptions[2], "scheduled": subscriptions[3]},
+        "publications": {"attempted": publications[0], "succeeded": publications[1], "failed": publications[2], "scheduled": publications[3]},
+        "by_status": by_status,
+    })
+}
+
 pub(crate) fn sync_all(a: &mut App, continue_on_error: bool) -> Result<serde_json::Value> {
     let cycle_now = now();
     let keys = a.state.subscriptions.keys().cloned().collect::<Vec<_>>();
@@ -195,7 +231,9 @@ pub(crate) fn run_worker_locked(
             .get("results")
             .cloned()
             .unwrap_or_else(|| serde_json::json!([]));
-        return Ok(serde_json::json!({"worker":"completed","results":results}));
+        return Ok(
+            serde_json::json!({"worker":"completed","results":results,"cycle_summary":cycle_summary(results.as_array().unwrap_or(&vec![]))}),
+        );
     }
     let stop = Arc::new(AtomicBool::new(false));
     let signal_stop = Arc::clone(&stop);
