@@ -35,6 +35,19 @@ test("worker classifies a missing repository without mutating live package or ba
   expect(await readFile(join(root, "library", "demo", "SKILL.md"), "utf8")).toBe(live);
 });
 
+test("successful update reports recovery from an exact persisted source failure and worker forwards it", async () => {
+  const { root, source } = await fixture(); const statePath = join(root, "config", "state.json");
+  await rm(source, { recursive: true, force: true });
+  const failed = run(root, ["worker", "--once"]); expect(failed.results[0]).not.toHaveProperty("recovered_from");
+  const missingState = JSON.parse(await readFile(statePath, "utf8")); const key = Object.keys(missingState.subscriptions)[0];
+  await repo(root); // recreate the exact source path with the original package
+  const recovered = run(root, ["worker", "--once"]);
+  expect(recovered.results[0]).toMatchObject({ status: "synced", recovered_from: "source_missing" });
+  expect(run(root, ["worker", "--once"]).results[0]).not.toHaveProperty("recovered_from");
+  const wrong = JSON.parse(await readFile(statePath, "utf8")); wrong.subscriptions[key].status = "conflict"; await writeFile(statePath, JSON.stringify(wrong));
+  expect(run(root, ["worker", "--once"]).results[0]).not.toHaveProperty("recovered_from");
+});
+
 test("explicit policy mismatch fails closed before update and never follows mutable branch", async () => {
   const { root, source } = await fixture(); const statePath = join(root, "config", "state.json"); const before = JSON.parse(await readFile(statePath, "utf8")); const key = Object.keys(before.subscriptions)[0];
   git(source, ["checkout", "-qb", "release"]); await writeFile(join(source, "nested", "demo", "SKILL.md"), "name: demo\nrelease\n"); git(source, ["add", "."]); git(source, ["commit", "-qm", "release change"]);

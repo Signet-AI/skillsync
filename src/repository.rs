@@ -247,6 +247,15 @@ pub(crate) fn status_for_error(error: &str) -> &'static str {
         "conflict"
     }
 }
+fn recovered_from(status: &str) -> Option<&'static str> {
+    match status {
+        "source_missing" => Some("source_missing"),
+        "branch_missing" => Some("branch_missing"),
+        "package_missing" => Some("package_missing"),
+        _ => None,
+    }
+}
+
 pub(crate) fn branch(repo: &str) -> Result<String> {
     if let Some(b) = run_git(None, &["ls-remote", "--symref", repo, "HEAD"])
         .ok()
@@ -522,6 +531,7 @@ pub(crate) fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
         .get(key)
         .cloned()
         .ok_or_else(|| anyhow!("subscription not found"))?;
+    let previous_status = s.status.clone();
     strict_component(&s.skill, "subscription skill name")?;
     strict_component(key, "subscription relationship key")?;
     let local = PathBuf::from(&s.local_path);
@@ -614,9 +624,11 @@ pub(crate) fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
         } else {
             s.status.as_str()
         };
-        return Ok(
-            serde_json::json!({"skill":s.skill,"relationship":key,"status":s.status,"result":result}),
-        );
+        let mut output = serde_json::json!({"skill":s.skill,"relationship":key,"status":s.status,"result":result});
+        if let Some(status) = recovered_from(&previous_status) {
+            output["recovered_from"] = serde_json::Value::String(status.into());
+        }
+        return Ok(output);
     }
     let live_parent = crate::filesystem::open_directory_file_bound(
         local
@@ -715,7 +727,11 @@ pub(crate) fn update_one(a: &mut App, key: &str) -> Result<serde_json::Value> {
     if let Some(baseline) = baseline_replacement.as_mut() {
         baseline.commit()?;
     }
-    Ok(serde_json::json!({"skill":s.skill,"relationship":key,"status":s.status}))
+    let mut output = serde_json::json!({"skill":s.skill,"relationship":key,"status":s.status});
+    if let Some(status) = recovered_from(&previous_status) {
+        output["recovered_from"] = serde_json::Value::String(status.into());
+    }
+    Ok(output)
 }
 pub(crate) fn publish_to_repo(
     a: &mut App,
