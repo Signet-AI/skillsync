@@ -11,6 +11,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+mod baseline_transfer;
 mod branch_policy;
 mod capabilities;
 #[cfg(feature = "external-editor")]
@@ -158,7 +159,24 @@ enum OnboardingCmd {
     },
 }
 #[derive(Subcommand)]
+enum BaselineCmd {
+    Export {
+        #[arg(long)]
+        relationship: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    Inspect {
+        #[arg(long = "from")]
+        from: PathBuf,
+    },
+}
+#[derive(Subcommand)]
 enum StateCmd {
+    Baseline {
+        #[command(subcommand)]
+        command: BaselineCmd,
+    },
     Inspect {
         #[arg(long = "from")]
         from: PathBuf,
@@ -932,6 +950,14 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         return conflicts::inspect_workspace(workspace);
     }
     if let Cmd::State {
+        command: StateCmd::Baseline {
+            command: BaselineCmd::Inspect { from },
+        },
+    } = &command
+    {
+        return baseline_transfer::inspect(from);
+    }
+    if let Cmd::State {
         command: StateCmd::Package { command },
     } = &command
     {
@@ -1165,6 +1191,15 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             command: OnboardingCmd::Plan { .. },
         } => unreachable!("onboarding plan handled before App load"),
         Cmd::Onboarding { .. } => unreachable!("onboarding discover handled before App load"),
+        Cmd::State {
+            command:
+                StateCmd::Baseline {
+                    command: BaselineCmd::Export { relationship, out },
+                },
+        } => baseline_transfer::export(&a, &relationship, &out),
+        Cmd::State {
+            command: StateCmd::Baseline { .. },
+        } => unreachable!("baseline inspect handled before App load"),
         Cmd::State {
             command: StateCmd::Export { out },
         } => state_boundary::export(&a, &out),

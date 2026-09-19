@@ -21,6 +21,36 @@ use std::{
     time::Duration,
 };
 
+pub(crate) fn validate_portable_source_identity(s: &str) -> Result<()> {
+    if s.is_empty()
+        || s.chars().any(|c| c.is_control())
+        || s.contains('\\')
+        || s.starts_with('/')
+        || s.starts_with("\\\\")
+        || (s.len() >= 2 && s.as_bytes()[1] == b':')
+        || Path::new(s).is_absolute()
+    {
+        return Err(anyhow!("nonportable repository source"));
+    }
+    if s.starts_with("git@") && s.contains(':') {
+        return Ok(());
+    }
+    let Some((scheme, rest)) = s.split_once("://") else {
+        return Err(anyhow!("nonportable repository source"));
+    };
+    if !matches!(scheme, "http" | "https" | "ssh") || rest.is_empty() || rest.contains('@') {
+        return Err(anyhow!("nonportable repository source"));
+    }
+    if rest
+        .split('/')
+        .next()
+        .is_some_and(|authority| authority.is_empty())
+    {
+        return Err(anyhow!("nonportable repository source"));
+    }
+    Ok(())
+}
+
 pub(crate) fn normalize(s: &str) -> Result<String> {
     if s.is_empty() || s.chars().any(|c| c.is_control()) {
         return Err(anyhow!("unsupported repository source"));

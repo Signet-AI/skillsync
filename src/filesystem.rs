@@ -1042,6 +1042,21 @@ pub(crate) fn canonicalize_path_with_missing(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+pub(crate) fn reject_output_overlap(output: &Path, roots: &[&Path]) -> Result<()> {
+    let output_identity = canonicalize_path_with_missing(output)?;
+    assert_no_symlink_path(&output_identity, Path::new("."))?;
+    for root in roots {
+        let root_identity = canonicalize_path_with_missing(root)?;
+        if output_identity == root_identity
+            || output_identity.starts_with(&root_identity)
+            || root_identity.starts_with(&output_identity)
+        {
+            return Err(anyhow!("destination overlaps Skillsync-owned path"));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_library_path(path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
