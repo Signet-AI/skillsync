@@ -890,6 +890,32 @@ pub(crate) fn status(config: &Path) -> Result<serde_json::Value> {
         serde_json::json!({"registered":true,"enabled":r.enabled,"provider_state":provider_state,"interval":r.interval,"executable":exe,"registration":reg}),
     )
 }
+#[cfg(unix)]
+pub(crate) fn status_from_directory(directory: &std::fs::File) -> Result<serde_json::Value> {
+    let Some(mut file) =
+        filesystem::open_relative_regular_file(directory, "worker-registration.json")?
+    else {
+        return Ok(
+            serde_json::json!({"registered":false,"enabled":false,"provider_state":"unknown"}),
+        );
+    };
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return Ok(
+            serde_json::json!({"registered":false,"enabled":false,"provider_state":"unknown"}),
+        );
+    }
+    let Ok(registration) = serde_json::from_slice::<Registration>(&bytes) else {
+        return Ok(
+            serde_json::json!({"registered":false,"enabled":false,"provider_state":"unknown"}),
+        );
+    };
+    Ok(
+        serde_json::json!({"registered":true,"enabled":registration.enabled,"provider_state":"unknown","interval":registration.interval}),
+    )
+}
+
 pub(crate) fn uninstall(config: &Path) -> Result<serde_json::Value> {
     let Some(r) = load(config)? else {
         return Ok(serde_json::json!({"worker":"already_absent"}));

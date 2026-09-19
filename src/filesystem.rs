@@ -236,6 +236,38 @@ pub(crate) fn open_directory_file_bound(path: &Path) -> Result<fs::File> {
     Ok(opened)
 }
 
+#[cfg(unix)]
+pub(crate) fn open_relative_regular_file(
+    directory: &fs::File,
+    name: &str,
+) -> Result<Option<fs::File>> {
+    use std::{
+        ffi::CString,
+        os::fd::{AsRawFd, FromRawFd},
+    };
+    let name = CString::new(name)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error.into())
+        };
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        return Err(anyhow!("regular file required: {name:?}"));
+    }
+    Ok(Some(file))
+}
+
 #[cfg(windows)]
 fn windows_file_identity(file: &fs::File) -> Result<(u32, u32, u32)> {
     use std::os::windows::io::AsRawHandle;
@@ -662,6 +694,17 @@ impl ConfigIdentity {
             self.len == current.len && self.modified == current.modified
         }
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn verify_open_directory_identity(directory: &fs::File, config: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let retained = directory.metadata()?;
+    let current = config_identity(config)?;
+    if retained.dev() != current.dev || retained.ino() != current.ino {
+        return Err(anyhow!("config directory changed during status read"));
+    }
+    Ok(())
 }
 
 impl StateLock {
@@ -2134,15 +2177,22 @@ pub(crate) fn install_dir_noreplace(src: &Path, dst: &Path) -> Result<()> {
     let name = dst
         .file_name()
         .ok_or_else(|| anyhow!("destination has no name"))?;
-    let source_c = CString::new(src.as_os_str().as_bytes())?;
+    let source_parent = src
+        .parent()
+        .ok_or_else(|| anyhow!("source has no parent"))?;
+    let source_name = src
+        .file_name()
+        .ok_or_else(|| anyhow!("source has no name"))?;
+    let source_c = CString::new(source_name.as_bytes())?;
     let name_c = CString::new(name.as_bytes())?;
-    let directory = open_directory_fd(parent)?;
+    let source_directory = open_directory_fd(source_parent)?;
+    let destination_directory = open_directory_fd(parent)?;
     let status = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
-            libc::AT_FDCWD,
+            source_directory,
             source_c.as_ptr(),
-            directory,
+            destination_directory,
             name_c.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
@@ -2153,7 +2203,8 @@ pub(crate) fn install_dir_noreplace(src: &Path, dst: &Path) -> Result<()> {
         Ok(())
     };
     unsafe {
-        libc::close(directory);
+        libc::close(source_directory);
+        libc::close(destination_directory);
     }
     result
 }

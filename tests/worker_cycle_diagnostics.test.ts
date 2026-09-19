@@ -36,6 +36,22 @@ test("scheduled publication is not counted as attempted", async () => {
   expect(JSON.stringify(result)).not.toMatch(/offline\.invalid|SKILLSYNC_TEST_|tmp/);
  });
 
+test("status exposes a read-only pending publication diagnostic projection", async () => {
+  const root = await fixture(); const statePath = join(root, "config", "state.json"); const before = await readFile(statePath, "utf8"); const state = JSON.parse(before);
+  state.pending_publications = {
+    "z-key": { publication: { skill: "z-safe", destination: "https://user:secret@remote.invalid/repo.git", branch: "main", path: "../../private", approved: true, status: "pending_push", last_hash: null, last_sync: 0 }, attempt_count: 2, last_attempt_at: 100, next_attempt_at: 200, last_error_status: "https://attacker:secret@evil.invalid/private/raw-error" },
+    "a-key": { publication: { skill: "a-safe", destination: "https://remote.invalid/repo.git", branch: "main", path: "skills/a-safe", approved: true, status: "pending_push", last_hash: null, last_sync: 0 }, attempt_count: 0, last_attempt_at: 0, next_attempt_at: 0, last_error_status: "source_missing" },
+  }; await writeFile(statePath, JSON.stringify(state));
+  const first = run(root, ["status"], { SKILLSYNC_TEST_NOW: "101" });
+  const second = run(root, ["status"], { SKILLSYNC_TEST_NOW: "101" });
+  expect(first.pending_publication_diagnostics).toEqual([
+    { skill: "a-safe", status: "source_missing", attempt_count: 0, next_attempt_at: 0, queue: "ready", due: true, diagnostic: "source unavailable" },
+    { skill: "z-safe", status: "unknown", attempt_count: 2, next_attempt_at: 200, queue: "scheduled", due: false, diagnostic: "repository operation failed" },
+  ]);
+  expect(first).toEqual(second); expect(await readFile(statePath, "utf8")).toBe(JSON.stringify(state));
+  expect(JSON.stringify(first.pending_publication_diagnostics)).not.toMatch(/user:secret|remote\.invalid|\.\.[\\/\\\\]|SKILLSYNC_TEST_/);
+});
+
 test("malformed relationship remains isolated and diagnostics are deterministic without state mutation", async () => {
   const root = await fixture(); const statePath = join(root, "config", "state.json"); const before = await readFile(statePath, "utf8"); const state = JSON.parse(before); state.subscriptions["../malformed"] = { skill: "bad", source: "/unreachable", branch: "main", source_path: ".", baseline_path: "/unstable/tmp/path", baseline_hash: "deadbeef", local_path: join(root, "library/bad"), status: "synced", recovery_path: null, last_sync: 0, update_count: 0 }; await writeFile(statePath, JSON.stringify(state));
   const first = run(root, ["worker", "--once"]); const second = run(root, ["worker", "--once"]); expect(first.cycle_summary).toEqual(second.cycle_summary); expect(first.cycle_summary.subscriptions.failed).toBe(1); expect(JSON.stringify(first)).not.toContain("/unstable/tmp/path"); expect(await readFile(statePath, "utf8")).not.toBe(before);

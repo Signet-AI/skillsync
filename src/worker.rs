@@ -33,7 +33,23 @@ pub(crate) fn worker_status(config: &Path) -> Result<&'static str> {
     }
 }
 
-fn now() -> u64 {
+#[cfg(unix)]
+pub(crate) fn worker_status_from_directory(directory: &std::fs::File) -> Result<&'static str> {
+    let Some(file) = crate::filesystem::open_relative_regular_file(directory, "worker.active")?
+    else {
+        return Ok("stopped");
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            file.unlock()?;
+            Ok("stopped")
+        }
+        Err(error) if lock_is_contended(&error) => Ok("running"),
+        Err(error) => Err(error).context("inspect worker status"),
+    }
+}
+
+pub(crate) fn now() -> u64 {
     #[cfg(feature = "test-hooks")]
     if let Ok(value) = std::env::var("SKILLSYNC_TEST_NOW") {
         if let Ok(value) = value.parse() {
@@ -52,11 +68,26 @@ fn retry_delay(attempt: u64) -> u64 {
     60_u64.checked_shl(exponent as u32).unwrap_or(CAP).min(CAP)
 }
 
-fn pending_due(pending: &crate::PendingPublication, current: u64) -> bool {
+pub(crate) fn pending_due(pending: &crate::PendingPublication, current: u64) -> bool {
     pending.next_attempt_at == 0 || current >= pending.next_attempt_at
 }
 
-fn safe_error(status: &str) -> &'static str {
+pub(crate) fn safe_pending_status(status: Option<&str>) -> &'static str {
+    match status {
+        Some("authentication_required") => "authentication_required",
+        Some("offline") => "offline",
+        Some("permission_denied") => "permission_denied",
+        Some("source_missing") => "source_missing",
+        Some("branch_missing") => "branch_missing",
+        Some("package_missing") => "package_missing",
+        Some("invalid_source") => "invalid_source",
+        Some("pending_push") => "pending_push",
+        None => "pending_push",
+        Some(_) => "unknown",
+    }
+}
+
+pub(crate) fn safe_error(status: &str) -> &'static str {
     match status {
         "authentication_required" => "repository authentication required",
         "offline" => "repository unavailable offline",

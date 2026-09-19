@@ -453,29 +453,32 @@ fn unique_stamp() -> u128 {
         .unwrap_or_default()
         .as_nanos()
 }
-pub(crate) fn config_dir() -> PathBuf {
-    let raw = if let Some(x) = std::env::var_os("SKILLSYNC_CONFIG_DIR") {
-        PathBuf::from(x)
-    } else if cfg!(target_os = "windows") {
-        std::env::var_os("LOCALAPPDATA")
+fn raw_config_dir() -> PathBuf {
+    if let Some(x) = std::env::var_os("SKILLSYNC_CONFIG_DIR") {
+        return PathBuf::from(x);
+    }
+    if cfg!(target_os = "windows") {
+        return std::env::var_os("LOCALAPPDATA")
             .map(|x| PathBuf::from(x).join("skillsync/config"))
-            .unwrap_or_else(|| PathBuf::from(".skillsync/config"))
-    } else if cfg!(target_os = "macos") {
-        std::env::var_os("HOME")
+            .unwrap_or_else(|| PathBuf::from(".skillsync/config"));
+    }
+    if cfg!(target_os = "macos") {
+        return std::env::var_os("HOME")
             .map(|x| PathBuf::from(x).join("Library/Application Support/skillsync"))
-            .unwrap_or_else(|| PathBuf::from(".skillsync"))
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(|x| PathBuf::from(x).join("skillsync"))
-            .or_else(|| {
-                std::env::var_os("HOME").map(|x| PathBuf::from(x).join(".config/skillsync"))
-            })
-            .unwrap_or_else(|| PathBuf::from(".skillsync"))
-    };
+            .unwrap_or_else(|| PathBuf::from(".skillsync"));
+    }
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(|x| PathBuf::from(x).join("skillsync"))
+        .or_else(|| std::env::var_os("HOME").map(|x| PathBuf::from(x).join(".config/skillsync")))
+        .unwrap_or_else(|| PathBuf::from(".skillsync"))
+}
+
+pub(crate) fn config_dir() -> PathBuf {
+    let raw = raw_config_dir();
     filesystem::canonicalize_path_with_missing(&raw).unwrap_or(raw)
 }
 impl App {
-    pub(crate) fn load(anchor: Option<&StateLock>) -> Result<Self> {
+    fn load_internal(anchor: Option<&StateLock>, status_only: bool) -> Result<Self> {
         let configured_config = config_dir();
         if configured_config.exists() {
             assert_no_symlink_path(&configured_config, Path::new("."))?;
@@ -509,8 +512,13 @@ impl App {
         #[cfg(unix)]
         let config_directory = match anchor {
             Some(lock) => lock.directory_try_clone()?,
+            None if status_only => filesystem::open_directory_file_bound(&c)?,
             None => filesystem::open_directory_file(&c)?,
         };
+        #[cfg(windows)]
+        if status_only {
+            return Err(anyhow!("status safety boundary is unavailable on Windows"));
+        }
         let config_exists = checked_regular_path(&cfg_path, "config")?;
         let file_cfg = if config_exists {
             let contents = String::from_utf8({
@@ -616,6 +624,10 @@ impl App {
         validate_local_adoptions(&state, &library)?;
         let baselines = c.join("baselines");
         let recovery = c.join("recovery");
+        #[cfg(unix)]
+        if status_only {
+            filesystem::verify_open_directory_identity(&config_directory, &c)?;
+        }
         Ok(Self {
             config: c,
             library,
@@ -627,6 +639,45 @@ impl App {
             config_directory,
         })
     }
+    pub(crate) fn load(anchor: Option<&StateLock>) -> Result<Self> {
+        Self::load_internal(anchor, false)
+    }
+
+    fn load_status() -> Result<Self> {
+        // Validate the uncanonicalized configured path before any helper can adopt a symlink target.
+        let raw_config = raw_config_dir();
+        match fs::symlink_metadata(&raw_config) {
+            Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {
+                assert_no_symlink_path(&raw_config, Path::new("."))?;
+            }
+            Ok(_metadata) => {
+                return Err(anyhow!(
+                    "config path must be an existing regular directory: {}",
+                    raw_config.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let library = filesystem::effective_library_path(None);
+                return Ok(Self {
+                    config: raw_config.clone(),
+                    library: library.clone(),
+                    state_path: raw_config.join("state.json"),
+                    baselines: raw_config.join("baselines"),
+                    recovery: raw_config.join("recovery"),
+                    state: State {
+                        version: 6,
+                        library: library.display().to_string(),
+                        ..Default::default()
+                    },
+                    #[cfg(unix)]
+                    config_directory: std::fs::File::open("/")?,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Self::load_internal(None, true)
+    }
+
     fn save(&self) -> Result<()> {
         #[cfg(feature = "test-hooks")]
         if std::env::var("SKILLSYNC_TEST_FAIL_STATE_SAVE").as_deref() == Ok("1") {
@@ -851,6 +902,243 @@ fn requires_lock(command: &Cmd) -> bool {
         } => false,
         _ => true,
     }
+}
+
+fn pending_publication_diagnostics(a: &App) -> Result<serde_json::Value> {
+    let current = worker::now();
+    let mut diagnostics = Vec::with_capacity(a.state.pending_publications.len());
+    for (key, pending) in &a.state.pending_publications {
+        strict_component(key, "pending publication identity")?;
+        let skill = strict_component(&pending.publication.skill, "pending publication skill")?;
+        let due = worker::pending_due(pending, current);
+        let status = worker::safe_pending_status(pending.last_error_status.as_deref());
+
+        diagnostics.push(serde_json::json!({"skill": skill, "status": status, "attempt_count": pending.attempt_count, "next_attempt_at": pending.next_attempt_at, "queue": if due { "ready" } else { "scheduled" }, "due": due, "diagnostic": worker::safe_error(status)}));
+    }
+    Ok(serde_json::Value::Array(diagnostics))
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod status_projection_tests {
+    use super::*;
+
+    #[test]
+    fn projections_never_copy_persisted_map_keys_or_sensitive_values() {
+        let mut state = State::default();
+        state.subscriptions.insert(
+            "https://user:pass@example.invalid/repo".into(),
+            Subscription {
+                branch_policy: Some(BranchPolicy::RemoteDefault),
+                skill: "skill".into(),
+                source: "https://user:pass@example.invalid/repo".into(),
+                branch: "main".into(),
+                source_path: "../../secret".into(),
+                baseline_path: "/absolute/base".into(),
+                baseline_hash: "h".into(),
+                baseline_source: String::new(),
+                baseline_source_path: String::new(),
+                local_path: "/absolute/local".into(),
+                status: "synced".into(),
+                recovery_path: None,
+                conflict_selection: None,
+                last_sync: 0,
+                update_count: 0,
+                resolved_commit: None,
+                resolved_tree: None,
+            },
+        );
+        let value = bounded_state_projection(&state).unwrap();
+        let text = value.to_string();
+        assert!(!text.contains("user:pass"));
+        assert!(!text.contains("/absolute"));
+        assert!(!text.contains("../"));
+        assert!(!text.contains("https://"));
+        assert!(value
+            .get("subscriptions")
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|k| k.starts_with("subscription-")));
+    }
+}
+
+fn safe_projection_key(prefix: &str, values: &[&str]) -> String {
+    let mut h = Sha256::new();
+    h.update(prefix.as_bytes());
+    for value in values {
+        h.update([0]);
+        h.update(value.as_bytes());
+    }
+    format!("{prefix}-{:x}", h.finalize())
+}
+
+fn bounded_state_projection(state: &State) -> Result<serde_json::Value> {
+    let mut subscriptions = serde_json::Map::new();
+    for record in state.subscriptions.values() {
+        let key = safe_projection_key("subscription", &[&record.skill, &record.source_path]);
+        subscriptions.insert(
+            key,
+            serde_json::json!({
+                "skill": strict_component(&record.skill, "subscription skill")?,
+                "status": worker::safe_pending_status(Some(&record.status)),
+                "update_count": record.update_count,
+                "resolved_commit": record.resolved_commit,
+                "resolved_tree": record.resolved_tree,
+            }),
+        );
+    }
+    let mut publications = serde_json::Map::new();
+    for record in state.publications.values() {
+        let key = safe_projection_key(
+            "publication",
+            &[
+                &record.skill,
+                &record.destination,
+                &record.branch,
+                &record.path,
+            ],
+        );
+        publications.insert(
+            key,
+            serde_json::json!({
+                "skill": strict_component(&record.skill, "publication skill")?,
+                "status": worker::safe_pending_status(Some(&record.status)),
+                "approved": record.approved,
+            }),
+        );
+    }
+    let mut pending_publications = serde_json::Map::new();
+    for pending in state.pending_publications.values() {
+        let publication = &pending.publication;
+        let key = safe_projection_key(
+            "publication",
+            &[
+                &publication.skill,
+                &publication.destination,
+                &publication.branch,
+                &publication.path,
+            ],
+        );
+        let status = worker::safe_pending_status(
+            pending
+                .last_error_status
+                .as_deref()
+                .or(Some(&publication.status)),
+        );
+        pending_publications.insert(
+            key,
+            serde_json::json!({
+                "skill": strict_component(&publication.skill, "pending publication skill")?,
+                "status": status,
+                "attempt_count": pending.attempt_count,
+                "next_attempt_at": pending.next_attempt_at,
+                "due": worker::pending_due(pending, worker::now()),
+            }),
+        );
+    }
+    let mut local_adoptions = serde_json::Map::new();
+    for (stored_key, record) in &state.local_adoptions {
+        let key = if stored_key.starts_with("local:path:") {
+            stored_key.clone()
+        } else {
+            format!("local:{}", record.skill)
+        };
+        local_adoptions.insert(
+            key,
+            serde_json::json!({
+                "skill": strict_component(&record.skill, "local adoption skill")?,
+                "status": record.status,
+                "content_hash": record.content_hash,
+                "source_package": record.source_package,
+                "local_path": record.local_path,
+            }),
+        );
+    }
+    let mut harness_links = serde_json::Map::new();
+    for record in state.harness_links.values() {
+        let key = safe_projection_key("harness-link", &[&record.skill, &record.harness_root]);
+        harness_links.insert(
+            key,
+            serde_json::json!({
+                "skill": strict_component(&record.skill, "harness link skill")?,
+                "status": record.status,
+            }),
+        );
+    }
+    let mut harness_sets = serde_json::Map::new();
+    for record in state.harness_sets.values() {
+        let key = safe_projection_key("harness-set", &[&record.set, &record.harness_root]);
+        harness_sets.insert(
+            key,
+            serde_json::json!({
+                "set": strict_component(&record.set, "harness set name")?,
+                "member_count": record.members.len(),
+            }),
+        );
+    }
+    Ok(serde_json::json!({
+        "subscriptions": subscriptions,
+        "local_adoptions": local_adoptions,
+        "publications": publications,
+        "pending_publications": pending_publications,
+        "harness_links": harness_links,
+        "harness_sets": harness_sets,
+    }))
+}
+
+fn status_value(a: &App) -> Result<serde_json::Value> {
+    if matches!(
+        fs::symlink_metadata(&a.config),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ) {
+        return Ok(serde_json::json!({
+            "subscriptions": {},
+            "local_adoptions": {},
+            "publications": {},
+            "pending_publication_diagnostics": [],
+            "pending_publications": {},
+            "harness_links": {},
+            "harness_sets": {},
+            "harness_health": [],
+            "worker": "stopped",
+            "worker_registration": {"enabled": false, "registered": false}
+        }));
+    }
+    let pending = pending_publication_diagnostics(a)?;
+    let bounded = bounded_state_projection(&a.state)?;
+    #[cfg(unix)]
+    let health = harness::harness_link_health(a)?
+        .into_iter()
+        .map(|item| {
+            let status = item
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            serde_json::json!({"status": status})
+        })
+        .collect::<Vec<_>>();
+    #[cfg(unix)]
+    let registration = worker_registration::status_from_directory(&a.config_directory)?;
+    #[cfg(unix)]
+    let worker = worker::worker_status_from_directory(&a.config_directory)?;
+    #[cfg(not(unix))]
+    let (health, registration, worker) = (
+        Vec::<serde_json::Value>::new(),
+        serde_json::json!({"registered":false,"enabled":false,"provider_state":"unknown"}),
+        "unknown",
+    );
+    let mut value = bounded;
+    if let serde_json::Value::Object(ref mut object) = value {
+        object.insert("pending_publication_diagnostics".into(), pending);
+        object.insert("harness_health".into(), serde_json::Value::Array(health));
+        object.insert("worker".into(), worker.into());
+        object.insert("worker_registration".into(), registration);
+    }
+    #[cfg(unix)]
+    filesystem::verify_open_directory_identity(&a.config_directory, &a.config)?;
+    Ok(value)
 }
 
 fn main() -> Result<()> {
@@ -1148,9 +1436,12 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
     let harness_read = matches!(
         command,
         Cmd::Harness {
-            command: HarnessCmd::List
+            command: HarnessCmd::List,
         }
     );
+    if matches!(command, Cmd::Status) {
+        return status_value(&App::load_status()?);
+    }
     let needs_lock =
         requires_lock(&command) && !conflicts_read_lock && !inventory_read && !harness_read;
     let _state_lock = if needs_lock {
@@ -1611,9 +1902,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 repository::publish_to_repo(&mut a, &skill, &url, previous.as_ref())
             }
         }
-        Cmd::Status => Ok(
-            serde_json::json!({"subscriptions":a.state.subscriptions,"local_adoptions":a.state.local_adoptions,"publications":a.state.publications,"pending_publications":a.state.pending_publications,"harness_links":a.state.harness_links,"harness_sets":a.state.harness_sets,"harness_health":harness::harness_link_health(&a)?,"worker":worker::worker_status(&a.config)?,"worker_registration":worker_registration::status(&a.config)?}),
-        ),
+        Cmd::Status => status_value(&a),
         Cmd::Inventory => Ok(serde_json::to_value(inventory::query(&a)?)?),
         Cmd::Doctor => {
             let report = capabilities::capability_report(&a.library.display().to_string(), true);
