@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context, Result};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
 };
 
 #[cfg(unix)]
@@ -233,6 +234,258 @@ fn remove_owned_directory_at(
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn recovery_inventory_digest(root_file: &fs::File) -> Result<String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::{ffi::CString, io::Read, os::fd::AsRawFd, os::unix::ffi::OsStrExt};
+    let mut records: Vec<(PathBuf, fs::Metadata, Option<Vec<u8>>)> = Vec::new();
+    fn walk(
+        dir: &fs::File,
+        rel: &Path,
+        records: &mut Vec<(PathBuf, fs::Metadata, Option<Vec<u8>>)>,
+    ) -> Result<()> {
+        let mut names = read_directory_entries(dir.as_raw_fd())?;
+        names.sort();
+        for name in names {
+            let c_name = CString::new(name.as_bytes())?;
+            let child = open_entry_checked(
+                dir.as_raw_fd(),
+                &c_name,
+                Path::new("recovery inventory entry"),
+            )?;
+            let metadata = child.metadata()?;
+            if !metadata.is_dir() && !metadata.is_file() {
+                return Err(anyhow!("recovery inventory special entry rejected"));
+            }
+            let child_rel = rel.join(&name);
+            if !child_rel
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)))
+            {
+                return Err(anyhow!("unsafe recovery inventory path"));
+            }
+            let bytes = if metadata.is_file() {
+                let before = child.metadata()?;
+                let mut bytes = Vec::new();
+                (&child).take(u64::MAX).read_to_end(&mut bytes)?;
+                let after = child.metadata()?;
+                if (before.dev(), before.ino()) != (after.dev(), after.ino())
+                    || before.len() != after.len()
+                {
+                    return Err(anyhow!("recovery inventory file changed during read"));
+                }
+                Some(bytes)
+            } else {
+                None
+            };
+            let child_rel_for_walk = child_rel.clone();
+            records.push((child_rel, metadata.clone(), bytes));
+            if metadata.is_dir() {
+                walk(&child, &child_rel_for_walk, records)?;
+            }
+        }
+        Ok(())
+    }
+    walk(root_file, Path::new(""), &mut records)?;
+    records.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = Sha256::new();
+    hasher.update(b"skillsync-recovery-inventory-v1\\0");
+    for (relative, metadata, bytes) in records {
+        let relative_bytes = relative.as_os_str().as_bytes();
+        hasher.update((relative_bytes.len() as u64).to_le_bytes());
+        hasher.update(relative_bytes);
+        hasher.update(if metadata.is_dir() { b"d" } else { b"f" });
+        hasher.update(metadata.len().to_le_bytes());
+        hasher.update((metadata.permissions().mode() as u64).to_le_bytes());
+        if let Some(bytes) = bytes {
+            hasher.update(bytes);
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(not(unix))]
+fn recovery_inventory_digest(root: &Path) -> Result<String> {
+    let mut records = Vec::new();
+    fn walk(root: &Path, current: &Path, records: &mut Vec<(PathBuf, fs::Metadata)>) -> Result<()> {
+        reject_reparse_point(current, "recovery inventory entry")?;
+        let metadata = fs::symlink_metadata(current)?;
+        if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
+            return Err(anyhow!("recovery inventory entry rejected"));
+        }
+        let relative = current
+            .strip_prefix(root)
+            .map_err(|_| anyhow!("recovery inventory path escaped root"))?;
+        if !relative.as_os_str().is_empty() {
+            records.push((relative.to_path_buf(), metadata.clone()));
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(current)? {
+                walk(root, &entry?.path(), records)?;
+            }
+        }
+        Ok(())
+    }
+    walk(root, root, &mut records)?;
+    records.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut h = Sha256::new();
+    h.update(b"skillsync-recovery-inventory-v1\\0");
+    for (p, m) in records {
+        h.update(p.as_os_str().as_encoded_bytes());
+        h.update(if m.is_dir() { b"d" } else { b"f" });
+        if m.is_file() {
+            return Err(anyhow!("safe recovery file reads unavailable"));
+        }
+    }
+    Ok(format!("{:x}", h.finalize()))
+}
+
+#[allow(dead_code)]
+fn validate_recovery_snapshot_tree(root: &Path) -> Result<()> {
+    fn walk(root: &Path, current: &Path) -> Result<()> {
+        let relative = current
+            .strip_prefix(root)
+            .map_err(|_| anyhow!("recovery snapshot path escaped root"))?;
+        if !relative.as_os_str().is_empty()
+            && !relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(anyhow!(
+                "unsafe recovery snapshot path: {}",
+                relative.display()
+            ));
+        }
+        reject_reparse_point(current, "recovery snapshot entry")?;
+        let metadata = fs::symlink_metadata(current)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(anyhow!("recovery snapshot root is not a regular directory"));
+        }
+        for entry in fs::read_dir(current)? {
+            let entry = entry?;
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| anyhow!("recovery snapshot path escaped root"))?;
+            if !relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+            {
+                return Err(anyhow!(
+                    "unsafe recovery snapshot path: {}",
+                    relative.display()
+                ));
+            }
+            reject_reparse_point(&path, "recovery snapshot entry")?;
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(anyhow!(
+                    "recovery snapshot symlink rejected: {}",
+                    relative.display()
+                ));
+            }
+            if metadata.is_dir() {
+                walk(root, &path)?;
+            } else if !metadata.is_file() {
+                return Err(anyhow!(
+                    "recovery snapshot special entry rejected: {}",
+                    relative.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+    walk(root, root)
+}
+
+pub(crate) fn list_inventory(a: &mut App) -> Result<serde_json::Value> {
+    #[cfg(unix)]
+    let root_file = crate::filesystem::open_directory_file_bound(&a.recovery)?;
+    #[cfg(unix)]
+    let root_identity = {
+        use std::os::unix::fs::MetadataExt;
+        let m = root_file.metadata()?;
+        (m.dev(), m.ino())
+    };
+    #[cfg(all(unix, feature = "test-hooks"))]
+    if std::env::var("SKILLSYNC_TEST_REPLACE_RECOVERY_ROOT").as_deref() == Ok("1") {
+        let replacement = a.recovery.with_extension("replaced");
+        fs::rename(&a.recovery, &replacement).context("test hook rename recovery root")?;
+        fs::create_dir(&a.recovery).context("test hook replace recovery root")?;
+    }
+    #[cfg(unix)]
+    let mut entries = {
+        use std::os::fd::AsRawFd;
+        read_directory_entries(root_file.as_raw_fd())?
+            .into_iter()
+            .map(|name| (name, ()))
+            .collect::<Vec<_>>()
+    };
+    #[cfg(not(unix))]
+    let mut entries = fs::read_dir(&a.recovery)?
+        .map(|e| e.map(|e| (e.file_name(), ())))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut artifacts = Vec::new();
+    for (sorted_position, (name, _)) in entries.into_iter().enumerate() {
+        #[cfg(not(unix))]
+        let path = a.recovery.join(&name);
+        #[cfg(unix)]
+        let entry = {
+            use std::os::unix::ffi::OsStrExt;
+            use std::{ffi::CString, os::fd::AsRawFd};
+            let c = CString::new(name.as_os_str().as_bytes())?;
+            open_entry_checked(
+                root_file.as_raw_fd(),
+                &c,
+                Path::new("recovery inventory entry"),
+            )
+        };
+        #[cfg(not(unix))]
+        let entry: Result<()> = Ok(());
+        #[cfg(unix)]
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => {
+                artifacts.push(serde_json::json!({"id": format!("recovery-{:016x}", sorted_position), "category":"unknown", "status":"invalid", "reason":"unrecognized_recovery_artifact", "deletable":false}));
+                continue;
+            }
+        };
+        #[cfg(not(unix))]
+        if entry.is_err() {
+            artifacts.push(serde_json::json!({"id": format!("recovery-{:016x}", sorted_position), "category":"unknown", "status":"invalid", "reason":"unrecognized_recovery_artifact", "deletable":false}));
+            continue;
+        }
+        #[cfg(unix)]
+        let digest = recovery_inventory_digest(&entry);
+        #[cfg(not(unix))]
+        let digest = recovery_inventory_digest(&path);
+        let digest = match digest {
+            Ok(v) => v,
+            Err(_) => {
+                artifacts.push(serde_json::json!({"id": format!("recovery-{:016x}", sorted_position), "category":"unknown", "status":"invalid", "reason":"unrecognized_recovery_artifact", "deletable":false}));
+                continue;
+            }
+        };
+        let opaque_id = format!("recovery-{}", &digest[..16]);
+        let item = serde_json::json!({"id":opaque_id,"category":"unknown","status":"invalid","reason":"unrecognized_recovery_artifact","deletable":false});
+        artifacts.push(item);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let current = fs::symlink_metadata(&a.recovery)?;
+        if (current.dev(), current.ino()) != root_identity {
+            return Err(anyhow!("recovery root changed during inventory"));
+        }
+        let retained = root_file.metadata()?;
+        if (retained.dev(), retained.ino()) != root_identity {
+            return Err(anyhow!("recovery root handle changed"));
+        }
+    }
+    Ok(serde_json::json!({"artifacts": artifacts, "count": artifacts.len()}))
 }
 
 pub(crate) fn import_local(

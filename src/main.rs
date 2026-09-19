@@ -129,6 +129,10 @@ enum Cmd {
         #[arg(long)]
         skill: Option<String>,
     },
+    Recovery {
+        #[command(subcommand)]
+        command: RecoveryCmd,
+    },
     Conflicts {
         #[command(subcommand)]
         command: ConflictCmd,
@@ -276,6 +280,10 @@ enum ConflictCmd {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+}
+#[derive(Subcommand)]
+enum RecoveryCmd {
+    List,
 }
 #[derive(Subcommand)]
 enum HarnessCmd {
@@ -1104,6 +1112,8 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         command,
         Cmd::Conflicts {
             command: ConflictCmd::List | ConflictCmd::Show { .. },
+        } | Cmd::Recovery {
+            command: RecoveryCmd::List
         } | Cmd::State {
             command: StateCmd::Relationship {
                 command: RelationshipCmd::Verify { .. },
@@ -1111,6 +1121,12 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         }
     );
     let inventory_read = matches!(command, Cmd::Inventory);
+    let recovery_read = matches!(
+        command,
+        Cmd::Recovery {
+            command: RecoveryCmd::List
+        }
+    );
     let harness_read = matches!(
         command,
         Cmd::Harness {
@@ -1161,6 +1177,11 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             Cmd::Conflicts {
                 command: ConflictCmd::List | ConflictCmd::Show { .. }
             }
+        ) || matches!(
+            command,
+            Cmd::Recovery {
+                command: RecoveryCmd::List
+            }
         ) || matches!(command, Cmd::Inventory)
             || matches!(
                 command,
@@ -1198,6 +1219,19 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             }
         ) {
             return Ok(serde_json::json!({"conflicts": [], "count": 0}));
+        }
+        if matches!(
+            command,
+            Cmd::Recovery {
+                command: RecoveryCmd::List
+            }
+        ) {
+            return Ok(serde_json::json!({"artifacts": [], "count": 0}));
+        }
+    }
+    if relationship_verify || recovery_read {
+        if let Some(lock) = operation_lock {
+            lock.verify_config_identity(&config_dir())?;
         }
     }
     let mut a = App::load(operation_lock)?;
@@ -1419,6 +1453,9 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             recovery_path,
             skill,
         } => restore_skill(&a, &recovery_path, skill.as_deref()),
+        Cmd::Recovery {
+            command: RecoveryCmd::List,
+        } => recovery::list_inventory(&mut a),
         Cmd::Conflicts {
             command: ConflictCmd::Show { relationship },
         } => conflicts::show(&a, &relationship),
@@ -1645,7 +1682,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             Ok(serde_json::json!({"skill":skill,"status":"unpublished; destination retained"}))
         }
     };
-    if relationship_verify {
+    if relationship_verify || recovery_read {
         if let Some(lock) = operation_lock {
             lock.verify_config_identity(&a.config)?;
         }
