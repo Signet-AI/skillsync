@@ -9,7 +9,7 @@ use crate::{
     branch_policy::BranchPolicy, now, unique_stamp, App, FileData, PendingPublication, Publication,
     WORKER_STOP_REQUESTED,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Context, Error, Result};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -230,7 +230,9 @@ pub(crate) fn status_for_error(error: &str) -> &'static str {
         || lower.contains("could not create work tree dir")
     {
         "permission_denied"
-    } else if error.contains("source repository missing") {
+    } else if error.contains("source repository missing")
+        || error.contains("publication source unavailable")
+    {
         "source_missing"
     } else if error.contains("tracked branch missing") {
         "branch_missing"
@@ -748,10 +750,7 @@ pub(crate) fn publish_to_repo(
     if !safe(source_relative) {
         return Err(anyhow!("publication source escaped library"));
     }
-    assert_no_symlink_path(&a.library, source_relative)?;
-    if !source.is_dir() {
-        return Err(anyhow!("skill not found in library"));
-    }
+    publication_source_preflight(&a.library, source_relative, &source)?;
     wait_for_stable_source(&source, skill)?;
     let source_candidate_parent = tempfile::tempdir()?;
     let source_candidate = source_candidate_parent.path().join("skill");
@@ -936,6 +935,44 @@ pub(crate) fn publish_to_repo(
         return Err(error);
     }
     Ok(serde_json::json!({"skill":skill,"status":"published"}))
+}
+
+fn publication_source_unavailable(error: &Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| {
+                matches!(
+                    io_error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                )
+            })
+    }) || error.to_string().starts_with("symlink destination ")
+        || error.to_string().starts_with("reparse point ")
+}
+
+fn publication_source_preflight(library: &Path, relative: &Path, source: &Path) -> Result<()> {
+    assert_no_symlink_path(library, relative).map_err(|error| {
+        if publication_source_unavailable(&error) {
+            anyhow!("publication source unavailable")
+        } else {
+            error
+        }
+    })?;
+    let metadata = fs::symlink_metadata(source).map_err(|error| {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ) {
+            anyhow!("publication source unavailable")
+        } else {
+            error.into()
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(anyhow!("publication source unavailable"));
+    }
+    Ok(())
 }
 
 /// Establish a bounded, no-follow observation boundary before any publication

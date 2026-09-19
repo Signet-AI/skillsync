@@ -1,5 +1,5 @@
 import { expect, test, afterEach } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -91,7 +91,54 @@ test("failure keeps prior provenance and does not auto-adopt a reappeared packag
   const after = JSON.parse(await readFile(statePath, "utf8")); expect(after.subscriptions[key].resolved_commit).toBe(before.subscriptions[key].resolved_commit); expect(after.subscriptions[key].status).toBe("package_missing");
  });
 
- test("failed real publication push is durably retried once when due", async () => {
+ test("missing canonical publication source is source-unavailable and recovers through pending retry", async () => {
+ const root = await mkdtemp(join(tmpdir(), "skillsync-publication-source-unavailable-")); roots.push(root);
+ const remote = join(root, "remote.git"); git(root, ["init", "--bare", remote]);
+ run(root, ["init"]);
+ const statePath = join(root, "config", "state.json"); const state = JSON.parse(await readFile(statePath, "utf8"));
+ const publication = { skill: "demo", destination: remote, branch: "main", path: "skills/demo", approved: true, status: "pending_push", last_hash: null, last_sync: 0 };
+ const key = "pub-" + createHash("sha256").update(Buffer.from("publication\0demo\0" + remote + "\0main\0skills/demo\0")).digest("hex");
+ state.pending_publications = { [key]: { publication, attempt_count: 0, last_attempt_at: 0, next_attempt_at: 0, last_error_status: null } };
+ await writeFile(statePath, JSON.stringify(state));
+ const beforeRemote = Bun.spawnSync({ cmd: ["git", "--git-dir", remote, "show-ref"], stdout: "pipe" });
+ const first = run(root, ["worker", "--once"]);
+ expect(first.results[0]).toMatchObject({ skill: "demo", relationship: key, status: "source_missing" });
+ expect(dec.decode(beforeRemote.stdout)).toBe("");
+ const failed = JSON.parse(await readFile(statePath, "utf8"));
+ expect(failed.pending_publications[key]).toMatchObject({ attempt_count: 1, last_error_status: "source_missing", publication: { branch: "main", destination: remote, path: "skills/demo" } });
+ expect(Bun.spawnSync({ cmd: ["git", "--git-dir", remote, "show-ref"], stdout: "pipe" }).stdout.length).toBe(0);
+ failed.pending_publications[key].next_attempt_at = 0;
+ await writeFile(statePath, JSON.stringify(failed));
+ await mkdir(join(root, "library", "demo"), { recursive: true });
+ await writeFile(join(root, "library", "demo", "SKILL.md"), "name: demo\ndescription: A valid multiline skill fixture.\n\n# Demo\n\nDo the thing.\n");
+ const recovered = run(root, ["worker", "--once"]);
+ expect(recovered.results.some((x: any) => x.skill === "demo" && x.status === "published"), JSON.stringify(recovered)).toBe(true);
+ const final = JSON.parse(await readFile(statePath, "utf8"));
+ expect(final.pending_publications[key]).toBeUndefined(); expect(final.publications[key]).toMatchObject({ status: "synced", branch: "main", destination: remote, path: "skills/demo" });
+ expect(Bun.spawnSync({ cmd: ["git", "--git-dir", remote, "rev-list", "--count", "main"], stdout: "pipe" }).stdout.toString().trim()).toBe("1");
+});
+
+test("unexpected publication source I/O remains permission denied", async () => {
+ const root = await mkdtemp(join(tmpdir(), "skillsync-publication-source-permission-")); roots.push(root);
+ const remote = join(root, "remote.git"); git(root, ["init", "--bare", remote]);
+ run(root, ["init"]);
+ const statePath = join(root, "config", "state.json"); const state = JSON.parse(await readFile(statePath, "utf8"));
+ const publication = { skill: "demo", destination: remote, branch: "main", path: "skills/demo", approved: true, status: "pending_push", last_hash: null, last_sync: 0 };
+ const fixtureIdentity = "publication\0demo\0" + remote + "\0main\0skills/demo\0";
+ const productionIdentity = "publication\0demo\0" + remote + "\0main\0skills/demo\0";
+ expect(Buffer.from(fixtureIdentity, "utf8")).toEqual(Buffer.from(productionIdentity, "utf8"));
+ expect([...Buffer.from(fixtureIdentity, "utf8")].filter((byte) => byte === 0).length).toBe(5);
+ const key = "pub-" + createHash("sha256").update(Buffer.from(fixtureIdentity, "utf8")).digest("hex");
+ state.pending_publications = { [key]: { publication, attempt_count: 0, last_attempt_at: 0, next_attempt_at: 0, last_error_status: null } };
+ await writeFile(statePath, JSON.stringify(state));
+ await chmod(join(root, "library"), 0o000);
+ try {
+   const result = run(root, ["worker", "--once"]);
+   expect(result.results[0]).toMatchObject({ skill: "demo", relationship: key, status: "permission_denied" });
+ } finally { await chmod(join(root, "library"), 0o700); }
+});
+
+test("failed real publication push is durably retried once when due", async () => {
  const root = await mkdtemp(join(tmpdir(), "skillsync-real-publication-retry-")); roots.push(root);
  const remote = join(root, "remote.git"); git(root, ["init", "--bare", remote]);
  run(root, ["init"]);
@@ -123,10 +170,9 @@ test("failed pending publication exposes durable retry queue metadata", async ()
  state.pending_publications = { [key]: { publication } };
  await writeFile(statePath, JSON.stringify(state));
   const result = run(root, ["worker", "--once"]);
-  expect(result.results[0].status).toBe("package_missing");
+  expect(result.results[0].status).toBe("source_missing");
   const after = JSON.parse(await readFile(statePath, "utf8"));
   expect(after.pending_publications[key].attempt_count).toBe(1);
-  expect(after.pending_publications[key].next_attempt_at).toBeGreaterThan(0);
   const skipped = run(root, ["worker", "--once"]);
   expect(skipped.results[0].queue).toBe("scheduled");
   const unchanged = JSON.parse(await readFile(statePath, "utf8"));

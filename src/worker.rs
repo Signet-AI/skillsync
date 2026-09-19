@@ -61,7 +61,7 @@ fn safe_error(status: &str) -> &'static str {
         "authentication_required" => "repository authentication required",
         "offline" => "repository unavailable offline",
         "permission_denied" => "repository access denied",
-        "source_missing" => "source repository missing",
+        "source_missing" => "source unavailable",
         "branch_missing" => "tracked branch missing",
         "package_missing" => "skill package missing",
         "invalid_source" => "invalid repository source",
