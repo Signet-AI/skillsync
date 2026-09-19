@@ -233,6 +233,67 @@ fn validate_evidence_package(
     Ok(())
 }
 
+fn source_observation(s: &crate::Subscription) -> serde_json::Value {
+    let source = Path::new(&s.source);
+    if !source.is_absolute() {
+        return json!({
+            "kind": "remote",
+            "availability": "not_checked_remote",
+            "reason": "remote_source_not_contacted"
+        });
+    }
+
+    // Local diagnostics are deliberately limited to the exact recorded package
+    // path.  Any unsafe or changing observation is reported conservatively.
+    let package = source.join(&s.source_path);
+    let result = (|| -> Result<&'static str> {
+        assert_no_symlink_path(source, Path::new("."))?;
+        crate::filesystem::reject_reparse_point(source, "local source")?;
+        let source_meta = fs::symlink_metadata(source)?;
+        if !source_meta.is_dir() || source_meta.file_type().is_symlink() {
+            return Ok("invalid");
+        }
+        if canonicalize_path(source)? != source {
+            return Ok("invalid");
+        }
+        match fs::symlink_metadata(&package) {
+            Ok(meta) if meta.file_type().is_symlink() => Ok("invalid"),
+            Ok(meta) if !meta.is_dir() => Ok("invalid"),
+            Ok(_) => {
+                assert_no_symlink_path(source, Path::new(&s.source_path))?;
+                crate::filesystem::reject_reparse_point(&package, "local source package")?;
+                if canonicalize_path(&package)? != package || manifest_name(&package)? != s.skill {
+                    return Ok("invalid");
+                }
+                Ok("present")
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("missing"),
+            Err(error) => Err(error.into()),
+        }
+    })();
+    match result {
+        Ok("present") => {
+            json!({"kind":"local","availability":"present","match":"same","reason":"recorded_source_path_valid"})
+        }
+        Ok("missing") => {
+            json!({"kind":"local","availability":"missing","match":"missing","reason":"recorded_source_path_missing"})
+        }
+        Ok(_) | Err(_) => {
+            json!({"kind":"local","availability":"invalid","match":"changed","reason":"recorded_source_path_invalid_or_changed"})
+        }
+    }
+}
+
+fn retention_diagnostics() -> serde_json::Value {
+    json!({
+        "recovery_present": true,
+        "evidence": "valid",
+        "recovery_retained": true,
+        "deletion_allowed": false,
+        "reason": "validated_conflict_evidence_retained"
+    })
+}
+
 pub(crate) fn show(a: &App, relationship: &str) -> Result<serde_json::Value> {
     let s = a
         .state
@@ -326,6 +387,8 @@ pub(crate) fn show(a: &App, relationship: &str) -> Result<serde_json::Value> {
     output["status"] = json!(s.status);
     output["current_live_hash"] = json!(current_live_hash.clone());
     output["stale"] = json!(current_live_hash != output["live_hash_at_detection"]);
+    output["source_observation"] = source_observation(s);
+    output["retention"] = retention_diagnostics();
     Ok(output)
 }
 

@@ -101,6 +101,13 @@ async function conflictFixture(): Promise<{ f: Fixture; relationship: string; st
   return { f, relationship, statePath, livePath: join(f.library, "demo/SKILL.md") };
 }
 
+test("conflict show reports bounded source and retention diagnostics", async () => {
+  const { f, relationship } = await conflictFixture();
+  const shown = run(f, ["--json", "conflicts", "show", relationship]).json;
+  expect(shown.source_observation).toEqual({ kind: "local", availability: "missing", match: "missing", reason: "recorded_source_path_missing" });
+  expect(shown.retention).toEqual({ recovery_present: true, evidence: "valid", recovery_retained: true, deletion_allowed: false, reason: "validated_conflict_evidence_retained" });
+});
+
 test("explicit conflict selection resumes incoming and retains immutable evidence", async () => {
   const { f, relationship, statePath, livePath } = await conflictFixture();
   const recoveryBefore = await readdir(join(f.config, "recovery"));
