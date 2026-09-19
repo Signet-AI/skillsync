@@ -469,7 +469,30 @@ pub(crate) fn list_inventory(a: &mut App) -> Result<serde_json::Value> {
                 continue;
             }
         };
-        let opaque_id = format!("recovery-{}", &digest[..16]);
+        let opaque_id = {
+            let mut id_hasher = Sha256::new();
+            id_hasher.update(b"skillsync-recovery-opaque-id-v2\\0");
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                let name_bytes = name.as_os_str().as_bytes();
+                id_hasher.update((name_bytes.len() as u64).to_le_bytes());
+                id_hasher.update(name_bytes);
+            }
+            #[cfg(not(unix))]
+            {
+                let name_bytes = name.as_os_str().as_encoded_bytes();
+                id_hasher.update((name_bytes.len() as u64).to_le_bytes());
+                id_hasher.update(name_bytes);
+            }
+            id_hasher.update(digest.as_bytes());
+            let id_digest = format!("{:x}", id_hasher.finalize());
+            format!("recovery-{}", &id_digest[..16])
+        };
+        // Recovery inventory is deliberately conservative until its complete
+        // descriptor-relative manifest/evidence validator has accepted the
+        // artifact. Never delegate to conflicts::show here: that validator
+        // reads the live subscription and recorded source by pathname.
         let item = serde_json::json!({"id":opaque_id,"category":"unknown","status":"invalid","reason":"unrecognized_recovery_artifact","deletable":false});
         artifacts.push(item);
     }

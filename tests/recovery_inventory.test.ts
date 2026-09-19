@@ -26,13 +26,13 @@ test("recovery list reports an empty deterministic inventory without initializat
 test("recovery list rejects a symlink package entry without following its target", async () => {
   const root = await mkdtemp(join(tmpdir(), "skillsync-recovery-list-"));
   await mkdir(join(root, "library/demo"), { recursive: true });
-  await writeFile(join(root, "library/demo/SKILL.md"), "name: demo\\n");
+  await writeFile(join(root, "library/demo/SKILL.md"), "name: demo\n");
   expect(run(root, ["--json", "init"]).exitCode).toBe(0);
   const artifact = join(root, "config/recovery", "delete-symlink-package");
   const target = join(root, "outside-package");
   await mkdir(target, { recursive: true });
   const targetFile = join(target, "SKILL.md");
-  await writeFile(targetFile, "must remain unchanged\\n");
+  await writeFile(targetFile, "must remain unchanged\n");
   await mkdir(artifact, { recursive: true });
   await symlink(target, join(artifact, "package"));
   const before = await readFile(targetFile, "utf8");
@@ -69,7 +69,7 @@ test("recovery list rejects operational symlinks inside deletion snapshots witho
 test("recovery list never emits attacker-controlled artifact names or metadata", async () => {
   const root = await mkdtemp(join(tmpdir(), "skillsync-recovery-list-"));
   await mkdir(join(root, "library/demo"), { recursive: true });
-  await writeFile(join(root, "library/demo/SKILL.md"), "name: demo\\n");
+  await writeFile(join(root, "library/demo/SKILL.md"), "name: demo\n");
   expect(run(root, ["--json", "init"]).exitCode).toBe(0);
   const sensitive = "delete-api-key-prod__credential-token__" + "a".repeat(80);
   await mkdir(join(root, "config/recovery", sensitive), { recursive: true });
@@ -84,11 +84,11 @@ test("recovery list never emits attacker-controlled artifact names or metadata",
 test("recovery list does not trust a fabricated valid delete directory as owned", async () => {
   const root = await mkdtemp(join(tmpdir(), "skillsync-recovery-list-"));
   await mkdir(join(root, "library/demo"), { recursive: true });
-  await writeFile(join(root, "library/demo/SKILL.md"), "name: demo\\n");
+  await writeFile(join(root, "library/demo/SKILL.md"), "name: demo\n");
   expect(run(root, ["--json", "init"]).exitCode).toBe(0);
   const fabricated = join(root, "config/recovery", "delete-credential-backup");
   await mkdir(join(fabricated, "package"), { recursive: true });
-  await writeFile(join(fabricated, "package/SKILL.md"), "name: demo\\n");
+  await writeFile(join(fabricated, "package/SKILL.md"), "name: demo\n");
   const before = await readdir(join(root, "config/recovery"));
   const result = run(root, ["--json", "recovery", "list"]);
   expect(result.exitCode).toBe(0);
@@ -115,14 +115,36 @@ test("recovery list is read-only and deterministic for a deletion snapshot", asy
   expect(await readdir(join(root, "config/recovery"))).toEqual(before);
 });
 
+test("identical safe direct children receive distinct deterministic recovery ids", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skillsync-recovery-list-"));
+  await mkdir(join(root, "library/demo"), { recursive: true });
+  await writeFile(join(root, "library/demo/SKILL.md"), "name: demo\n");
+  expect(run(root, ["--json", "init"]).exitCode).toBe(0);
+  const recoveryRoot = join(root, "config/recovery");
+  const first = join(recoveryRoot, "snapshot-one", "package");
+  const second = join(recoveryRoot, "snapshot-two", "package");
+  await mkdir(first, { recursive: true });
+  await mkdir(second, { recursive: true });
+  await writeFile(join(first, "SKILL.md"), "name: demo\n");
+  await writeFile(join(second, "SKILL.md"), "name: demo\n");
+  expect(await readFile(join(first, "SKILL.md"))).toEqual(Buffer.from("name: demo\n"));
+  const before = (await readdir(recoveryRoot)).sort();
+  const result = run(root, ["--json", "recovery", "list"]);
+  expect(result.exitCode).toBe(0);
+  const body = JSON.parse(dec.decode(result.stdout));
+  expect(body.count).toBe(2);
+  expect(new Set(body.artifacts.map((item: { id: string }) => item.id)).size).toBe(2);
+  expect((await readdir(recoveryRoot)).sort()).toEqual(before);
+});
+
 test("distinct unsafe direct children never receive colliding recovery ids", async () => {
   const root = await mkdtemp(join(tmpdir(), "skillsync-recovery-list-"));
   await mkdir(join(root, "library/demo"), { recursive: true });
-  await writeFile(join(root, "library/demo/SKILL.md"), "name: demo\\n");
+  await writeFile(join(root, "library/demo/SKILL.md"), "name: demo\n");
   expect(run(root, ["--json", "init"]).exitCode).toBe(0);
   const outside = join(root, "outside");
   await mkdir(join(root, "config/recovery"), { recursive: true });
-  await writeFile(outside, "outside\\n");
+  await writeFile(outside, "outside\n");
   await symlink(outside, join(root, "config/recovery", "unsafe-one"));
   await symlink(outside, join(root, "config/recovery", "unsafe-two"));
   const result = run(root, ["--json", "recovery", "list"]);
@@ -135,17 +157,17 @@ test("distinct unsafe direct children never receive colliding recovery ids", asy
 test("recovery ids include operational-looking descendants without mutating snapshots", async () => {
   const root = await mkdtemp(join(tmpdir(), "skillsync-recovery-list-"));
   await mkdir(join(root, "library/demo"), { recursive: true });
-  await writeFile(join(root, "library/demo/SKILL.md"), "name: demo\\n");
+  await writeFile(join(root, "library/demo/SKILL.md"), "name: demo\n");
   expect(run(root, ["--json", "init"]).exitCode).toBe(0);
   const recoveryRoot = join(root, "config/recovery");
   const first = join(recoveryRoot, "snapshot-one", "package");
   const second = join(recoveryRoot, "snapshot-two", "package");
   await mkdir(first, { recursive: true });
   await mkdir(second, { recursive: true });
-  await writeFile(join(first, "SKILL.md"), "name: demo\\n");
-  await writeFile(join(second, "SKILL.md"), "name: demo\\n");
-  await writeFile(join(first, ".env"), "TOKEN=one\\n");
-  await writeFile(join(second, ".env"), "TOKEN=two\\n");
+  await writeFile(join(first, "SKILL.md"), "name: demo\n");
+  await writeFile(join(second, "SKILL.md"), "name: demo\n");
+  await writeFile(join(first, ".env"), "TOKEN=one\n");
+  await writeFile(join(second, ".env"), "TOKEN=two\n");
   const before = [await readFile(join(first, ".env"), "utf8"), await readFile(join(second, ".env"), "utf8")];
   const result = run(root, ["--json", "recovery", "list"]);
   expect(result.exitCode).toBe(0);

@@ -108,6 +108,22 @@ test("conflict show reports bounded source and retention diagnostics", async () 
   expect(shown.retention).toEqual({ recovery_present: true, evidence: "valid", recovery_retained: true, deletion_allowed: false, reason: "validated_conflict_evidence_retained" });
 });
 
+test("recovery list keeps state-backed conflict artifacts opaque", async () => {
+  const { f, relationship } = await conflictFixture();
+  const listed = run(f, ["--json", "recovery", "list"]).json;
+  expect(listed.count).toBe(1);
+  expect(listed.artifacts[0]).toMatchObject({ category: "unknown", status: "invalid", reason: "unrecognized_recovery_artifact", deletable: false });
+  expect(relationship).toBeTruthy();
+});
+
+test("recovery list stays bound to retained artifact after root replacement", async () => {
+  const { f, relationship } = await conflictFixture();
+  const listed = run(f, ["--json", "recovery", "list"], false, { SKILLSYNC_TEST_REPLACE_RECOVERY_ROOT: "1" }).json;
+  expect(listed.ok).toBe(false);
+  expect(listed.message).toContain("recovery root changed during inventory");
+  expect(relationship).toBeTruthy();
+});
+
 test("explicit conflict selection resumes incoming and retains immutable evidence", async () => {
   const { f, relationship, statePath, livePath } = await conflictFixture();
   const recoveryBefore = await readdir(join(f.config, "recovery"));
