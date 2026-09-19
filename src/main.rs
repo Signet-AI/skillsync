@@ -922,7 +922,7 @@ fn pending_publication_diagnostics(a: &App) -> Result<serde_json::Value> {
         let due = worker::pending_due(pending, current);
         let status = worker::safe_pending_status(pending.last_error_status.as_deref());
 
-        diagnostics.push(serde_json::json!({"skill": skill, "status": status, "attempt_count": pending.attempt_count, "next_attempt_at": pending.next_attempt_at, "queue": if due { "ready" } else { "scheduled" }, "due": due, "diagnostic": worker::safe_error(status)}));
+        diagnostics.push(serde_json::json!({"skill": skill, "status": status, "attempt_count": pending.attempt_count, "last_attempt_at": pending.last_attempt_at, "next_attempt_at": pending.next_attempt_at, "queue": if due { "ready" } else { "scheduled" }, "due": due, "diagnostic": worker::safe_error(status)}));
     }
     Ok(serde_json::Value::Array(diagnostics))
 }

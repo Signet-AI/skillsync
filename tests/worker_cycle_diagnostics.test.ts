@@ -45,8 +45,8 @@ test("status exposes a read-only pending publication diagnostic projection", asy
   const first = run(root, ["status"], { SKILLSYNC_TEST_NOW: "101" });
   const second = run(root, ["status"], { SKILLSYNC_TEST_NOW: "101" });
   expect(first.pending_publication_diagnostics).toEqual([
-    { skill: "a-safe", status: "source_missing", attempt_count: 0, next_attempt_at: 0, queue: "ready", due: true, diagnostic: "source unavailable" },
-    { skill: "z-safe", status: "unknown", attempt_count: 2, next_attempt_at: 200, queue: "scheduled", due: false, diagnostic: "repository operation failed" },
+    { skill: "a-safe", status: "source_missing", attempt_count: 0, last_attempt_at: 0, next_attempt_at: 0, queue: "ready", due: true, diagnostic: "source unavailable" },
+    { skill: "z-safe", status: "unknown", attempt_count: 2, last_attempt_at: 100, next_attempt_at: 200, queue: "scheduled", due: false, diagnostic: "repository operation failed" },
   ]);
   expect(first).toEqual(second); expect(await readFile(statePath, "utf8")).toBe(JSON.stringify(state));
   expect(JSON.stringify(first.pending_publication_diagnostics)).not.toMatch(/user:secret|remote\.invalid|\.\.[\\/\\\\]|SKILLSYNC_TEST_/);
